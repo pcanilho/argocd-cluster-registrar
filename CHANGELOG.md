@@ -122,6 +122,14 @@ Verified against k3k v1.2.0-rc3 and vcluster 0.36.1 on a Kubernetes 1.26 host.
   full import path, so every released binary reported `dev (n/a) n/a`.
 - `project_name` is pinned, since goreleaser derives it from the git remote and
   would otherwise name artefacts after the old repository.
+- The published chart and image are now linked to this repository on GHCR, via
+  `org.opencontainers.image.source`. Helm copies Chart.yaml annotations onto the
+  OCI manifest, and GHCR only makes the association when that source is an https
+  URL. The chart had no annotations at all and the image used goreleaser's
+  `{{ .GitURL }}`, which resolves to the SSH remote, so every 0.1.x release was
+  published as an orphan package under the account.
+- Chart metadata filled in: a real description, home, sources, icon, keywords,
+  maintainers and a license annotation, none of which existed.
 
 ### Removed
 

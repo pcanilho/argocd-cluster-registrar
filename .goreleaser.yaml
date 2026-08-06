@@ -69,7 +69,10 @@ kos:
       org.opencontainers.image.name: "{{.ProjectName}}"
       org.opencontainers.image.revision: "{{.FullCommit}}"
       org.opencontainers.image.version: "{{.Version}}"
-      org.opencontainers.image.source: "{{.GitURL}}"
+      # Not {{.GitURL}}: that yields the SSH remote, which GHCR will not link.
+      org.opencontainers.image.source: "https://github.com/pcanilho/argocd-cluster-registrar"
+      org.opencontainers.image.licenses: "Apache-2.0"
+      org.opencontainers.image.description: "Registers k3k and vcluster child clusters with ArgoCD, and removes them when they are deleted"
     bare: true
     preserve_import_paths: false
     tags:
