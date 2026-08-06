@@ -38,12 +38,11 @@ checksum:
 release:
   draft: false
 
+# Release notes come from CHANGELOG.md, injected by the workflow via
+# --release-notes. Generating a second set from commit subjects would either be
+# ignored or appended as noise, so it is turned off here.
 changelog:
-  sort: asc
-  filters:
-    exclude:
-      - "^docs:"
-      - "^test:"
+  disable: true
 
 kos:
   - id: app
