@@ -38,7 +38,11 @@ commonLabels: ~
 
 image:
   repository: ghcr.io/pcanilho/argocd-cluster-registrar
-  tag: 0.2.0
+  # Empty on purpose: defaults to .Chart.AppVersion. The release workflow
+  # repackages the chart with --app-version from the git tag but does not touch
+  # this file, so a hardcoded tag here would quietly ship the previous image
+  # alongside a new chart. Set it only to pin against the chart's own version.
+  tag: ""
   pullPolicy: IfNotPresent
 
 resources:

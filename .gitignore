@@ -2,3 +2,7 @@ go.work
 go.work.sum
 .env
 .idea
+
+# goreleaser and the release workflow's chart staging directory
+dist/
+_build/

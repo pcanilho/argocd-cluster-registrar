@@ -2,6 +2,7 @@
 package cmd
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -66,14 +67,25 @@ does not leave a broken entry behind in ArgoCD.`,
 			AddSource: debug,
 		}))
 
-		r, err := registrar.New(log, registrar.Config{
+		if interval <= 0 {
+			// time.NewTicker panics on a non-positive duration, so a Helm value of
+			// `interval: 0s` would crash-loop the Deployment on a stack trace.
+			return fmt.Errorf("--interval must be positive, got %s", interval)
+		}
+
+		cfg := registrar.Config{
 			TargetNamespace:   targetNamespace,
 			ManagedByValue:    managedByValue,
 			SecretNamePattern: secretNamePattern,
 			SecretKey:         secretKey,
 			LabelPrefix:       labelPrefix,
 			DryRun:            dryRun,
-		})
+		}
+		if err := cfg.Validate(); err != nil {
+			return err
+		}
+
+		r, err := registrar.New(log, cfg)
 		if err != nil {
 			return err
 		}
@@ -94,6 +106,12 @@ does not leave a broken entry behind in ArgoCD.`,
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
+			// select below can pick the ticker even when ctx is already done, so
+			// check explicitly or shutdown can run one extra full pass.
+			if ctx.Err() != nil {
+				log.Info("shutting down")
+				return nil
+			}
 			// A failed pass is logged, never fatal: one unreachable child must not
 			// take the registrar down for every other cluster.
 			if err := r.Reconcile(ctx); err != nil {

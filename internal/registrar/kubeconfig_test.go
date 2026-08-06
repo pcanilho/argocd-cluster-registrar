@@ -193,3 +193,83 @@ func TestParseKubeconfigVclusterShape(t *testing.T) {
 		t.Errorf("expected client certificates, got %+v", got.TLSClientConfig)
 	}
 }
+
+// Taking Clusters[0]/Users[0] would pair prod's server with sandbox's
+// credentials, or vice versa. That is not just a misconfiguration: ArgoCD would
+// then present one cluster's token to another cluster on every connection,
+// handing it a replayable credential. current-context must decide.
+const multiContextKubeconfig = `apiVersion: v1
+kind: Config
+clusters:
+- name: prod
+  cluster: {server: https://prod.example.com, certificate-authority-data: cHJvZGNh}
+- name: sandbox
+  cluster: {server: https://sandbox.example.com, certificate-authority-data: c2JjYQ==}
+users:
+- name: prod-admin
+  user: {token: prod-token}
+- name: sandbox-admin
+  user: {token: sandbox-token}
+contexts:
+- name: prod
+  context: {cluster: prod, user: prod-admin}
+- name: sandbox
+  context: {cluster: sandbox, user: sandbox-admin}
+current-context: sandbox
+`
+
+func TestParseKubeconfigHonoursCurrentContext(t *testing.T) {
+	server, config, err := parseKubeconfig([]byte(multiContextKubeconfig))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if server != "https://sandbox.example.com" {
+		t.Errorf("server = %q, want the current-context cluster, not Clusters[0]", server)
+	}
+	var got argoClusterConfig
+	if err := json.Unmarshal([]byte(config), &got); err != nil {
+		t.Fatalf("bad JSON: %v", err)
+	}
+	if got.BearerToken != "sandbox-token" {
+		t.Errorf("bearerToken = %q; pairing a cluster with another cluster's credential leaks it", got.BearerToken)
+	}
+	if got.TLSClientConfig.CaData != "c2JjYQ==" {
+		t.Errorf("caData = %q, want sandbox's CA", got.TLSClientConfig.CaData)
+	}
+}
+
+func TestParseKubeconfigRefusesToGuessWhenAmbiguous(t *testing.T) {
+	noCurrent := `apiVersion: v1
+kind: Config
+clusters:
+- name: a
+  cluster: {server: https://a}
+- name: b
+  cluster: {server: https://b}
+users:
+- name: ua
+  user: {token: ta}
+- name: ub
+  user: {token: tb}
+`
+	if _, _, err := parseKubeconfig([]byte(noCurrent)); err == nil {
+		t.Error("expected a refusal on an ambiguous multi-entry kubeconfig, got nil")
+	}
+}
+
+func TestParseKubeconfigRejectsUnusableCredentials(t *testing.T) {
+	for name, in := range map[string]string{
+		"empty server": "apiVersion: v1\nclusters:\n- name: a\n  cluster: {server: \"\"}\nusers:\n- name: a\n  user: {token: t}\n",
+		"bad url":      "apiVersion: v1\nclusters:\n- name: a\n  cluster: {server: \"not a url\"}\nusers:\n- name: a\n  user: {token: t}\n",
+		"ca by file":   "apiVersion: v1\nclusters:\n- name: a\n  cluster: {server: https://a, certificate-authority: /etc/ca.crt}\nusers:\n- name: a\n  user: {token: t}\n",
+		"cert by file": "apiVersion: v1\nclusters:\n- name: a\n  cluster: {server: https://a}\nusers:\n- name: a\n  user: {client-certificate: /etc/c.crt, client-key: /etc/c.key}\n",
+		"exec plugin":  "apiVersion: v1\nclusters:\n- name: a\n  cluster: {server: https://a}\nusers:\n- name: a\n  user:\n    exec: {command: aws}\n",
+		"unknown ctx":  "apiVersion: v1\nclusters:\n- name: a\n  cluster: {server: https://a}\n- name: b\n  cluster: {server: https://b}\nusers:\n- name: ua\n  user: {token: t}\n- name: ub\n  user: {token: u}\ncontexts:\n- name: c\n  context: {cluster: zzz, user: ua}\ncurrent-context: c\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := parseKubeconfig([]byte(in)); err == nil {
+				t.Error("expected an error, got nil")
+			}
+		})
+	}
+}

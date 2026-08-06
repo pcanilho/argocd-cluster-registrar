@@ -32,6 +32,11 @@ This does it for you, and it also does the part scripts usually skip:
   child's client certificate, and without this ArgoCD quietly starts failing
   authentication.
 
+> [!IMPORTANT]
+> Upgrading from `0.1.x` (`vcluster-argocd-exporter`)? The flags, values, Secret
+> names and labels all changed, and a stale values file fails silently. See
+> [Migrating from 0.1.x](CHANGELOG.md#migrating-from-01x).
+
 ## Installing
 
 Install it once, as a singleton. Do not add it as a dependency of a per-cluster
@@ -43,7 +48,7 @@ instances sharing a `managedBy` value will delete each other's `Secret`s.
 ```yaml
 dependencies:
   - name: argocd-cluster-registrar
-    version: =>0.2.0
+    version: ">=0.2.0"
     repository: oci://ghcr.io/pcanilho/charts
 ```
 
@@ -84,6 +89,16 @@ interval: 60s
 # Log what would change without writing anything. Useful the first time you point
 # this at an existing cluster, to check the GC selector matches only what you expect.
 dryRun: false
+
+# Verbose logging.
+debug: false
+```
+
+The binary also falls back to your own kubeconfig when it is not running in a
+cluster, so you can try it before installing anything:
+
+```bash
+argocd-cluster-registrar --once --dry-run --debug
 ```
 
 ### Settings per provisioner
@@ -112,10 +127,16 @@ exportKubeConfig:
 ```
 
 Note that `vc-*` also matches vcluster's own `vc-config-<name>` `Secret`, which
-sorts first and holds no kubeconfig. That is handled: a `Secret` is only used if
-it matches the name pattern *and* carries `secretKey`.
+holds no kubeconfig. That is handled: a `Secret` is only used if it matches the
+name pattern *and* carries `secretKey`. Do not rely on ordering to save you here
+(`vc-config-abc` sorts before `vc-abc`, but after `vc-xyz`).
 
 ### Marking a cluster for registration
+
+Both labels below are required. A namespace carrying `managed-by` but no
+`cluster` is skipped with a warning, and the cluster name must be usable as a
+Kubernetes object name, since the resulting Secret is called `cluster-<name>`.
+Two namespaces must never claim the same cluster name.
 
 Label the namespace that holds the kubeconfig `Secret`. It reads the namespace
 rather than the `Secret` because the provisioner owns that `Secret`. k3k, for

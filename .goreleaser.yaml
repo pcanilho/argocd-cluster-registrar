@@ -1,5 +1,10 @@
 version: 2
 
+# Pinned explicitly. goreleaser otherwise derives ProjectName from the git
+# REMOTE, not the module path, so a stale remote silently names every archive,
+# checksum file and image label after the old repository.
+project_name: argocd-cluster-registrar
+
 before:
   hooks:
     - go mod tidy
@@ -14,7 +19,7 @@ builds:
     flags:
       - -trimpath
     ldflags:
-      - "-s -w -X cmd.version={{.Version}} -X main.commit={{.ShortCommit}} -X main.date={{.Date}}"
+      - "-s -w -X github.com/pcanilho/argocd-cluster-registrar/cmd.version={{.Version}} -X github.com/pcanilho/argocd-cluster-registrar/cmd.commit={{.ShortCommit}} -X github.com/pcanilho/argocd-cluster-registrar/cmd.date={{.Date}}"
     goos:
       - freebsd
       - windows
@@ -25,11 +30,11 @@ builds:
       - arm64
 
 archives:
-  - format: zip
+  - formats: [zip]
     name_template: "{{.ProjectName}}_{{.Version}}_{{.Os}}_{{.Arch}}"
 
 snapshot:
-  name_template: "{{.Tag}}-next"
+  version_template: "{{.Tag}}-next"
 
 checksum:
   name_template: "{{.ProjectName}}_{{.Version}}_SHA256SUMS"
@@ -46,7 +51,8 @@ changelog:
 
 kos:
   - id: app
-    repository: ghcr.io/pcanilho/argocd-cluster-registrar
+    repositories:
+      - ghcr.io/pcanilho/argocd-cluster-registrar
     main: .
     platforms:
       - linux/amd64
@@ -56,7 +62,7 @@ kos:
     flags:
       - -trimpath
     ldflags:
-      - -s -w
+      - "-s -w -X github.com/pcanilho/argocd-cluster-registrar/cmd.version={{.Version}} -X github.com/pcanilho/argocd-cluster-registrar/cmd.commit={{.ShortCommit}} -X github.com/pcanilho/argocd-cluster-registrar/cmd.date={{.Date}}"
     ko_data_creation_time: "{{.CommitTimestamp}}"
     labels:
       org.opencontainers.image.created: "{{.Date}}"

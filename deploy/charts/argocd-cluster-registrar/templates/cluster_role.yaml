@@ -1,28 +1,71 @@
 ---
-# Scoped down from the previous grant, which was `[""]` all-resources-all-verbs
-# plus the same for `apps` -- far wider than this tool has ever needed.
+# Split into a cluster-scoped READ role and a namespaced WRITE role.
 #
-# `delete` on secrets is the one genuinely new verb, and the important one:
-# without it a destroyed child cluster leaves a permanently broken entry in
-# ArgoCD.
+# The reads have to be cluster-wide: source Secrets live in one namespace per
+# child, and RBAC cannot express "namespaces carrying label X".
+#
+# The writes do not. Everything this tool creates, updates or deletes lands in
+# .Values.targetNamespace, so granting create/update/delete on Secrets across
+# every namespace was a standing privilege-escalation path (overwrite
+# argocd-secret, mint a token Secret for a privileged ServiceAccount, delete
+# kube-system Secrets) bought for nothing.
+#
+# `watch` and `patch` are gone as well: nothing here runs an informer, and
+# apply() uses Get plus Create/Update with a carried resourceVersion.
+#
+# Residual risk worth naming rather than hiding: cluster-wide Secret READ still
+# lets this ServiceAccount read every credential in the cluster. That is inherent
+# to label-driven discovery across arbitrary namespaces.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: {{ include "app.fullname" . }}-role
   labels:
-    {{- include "app.commonLabels" . | indent 4 }}
+    {{- include "app.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
   annotations:
-    {{- include "app.commonAnnotations" . }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 rules:
-  # Discovery: find namespaces carrying the managed-by label.
+  # Discovery: find namespaces carrying the managed-by label, and confirm one is
+  # genuinely gone before deregistering its cluster.
   - apiGroups: [""]
     resources: ["namespaces"]
-    verbs: ["get", "list", "watch"]
-  # Read provisioner-written kubeconfig Secrets in those namespaces, and
-  # create/update/delete the ArgoCD cluster Secrets derived from them.
-  #
-  # Cluster-scoped because the sources live in one namespace per child while the
-  # destination lives in argocd -- a Role would have to be created per child.
+    verbs: ["get", "list"]
+  # Read the provisioner-written kubeconfig Secrets in those namespaces.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["list"]
+---
+# The write half, confined to the single namespace this tool ever writes to.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "app.fullname" . }}-write
+  namespace: {{ .Values.targetNamespace }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "app.fullname" . }}-write
+  namespace: {{ .Values.targetNamespace }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "app.fullname" . }}-write
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "app.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
