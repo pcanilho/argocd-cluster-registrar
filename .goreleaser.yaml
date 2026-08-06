@@ -7,7 +7,7 @@ before:
 builds:
   - id: app
     main: .
-    binary: vcluster-argocd-exporter
+    binary: argocd-cluster-registrar
     env:
       - CGO_ENABLED=0
     mod_timestamp: "{{.CommitTimestamp}}"
@@ -47,7 +47,7 @@ changelog:
 
 kos:
   - id: app
-    repository: ghcr.io/pcanilho/vcluster-argocd-exporter
+    repository: ghcr.io/pcanilho/argocd-cluster-registrar
     main: .
     platforms:
       - linux/amd64

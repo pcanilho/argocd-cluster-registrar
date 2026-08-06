@@ -75,7 +75,7 @@ jobs:
             --create-namespace \
             --wait
           kubectl get sts -n vcluster
-          helm install test-cluster ./deploy/charts/vcluster-argocd-exporter \
+          helm install test-cluster ./deploy/charts/argocd-cluster-registrar \
             --namespace exporter \
             --timeout 1m \
             --create-namespace \

@@ -1,0 +1,28 @@
+---
+# Scoped down from the previous grant, which was `[""]` all-resources-all-verbs
+# plus the same for `apps` -- far wider than this tool has ever needed.
+#
+# `delete` on secrets is the one genuinely new verb, and the important one:
+# without it a destroyed child cluster leaves a permanently broken entry in
+# ArgoCD.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "app.fullname" . }}-role
+  labels:
+    {{- include "app.commonLabels" . | indent 4 }}
+  annotations:
+    {{- include "app.commonAnnotations" . }}
+rules:
+  # Discovery: find namespaces carrying the managed-by label.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  # Read provisioner-written kubeconfig Secrets in those namespaces, and
+  # create/update/delete the ArgoCD cluster Secrets derived from them.
+  #
+  # Cluster-scoped because the sources live in one namespace per child while the
+  # destination lives in argocd -- a Role would have to be created per child.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

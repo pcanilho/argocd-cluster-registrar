@@ -48,5 +48,5 @@ jobs:
       - name: Build and Push Helm Chart
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
-          helm package deploy/charts/vcluster-argocd-exporter --destination _build --version "$VERSION" --app-version "$VERSION"
-          helm push _build/vcluster-argocd-exporter-*.tgz oci://ghcr.io/pcanilho/charts
+          helm package deploy/charts/argocd-cluster-registrar --destination _build --version "$VERSION" --app-version "$VERSION"
+          helm push _build/argocd-cluster-registrar-*.tgz oci://ghcr.io/pcanilho/charts
