@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"path"
 	"slices"
 	"sort"
@@ -411,9 +412,7 @@ func (r *Registrar) apply(ctx context.Context, c child) error {
 		r.clusterLabel():         c.cluster,
 		r.sourceNamespaceLabel(): c.namespace,
 	}
-	for k, v := range c.labels {
-		labels[k] = v
-	}
+	maps.Copy(labels, c.labels)
 
 	want := &coreV1.Secret{
 		ObjectMeta: metaV1.ObjectMeta{
@@ -474,9 +473,7 @@ func (r *Registrar) apply(ctx context.Context, c child) error {
 	if updated.Labels == nil {
 		updated.Labels = map[string]string{}
 	}
-	for k, v := range want.Labels {
-		updated.Labels[k] = v
-	}
+	maps.Copy(updated.Labels, want.Labels)
 	// Drop prefixed labels that no longer exist upstream, so a cluster can be
 	// opted back OUT of a selector (e.g. flux=true) once it was opted in.
 	for k := range updated.Labels {

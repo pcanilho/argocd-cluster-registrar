@@ -15,12 +15,17 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 )
 
-const testPrefix = "example.com/"
+const (
+	testPrefix = "example.com/"
+	// Shared by both test files: it is the ownership marker the registrar
+	// discovers namespaces by and garbage collects on.
+	testManagedBy = "cluster-registrar"
+)
 
 func testConfig() Config {
 	return Config{
 		TargetNamespace:   "argocd",
-		ManagedByValue:    "cluster-registrar",
+		ManagedByValue:    testManagedBy,
 		SecretNamePattern: "k3k-*-kubeconfig",
 		SecretKey:         "kubeconfig.yaml",
 		LabelPrefix:       testPrefix,
@@ -40,7 +45,7 @@ func managedNS(name, cluster string) *coreV1.Namespace {
 	return &coreV1.Namespace{ObjectMeta: metaV1.ObjectMeta{
 		Name: name,
 		Labels: map[string]string{
-			ManagedByLabel(testPrefix): "cluster-registrar",
+			ManagedByLabel(testPrefix): testManagedBy,
 			ClusterLabel(testPrefix):   cluster,
 		},
 	}}
@@ -61,7 +66,7 @@ func registeredSecret(cluster, srcNS string) *coreV1.Secret {
 			Namespace: "argocd",
 			Labels: map[string]string{
 				argoSecretTypeLabel:              argoSecretTypeValue,
-				ManagedByLabel(testPrefix):       "cluster-registrar",
+				ManagedByLabel(testPrefix):       testManagedBy,
 				ClusterLabel(testPrefix):         cluster,
 				SourceNamespaceLabel(testPrefix): srcNS,
 			},
@@ -112,7 +117,7 @@ func TestCollectRequiresProofTheNamespaceIsGone(t *testing.T) {
 	// The namespace exists but carries no cluster label, so it yields no child.
 	unlabelled := &coreV1.Namespace{ObjectMeta: metaV1.ObjectMeta{
 		Name:   "k3k-a",
-		Labels: map[string]string{ManagedByLabel(testPrefix): "cluster-registrar"},
+		Labels: map[string]string{ManagedByLabel(testPrefix): testManagedBy},
 	}}
 	r, c := newTestRegistrar(unlabelled, registeredSecret("a", "k3k-a"))
 

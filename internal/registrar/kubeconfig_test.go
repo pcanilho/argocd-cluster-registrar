@@ -137,9 +137,9 @@ func TestParseKubeconfigErrors(t *testing.T) {
 func TestPropagatedLabels(t *testing.T) {
 	const p = "nas.canilho.net/"
 	got := propagatedLabels(map[string]string{
-		ManagedByLabel(p):             "cluster-registrar", // describes the source
-		ClusterLabel(p):               "sandbox",           // set explicitly by apply()
-		"nas.canilho.net/flux":        "true",              // must reach the cluster Secret
+		ManagedByLabel(p):             testManagedBy, // describes the source
+		ClusterLabel(p):               "sandbox",     // set explicitly by apply()
+		"nas.canilho.net/flux":        "true",        // must reach the cluster Secret
 		"nas.canilho.net/env":         "lab",
 		"kubernetes.io/metadata.name": "k3k-sandbox", // unrelated, must not leak
 	}, p)

@@ -126,6 +126,18 @@ exportKubeConfig:
   server: https://<address>
 ```
 
+That was enough when this was tested against vcluster 0.36.1 with a LoadBalancer
+address: ArgoCD connected with `insecure: false` and verification passed, so the
+address was already covered by the API server certificate. If yours is not, and
+connections fail x509 verification, add it to the certificate explicitly:
+
+```yaml
+controlPlane:
+  proxy:
+    extraSANs:
+      - <address>
+```
+
 Note that `vc-*` also matches vcluster's own `vc-config-<name>` `Secret`, which
 holds no kubeconfig. That is handled: a `Secret` is only used if it matches the
 name pattern *and* carries `secretKey`. Do not rely on ordering to save you here

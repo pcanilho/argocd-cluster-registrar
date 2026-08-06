@@ -70,6 +70,8 @@ Verified against k3k v1.2.0-rc3 and vcluster 0.36.1 on a Kubernetes 1.26 host.
   pinned tag there quietly shipped the previous image with a new chart.
 - Release notes come from `CHANGELOG.md` rather than commit subjects, and a tag
   with no matching section fails the release.
+- Go toolchain bumped to 1.26.5 (`go.mod`), and `go fix` applied: two manual
+  map-copy loops are now `maps.Copy`.
 
 ### Fixed
 
@@ -110,7 +112,9 @@ Verified against k3k v1.2.0-rc3 and vcluster 0.36.1 on a Kubernetes 1.26 host.
 ### Build
 
 - CI could not lint: `golangci-lint-action` v9 was fed a v1 version, which it
-  rejects outright. Bumped to v2 and migrated `.golangci.yaml` accordingly.
+  rejects outright. Bumped to v2.12 and migrated `.golangci.yaml` accordingly.
+  Note the CI and local versions must match: 2.11 and 2.12 disagree about
+  `goconst`, so a clean local run said nothing while CI failed.
 - CI now runs `go test`, lints the chart with non-default values, and deploys it
   into kind to assert a cluster is registered and then garbage collected. The
   previous deploy test swallowed every assertion with `|| echo "Ignored..."`.
