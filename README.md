@@ -3,7 +3,9 @@
 [![Dependabot Updates](https://github.com/pcanilho/argocd-cluster-registrar/actions/workflows/dependabot/dependabot-updates/badge.svg)](https://github.com/pcanilho/argocd-cluster-registrar/actions/workflows/dependabot/dependabot-updates)
 [![SAST](https://github.com/pcanilho/argocd-cluster-registrar/actions/workflows/sast.yaml/badge.svg)](https://github.com/pcanilho/argocd-cluster-registrar/actions/workflows/sast.yaml)
 
-![version](https://img.shields.io/badge/Version-v0.2.0%20/%20latest-blue)
+[![Version](https://img.shields.io/github/v/release/pcanilho/argocd-cluster-registrar?label=version&sort=semver)](https://github.com/pcanilho/argocd-cluster-registrar/releases)
+[![Go](https://img.shields.io/github/go-mod/go-version/pcanilho/argocd-cluster-registrar)](go.mod)
+[![License](https://img.shields.io/github/license/pcanilho/argocd-cluster-registrar)](LICENSE)
 <p align="center" width="100%">
     <img src="https://github.com/pcanilho/argocd-cluster-registrar/blob/main/docs/images/logo.png?raw=true" width="220"></img>
     <br>
