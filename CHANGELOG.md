@@ -5,6 +5,23 @@ All notable changes to **argocd-cluster-registrar** are documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `capi` promoted from *assumed* to *tested*. Verified against Cluster API v1.13.4
+  with the Docker infrastructure provider: the kubeadm control-plane controller
+  wrote `capi-child-kubeconfig` in the `Cluster`'s namespace, typed
+  `cluster.x-k8s.io/secret`, labelled `cluster.x-k8s.io/cluster-name`, with the
+  kubeconfig under `value` and no other key. Registering it and rebuilding a
+  kubeconfig from the resulting ArgoCD Secret authenticated to the workload cluster
+  as `kubernetes-admin` with full x509 verification. CAPD is what was exercised,
+  but the Secret is written by the control-plane provider, so the shape holds for
+  any infrastructure provider.
+- README trimmed. The per-provider sections had grown to 43% of the page, most of
+  it test provenance rather than instruction. Provenance lives here now; the README
+  keeps the table, the configuration forms and the operational gotchas.
+
 ## [0.3.0] - 2026-08-07
 
 Serves more than one provisioner at a time. Until now `Config` held a single

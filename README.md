@@ -122,10 +122,11 @@ Each preset is a `Secret`-name glob plus the keys that may hold the kubeconfig:
 | `k3k` | [k3k](https://github.com/rancher/k3k) v1.2.0-rc3 | `k3k-*-kubeconfig` | `kubeconfig.yaml` | tested |
 | `vcluster` | [vcluster](https://www.vcluster.com/) 0.36.1 | `vc-*` | `config` | tested, see below |
 | `kamaji` | [Kamaji](https://kamaji.clastix.io/) v1.0.0 standalone | `*-admin-kubeconfig` | `admin.conf`, `admin.svc` | tested, see below |
-| `capi` | [Cluster API](https://cluster-api.sigs.k8s.io/) contract | `*-kubeconfig` | `value` | assumed |
+| `capi` | [Cluster API](https://cluster-api.sigs.k8s.io/) v1.13.4 contract | `*-kubeconfig` | `value` | tested, see below |
 
-`Status` is meant literally: **tested** has been run against the real thing,
-**assumed** was taken from upstream source but not exercised here.
+`Status` is meant literally: **tested** has been run against the real thing.
+Nothing currently ships as **assumed**, but the column stays so it can be honest
+if that changes.
 
 Several can run at once, which is rather the point. One instance serves a mixed
 fleet:
@@ -149,79 +150,32 @@ providers:
 The matched provider is recorded on the cluster `Secret` as
 `<labelPrefix>provider`, so an ApplicationSet can select by provisioner.
 
-#### Scope
+#### Per-provider notes
 
-This registers clusters **provisioned inside the host cluster**: something running
-here writes a kubeconfig `Secret` into a namespace you can label, and that `Secret`
-is the only input. A standalone cluster elsewhere has no such object, so there is
-nothing to discover. That is a different problem, usually one of reachability.
+**Order matters.** The globs overlap on purpose: `capi`'s `*-kubeconfig` also
+matches k3k's `k3k-<cluster>-kubeconfig`. Correctness comes from the key, not the
+name, and where two providers could both claim a `Secret` the one declared first
+wins. Put the more specific provider first. `capi` is the loosest shipped.
 
-#### Why order matters
+**Scope.** This registers clusters provisioned *inside* the host cluster: something
+running here writes a kubeconfig `Secret` into a namespace you can label. A
+standalone cluster elsewhere has no such object, so there is nothing to discover.
 
-The globs overlap deliberately. `capi`'s `*-kubeconfig` also matches k3k's
-`k3k-<cluster>-kubeconfig`. Correctness comes from the **key**, not the name: the
-k3k `Secret` carries no `value`, so `capi` falls through. Where two providers could
-both claim a `Secret`, the one declared first wins, and a `Secret` already claimed
-is never offered twice, so one cluster is registered once.
+**Kamaji** normally writes both `admin.conf` and `admin.svc`. Only the first key
+present is tried, so `admin.conf` wins; reorder them in a custom entry if you need
+the other. Running Kamaji through its Cluster API control-plane provider produces
+a second, CAPI-shaped `Secret` for the same cluster, so with both presets enabled
+the one declared first decides which is used.
 
-That is not hypothetical. Driving Kamaji through its Cluster API control-plane
-provider produces **two** `Secret`s for one cluster: Kamaji's own
-`<tcp>-admin-kubeconfig`, and a CAPI-shaped `<cluster>-kubeconfig` copied from it.
-With both presets enabled, both match.
+**`capi`** is the mandatory control-plane contract, so it covers any CAPI cluster
+whatever the infrastructure provider, plus standalone k0smotron. It does **not**
+usefully cover managed cloud control planes: CAPA's EKS path writes an `exec`
+credential, which cannot become an ArgoCD `Secret` at all, and the CAPI-internal
+one holds a token that rotates every ~15 minutes. Treat it as self-managed only.
 
-#### Kamaji
-
-Tested against Kamaji v1.0.0: a `TenantControlPlane` named `tenant-00` produced
-`tenant-00-admin-kubeconfig`, and the resulting registration authenticated to the
-tenant API server with `insecure: false` and full x509 verification.
-
-Two things worth knowing. The `Secret` also carries `super-admin.conf` and
-`super-admin.svc`; the preset tries `admin.conf` first, so the ordinary admin
-credential wins and the more privileged one is never copied. And Kamaji writes
-sibling `<tcp>-controller-manager-kubeconfig` and `<tcp>-scheduler-kubeconfig`
-`Secret`s, which do **not** end in `-admin-kubeconfig` and so never match the
-`kamaji` preset. They do match `capi`'s looser `*-kubeconfig`, but carry no
-`value` key, so they are rejected there too.
-
-`admin.conf` points at the control plane's `Service` address. When
-`spec.networkProfile.address` advertises a different one, Kamaji writes it to
-`admin.svc` as well, hence two keys. Both are normally present at once: a live
-v1.0.0 `TenantControlPlane` carried `admin.conf`, `admin.svc`, `super-admin.conf`
-and `super-admin.svc` on the same `Secret`.
-
-Whichever key is present first in the list wins, and only that one is tried. If
-`admin.conf` is unusable, `admin.svc` is not attempted as a fallback; reorder them
-in a custom provider entry if you need the other.
-
-#### About `capi`
-
-It is the *mandatory* Cluster API control-plane contract rather than a convention:
-`<cluster>-kubeconfig` in the Cluster's namespace, type `cluster.x-k8s.io/secret`,
-kubeconfig under `value`. One entry therefore covers any CAPI cluster whatever the
-**infrastructure** provider. Note that the kubeconfig is written by the
-*control-plane* provider (KCP, KamajiControlPlane, K0sControlPlane,
-KThreesControlPlane, Talos CACPPT), not by CAPD, Proxmox or Metal3. Standalone
-k0smotron adopts the same shape, so it is covered as well.
-[CAPI + KubeVirt](https://github.com/kubernetes-sigs/cluster-api-provider-kubevirt)
-is the closest peer to k3k and vcluster: child clusters as VMs inside the host
-cluster.
-
-It does **not** usefully cover managed cloud control planes. CAPA's EKS path writes
-a second `<cluster>-user-kubeconfig` holding an `exec` credential, which cannot be
-copied into an ArgoCD `Secret` at all, and the CAPI-internal one holds a token that
-rotates every ~15 minutes. A candidate that fails to parse is skipped in favour of
-the next, so the `exec` case degrades safely. A short-lived token is worse: it
-parses, registers, and then quietly expires. So
-treat `capi` as self-managed control planes only.
-
-`capi` is also the loosest pattern shipped: `*-kubeconfig` matches anything in a
-managed namespace ending that way. Put a more specific provider first.
-
-#### vcluster
-
-vcluster exports a kubeconfig pointing at `https://localhost:8443`, which is fine
-for a port-forward and useless to ArgoCD. Set `exportKubeConfig.server` to an
-address ArgoCD can reach, and expose the control plane on it:
+**vcluster** exports a kubeconfig pointing at `https://localhost:8443`, which is
+fine for a port-forward and useless to ArgoCD. This is the most common reason a
+vcluster registration silently does not work. Point it somewhere ArgoCD can reach:
 
 ```yaml
 controlPlane:
@@ -232,10 +186,8 @@ exportKubeConfig:
   server: https://<address>
 ```
 
-That was enough when this was tested against vcluster 0.36.1 with a LoadBalancer
-address: ArgoCD connected with `insecure: false` and verification passed, so the
-address was already covered by the API server certificate. If yours is not, and
-connections fail x509 verification, add it to the certificate explicitly:
+If connections then fail x509 verification, the address is not on the API server
+certificate; add it:
 
 ```yaml
 controlPlane:
@@ -243,13 +195,6 @@ controlPlane:
     extraSANs:
       - <address>
 ```
-
-Note that `vc-*` also matches vcluster's own `vc-config-<name>` `Secret`, which
-holds no kubeconfig (its key is `config.yaml`, not `config`). That is handled: a
-`Secret` is only used if it matches the name pattern *and* carries one of the
-provider's keys. Do not rely on ordering to save you here: whether the decoy sorts
-first depends entirely on the names. `vc-config-x` sorts before `vc-x`, but
-`vc-config-abc` sorts *after* `vc-abc`. The key check is what saves you, not the sort.
 
 ### Marking a cluster for registration
 
