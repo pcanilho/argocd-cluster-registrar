@@ -5,6 +5,133 @@ All notable changes to **argocd-cluster-registrar** are documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-08-07
+
+Closes the four things 0.4.0 deliberately left open: metrics, a TTL for demoted
+registrations, key-level fallthrough on kubeconfig `Secret`s, and the absence of
+any test driving a real manager.
+
+Upgrading needs no configuration change, no RBAC change, and nothing new is
+served or deleted unless you ask for it.
+
+### Added
+
+- **Prometheus metrics, off by default.** Four series, all counts of this
+  instance's own decisions:
+
+  | Metric | |
+  |---|---|
+  | `argocd_cluster_registrar_conflicts_total{reason}` | registrations refused, by which check refused them |
+  | `argocd_cluster_registrar_adoptions_total` | orphaned `Secret`s adopted by a matching namespace |
+  | `argocd_cluster_registrar_registrations{state}` | registrations owned, `active` or `demoted` |
+  | `argocd_cluster_registrar_unrouted_secrets` | owned `Secret`s no reconcile key can reach |
+
+  `conflicts_total{reason="incumbent"}` is the one worth alerting on: a contested
+  cluster name persists until a human resolves it, and until now the only signal
+  was a log line. `reason="create_race"` is benign and expected during a
+  leader-election handover; do not alert on it.
+
+  The counters are published at zero from startup, because an unincremented
+  counter is absent from `/metrics` entirely and an absent series makes
+  `increase(...[15m]) > 0` unevaluable rather than false.
+
+  Enable with `metrics.enabled`, which opens the port on the pod;
+  `metrics.service.enabled` additionally renders a `Service`. **The endpoint is
+  unauthenticated**, so put a `NetworkPolicy` in front of it. Securing it properly
+  means controller-runtime's authn/authz filter, which links `k8s.io/apiserver`
+  and its cel-go/gRPC/OpenTelemetry arm and needs `tokenreviews` and
+  `subjectaccessreviews` RBAC; nothing published carries a cluster name, a
+  namespace or a credential, so that trade was not worth making. No
+  `ServiceMonitor` ships: it needs a CRD `helm template` cannot check for, so it
+  could not be proven correct in CI.
+
+  **Which** cluster is contested stays in the log line, which names it along with
+  both namespaces, and it is not coming to the metrics. Those values are read off
+  objects a tenant creates, so as labels they are unbounded cardinality anyone
+  able to label a namespace could mint, on the one code path that exists because
+  somebody may be acting in bad faith. A per-conflict gauge would also be
+  unclearable: when the losing claimant's namespace is deleted, the reconcile
+  takes the `NotFound` branch and never reaches the code that would zero it, so it
+  would alert forever about a conflict that no longer exists.
+
+- **`demotedTTL`, off by default.** A renamed cluster leaves its old registration
+  demoted rather than deleted, so the rename can be undone. Nothing ever cleaned
+  those up: they accumulated until their source namespace was deleted, and they
+  held the old cluster name against any other claimant for exactly as long.
+
+  Setting `demotedTTL` deletes them once they have been superseded that long,
+  which also frees the name they were holding, so a namespace refused for that
+  name starts succeeding. It is opt-in because the TTL is equally a deadline on
+  reverting a rename.
+
+  Expiry is deliberately narrow. It runs only when the source namespace is alive
+  and has registered under a different name, never while it is terminating or
+  undiscoverable, and never sooner than `interval`. `<labelPrefix>prune: disabled`
+  exempts a registration from it, as from the other two removal paths.
+
+### Fixed
+
+- **Every key present on a kubeconfig `Secret` is now tried, in declared order.**
+  Discovery stopped at the first key a `Secret` carried, so each provider/`Secret`
+  pair produced exactly one candidate. Kamaji ships `admin.conf` and `admin.svc`
+  together, so a half-written or otherwise unusable `admin.conf` put `admin.svc`
+  out of reach and left the namespace unregistered for as long as it stayed that
+  way, with a working kubeconfig sitting beside it. `Provider.SecretKeys`
+  documented its keys as "tried in order" throughout.
+
+  Fallthrough across `Secret`s already worked and is unchanged; this extends the
+  same mechanism within one. Scope worth being plain about: both Kamaji keys
+  normally parse, so `admin.conf` still wins on a healthy install. This makes the
+  declared order real rather than changing which key anyone uses today.
+
+- **A repeated key in a provider spec is now rejected at startup** instead of
+  parsing the same bytes twice, matching how a duplicate provider name is already
+  handled.
+
+### Changed
+
+- The `--dry-run` de-escalation of `--leader-elect` no longer writes back into the
+  flag variable. No user-visible effect; it made the flag mapping untestable and
+  leaked state across cases in the test binary.
+
+- The README no longer restates the chart's values. Nine keys were documented in
+  two places while twenty-three existed, so `leaderElection`, `probes`,
+  `replicaCount` and `resources` read as though they were not configurable. Use
+  `helm show values`. The architecture notes moved to
+  [docs/architecture.md](docs/architecture.md), where they can grow without
+  standing between a reader and the install instructions.
+
+### Internal
+
+- A test now drives a real manager under envtest. The startup seeder had no
+  coverage anywhere: removing it leaves every other test passing while a
+  registration orphaned during downtime survives forever with no symptom. Two kind
+  steps cover the same ground against real RBAC.
+
+- CI asserts `k8s.io/apiserver` stays out of the binary. One import of
+  controller-runtime's metrics filter brings the whole arm back, and that cost is
+  the entire reason metrics were deferred a release.
+
+### Migrating from 0.4.x
+
+Nothing to change. No RBAC change, no value changes meaning, and the two new
+features are both off until you turn them on.
+
+1. **Metrics are off.** `metrics.enabled` opens an unauthenticated port on the
+   pod; pair it with a `NetworkPolicy`. `metrics.service.enabled` is a separate
+   switch for the `Service`.
+
+2. **`demotedTTL` is `0s`, meaning never.** Existing demoted registrations are
+   untouched until you set it. When you do, remember it is also how long a
+   mistaken rename stays revertible.
+
+3. **Discovery may now find a cluster it previously could not.** If a namespace
+   was stuck unregistered because the first key on its `Secret` was unusable, it
+   will register on first reconcile after upgrade. That is the fix working.
+
+4. **A duplicated `secretKeys` entry now fails at startup** rather than being
+   quietly tolerated. It has never done anything useful; remove the duplicate.
+
 ## [0.4.0] - 2026-08-07
 
 A controller. Registration and removal now follow namespace events instead of a
