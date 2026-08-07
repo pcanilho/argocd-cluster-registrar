@@ -569,8 +569,14 @@ func (r *Registrar) ReconcileOne(ctx context.Context, nsName string) (bool, erro
 			//
 			// Skip collection: a refused claimant vouches for nothing, and its own
 			// earlier registrations must not be read as superseded.
+			//
+			// The reason is logged under "conflict", NOT "reason": that key is
+			// already taken by the error itself, and a TextHandler emits both
+			// rather than choosing, which would break anything already grepping
+			// the existing field.
 			r.log.Error("refused to register cluster", slog.String("cluster", c.cluster),
-				slog.String("namespace", c.namespace), slog.Any("reason", err))
+				slog.String("namespace", c.namespace),
+				slog.String("conflict", conflict.reason), slog.Any("reason", err))
 			return false, nil
 		}
 		r.log.Error("failed to register cluster",
@@ -706,16 +712,47 @@ func (e *apiFailure) Unwrap() error { return e.err }
 //
 // Reconcile must not count it toward the pass's error return. A contested name is
 // a configuration mistake that persists until a human fixes it, so treating it as
-// an error would fail every pass forever and, once there is a metric, pump it
-// forever too. It is still logged at Error, because a silently resolved conflict
-// over a credential-bearing Secret is the actual hazard.
-type conflictError struct{ err error }
+// an error would fail every pass forever and pump the conflict metric forever too.
+// It is still logged at Error, because a silently resolved conflict over a
+// credential-bearing Secret is the actual hazard.
+//
+// The reason travels on the error rather than being re-derived from its text: it
+// is the metric's only label, and matching on message wording would make a
+// reworded sentence a silent monitoring regression.
+type conflictError struct {
+	reason string
+	err    error
+}
 
 func (e *conflictError) Error() string { return e.err.Error() }
 func (e *conflictError) Unwrap() error { return e.err }
 
-func conflictf(format string, a ...any) error {
-	return &conflictError{fmt.Errorf(format, a...)}
+// The closed set of reasons a claim can be refused. Every value is a constant
+// because these are metric label values: anything derived from a namespace or a
+// cluster name would be attacker-chosen cardinality on the one path that is
+// explicitly adversarial.
+const (
+	// conflictNotManaged is a Secret this registrar does not own at all: hand
+	// written, or another instance's.
+	conflictNotManaged = "not_managed"
+	// conflictOrphanClusterMismatch is an owned Secret recording no source
+	// namespace whose cluster label names a different cluster, so adopting it
+	// would repoint someone else's registration.
+	conflictOrphanClusterMismatch = "orphan_cluster_mismatch"
+	// conflictIncumbent is the ordinary case: the name is held by another live
+	// namespace and the holder keeps it.
+	conflictIncumbent = "incumbent"
+	// conflictContestedName is an unclaimed name several namespaces want, awarded
+	// to the oldest.
+	conflictContestedName = "contested_name"
+	// conflictCreateRace is benign and self-resolving: two workers created the
+	// same Secret at once. Expected during a leader-election handover, so it is
+	// counted separately rather than alerted on.
+	conflictCreateRace = "create_race"
+)
+
+func conflictf(reason, format string, a ...any) error {
+	return &conflictError{reason: reason, err: fmt.Errorf(format, a...)}
 }
 
 // discoverOne evaluates a single managed namespace. The bool reports whether a
@@ -984,7 +1021,7 @@ func secretName(cluster string) string { return "cluster-" + cluster }
 func (r *Registrar) checkOwnership(existing *coreV1.Secret, c child) error {
 	if existing.Labels[r.managedByLabel()] != r.cfg.ManagedByValue {
 		// Hand-registered, or another registrar's. Either way not ours to take.
-		return conflictf(
+		return conflictf(conflictNotManaged,
 			"secret %s/%s is not managed by this registrar (%s=%q); "+
 				"refusing to take it over for namespace %s. Rename the cluster, or delete "+
 				"the secret if it is genuinely stale",
@@ -1011,7 +1048,7 @@ func (r *Registrar) checkOwnership(existing *coreV1.Secret, c child) error {
 		// wearing a different hat. Requiring the cluster label to match means an
 		// attacker gains nothing they did not already have.
 		if existing.Labels[r.clusterLabel()] != c.cluster {
-			return conflictf(
+			return conflictf(conflictOrphanClusterMismatch,
 				"secret %s/%s is owned but records no source namespace, and its %s label is %q "+
 					"rather than %q; refusing to adopt it for namespace %s",
 				r.cfg.TargetNamespace, existing.Name, r.clusterLabel(),
@@ -1028,7 +1065,7 @@ func (r *Registrar) checkOwnership(existing *coreV1.Secret, c child) error {
 		// under the same name is a legitimate claimant, and refusing it here
 		// would deadlock: collect() would see a live namespace of that name and
 		// refuse to delete the registration, so neither side could ever move.
-		return conflictf(
+		return conflictf(conflictIncumbent,
 			"cluster %q is registered from namespace %s; refusing to take it over for %s. "+
 				"Two namespaces must not claim one cluster name",
 			c.cluster, src, c.namespace)
@@ -1083,7 +1120,7 @@ func (r *Registrar) claimContestedName(ctx context.Context, c child) error {
 	if winner == "" || winner == c.namespace {
 		return nil
 	}
-	return conflictf(
+	return conflictf(conflictContestedName,
 		"cluster %q is also claimed by namespace %s, which is older; "+
 			"not registering it from %s", c.cluster, winner, c.namespace)
 }
@@ -1137,7 +1174,8 @@ func (r *Registrar) apply(ctx context.Context, c child) error {
 				// Someone wrote it between our Get and our Create. Benign, and
 				// resolved by incumbency on the next pass -- which is also what
 				// keeps this safe once more than one worker reconciles at a time.
-				return conflictf("cluster secret %s was created concurrently; retrying next pass",
+				return conflictf(conflictCreateRace,
+					"cluster secret %s was created concurrently; retrying next pass",
 					want.Name)
 			}
 			return fmt.Errorf("create: %w", err)

@@ -30,6 +30,9 @@ const (
 	testSourceNS = "k3k-src"
 	// keyConfig is the ArgoCD cluster Secret's credential key.
 	keyConfig = "config"
+	// testServer is a placeholder endpoint for cases where the address itself is
+	// not what is being asserted.
+	testServer = "https://x"
 
 	// Kamaji's two kubeconfig keys. Named because the multi-key tests repeat them
 	// and because which of the two wins is itself the assertion.
@@ -113,7 +116,7 @@ func registeredSecret(cluster, srcNS string) *coreV1.Secret {
 				SourceNamespaceLabel(testPrefix): srcNS,
 			},
 		},
-		Data: map[string][]byte{"name": []byte(cluster), "server": []byte("https://x"), "config": []byte("{}")},
+		Data: map[string][]byte{"name": []byte(cluster), "server": []byte(testServer), "config": []byte("{}")},
 	}
 }
 
@@ -539,7 +542,7 @@ func TestApplyAdoptsSecretWithMatchingClusterLabel(t *testing.T) {
 
 	if err := r.apply(context.Background(), child{
 		cluster: "a", namespace: testSourceNS, namespaceUID: "uid-k3k-a",
-		server: "https://x", config: "{}",
+		server: testServer, config: "{}",
 	}); err != nil {
 		t.Fatalf("apply refused to adopt its own registration: %v", err)
 	}
@@ -671,7 +674,7 @@ func TestCreateRaceReturnsConflict(t *testing.T) {
 
 	err := r.apply(context.Background(), child{
 		cluster: "a", namespace: testSourceNS, namespaceUID: "uid-k3k-a",
-		server: "https://x", config: "{}",
+		server: testServer, config: "{}",
 	})
 	var conflict *conflictError
 	if !errors.As(err, &conflict) {
@@ -1282,5 +1285,94 @@ func TestDuplicateSecretKeysInOneProviderAreRejected(t *testing.T) {
 	}}
 	if err := cfg.Validate(); err == nil {
 		t.Error("a duplicated secret key was accepted")
+	}
+}
+
+// Every way a claim can be refused carries its own reason.
+//
+// The reason is the conflict metric's only label, so a site tagged with the wrong
+// constant is a monitoring bug that no other test can see: the refusal still
+// happens, the Secret is still protected, and only the counter lies. Deriving it
+// from the message text instead would make a reworded sentence a silent
+// regression, which is why it travels on the error.
+func TestEveryRefusalCarriesItsOwnReason(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		want  string
+		build func(t *testing.T) (*Registrar, child)
+	}{
+		{
+			name: "a Secret we do not own at all",
+			want: conflictNotManaged,
+			build: func(*testing.T) (*Registrar, child) {
+				hand := &coreV1.Secret{ObjectMeta: metaV1.ObjectMeta{
+					Name:      "cluster-prod",
+					Namespace: testTargetNS,
+					Labels:    map[string]string{argoSecretTypeLabel: argoSecretTypeValue},
+				}}
+				r, _ := newTestRegistrar(hand)
+				return r, child{cluster: "prod", namespace: "tenant-evil", server: testServer, config: "{}"}
+			},
+		},
+		{
+			name: "an orphan naming a different cluster",
+			want: conflictOrphanClusterMismatch,
+			build: func(*testing.T) (*Registrar, child) {
+				existing := registeredSecret("a", testSourceNS)
+				delete(existing.Labels, SourceNamespaceLabel(testPrefix))
+				existing.Labels[ClusterLabel(testPrefix)] = "somethingelse"
+				r, _ := newTestRegistrar(existing)
+				return r, child{cluster: "a", namespace: testSourceNS, server: testServer, config: "{}"}
+			},
+		},
+		{
+			name: "a name another live namespace holds",
+			want: conflictIncumbent,
+			build: func(*testing.T) (*Registrar, child) {
+				r, _ := newTestRegistrar(registeredSecret("a", "k3k-incumbent"))
+				return r, child{cluster: "a", namespace: "k3k-challenger", server: testServer, config: "{}"}
+			},
+		},
+		{
+			name: "an unclaimed name an older namespace also wants",
+			want: conflictContestedName,
+			build: func(t *testing.T) (*Registrar, child) {
+				// No Secret exists, deliberately: with one present this would take
+				// the incumbency branch instead and pass under the wrong reason.
+				r, c := newTestRegistrar(
+					managedNSAt("k3k-older", "a", 2*time.Hour),
+					managedNSAt("k3k-younger", "a", time.Hour),
+				)
+				if secretExists(t, c, "cluster-a") {
+					t.Fatal("this case must reach the create path, not the incumbency check")
+				}
+				return r, child{cluster: "a", namespace: "k3k-younger", server: testServer, config: "{}"}
+			},
+		},
+		{
+			name: "two workers creating the same Secret at once",
+			want: conflictCreateRace,
+			build: func(*testing.T) (*Registrar, child) {
+				r, c := newTestRegistrar(managedNS(testSourceNS, "a"))
+				c.PrependReactor("create", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apiErrors.NewAlreadyExists(
+						schema.GroupResource{Resource: "secrets"}, "cluster-a")
+				})
+				return r, child{cluster: "a", namespace: testSourceNS, server: testServer, config: "{}"}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, c := tc.build(t)
+			err := r.apply(context.Background(), c)
+			var conflict *conflictError
+			if !errors.As(err, &conflict) {
+				t.Fatalf("apply returned %v, want a conflictError", err)
+			}
+			if conflict.reason != tc.want {
+				t.Errorf("reason = %q, want %q; the conflict metric would count this "+
+					"refusal under the wrong label", conflict.reason, tc.want)
+			}
+		})
 	}
 }
