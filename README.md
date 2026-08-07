@@ -14,7 +14,7 @@
     A cluster registrar made for ArgoCD
     <br>
     <br>
-    ⚙️ <a href="#installing">Installing</a> | 🔎 <a href="#configuring">Configuring</a> | 🧩 <a href="#how-it-works">How it works</a>
+    ⚙️ <a href="#installing">Installing</a> | 🔎 <a href="#configuring">Configuring</a> | 🧩 <a href="#how-it-works">How it works</a> | 🔐 <a href="#operating">Operating</a>
     <br>
     <br>
 </p>
@@ -51,9 +51,11 @@ usually skip:
 ## Installing
 
 Install it once, as a singleton. Do not add it as a dependency of a per-cluster
-chart: every instance reconciles cluster-wide and garbage collects, so two
-instances sharing a `managedBy` value fight over the same `Secret`s, each
-overwriting the other's work every pass.
+chart: every instance reconciles cluster-wide, so a second one is at best doing
+the same work twice. Give each instance its own `managedBy` if you do run more
+than one. Two instances sharing that value but configured with different
+`providers` will rewrite each other's `<labelPrefix>provider` label every pass,
+forever.
 
 ### Helm `dependency`
 
@@ -114,8 +116,13 @@ argocd-cluster-registrar --once --dry-run --debug
 
 ### Providers
 
+This registers clusters provisioned *inside* the host cluster: something running
+here writes a kubeconfig `Secret` into a namespace you can label. A standalone
+cluster elsewhere has no such object, so there is nothing to discover.
+
 `providers` lists the provisioner shapes to look for, **in precedence order**.
-Each preset is a `Secret`-name glob plus the keys that may hold the kubeconfig:
+Each preset is a `Secret`-name glob plus the keys that may hold the kubeconfig.
+`Status` is meant literally: **tested** means run against the version shown.
 
 | Preset | Provisioner | `Secret` name | Key(s) | Status |
 |---|---|---|---|---|
@@ -124,9 +131,8 @@ Each preset is a `Secret`-name glob plus the keys that may hold the kubeconfig:
 | `kamaji` | [Kamaji](https://kamaji.clastix.io/) v1.0.0 standalone | `*-admin-kubeconfig` | `admin.conf`, `admin.svc` | tested, see below |
 | `capi` | [Cluster API](https://cluster-api.sigs.k8s.io/) v1.13.4 contract | `*-kubeconfig` | `value` | tested, see below |
 
-`Status` is meant literally: **tested** has been run against the real thing.
-Nothing currently ships as **assumed**, but the column stays so it can be honest
-if that changes.
+Nothing currently ships as **assumed**, but the column stays so it can stay
+honest if that changes.
 
 Several can run at once, which is rather the point. One instance serves a mixed
 fleet:
@@ -156,10 +162,6 @@ The matched provider is recorded on the cluster `Secret` as
 matches k3k's `k3k-<cluster>-kubeconfig`. Correctness comes from the key, not the
 name, and where two providers could both claim a `Secret` the one declared first
 wins. Put the more specific provider first. `capi` is the loosest shipped.
-
-**Scope.** This registers clusters provisioned *inside* the host cluster: something
-running here writes a kubeconfig `Secret` into a namespace you can label. A
-standalone cluster elsewhere has no such object, so there is nothing to discover.
 
 **Kamaji** normally writes both `admin.conf` and `admin.svc`. Only the first key
 present is tried, so `admin.conf` wins; reorder them in a custom entry if you need
@@ -260,7 +262,8 @@ flowchart LR
 ```
 
 The provisioner writes the kubeconfig. The registrar reshapes its credentials
-into ArgoCD's format, copies across any prefixed labels from the namespace, and writes the result into `argocd`.
+into ArgoCD's format, copies across any prefixed labels from the namespace, and
+writes the result into `argocd`.
 
 Each pass is a full reconcile rather than an event diff. It is easier to reason
 about, and refreshing credentials comes for free:
@@ -284,49 +287,13 @@ Cluster `Secret`s that carry the ownership label but whose source namespace has
 gone are deleted. Anything without that label is left alone, so clusters you
 registered by hand are safe.
 
-Renaming a cluster is the one other way a registration goes away, and it is not a
-deletion. If a namespace's `cluster` label changes, the new name is registered and
-the old `Secret` is **demoted**: its `argocd.argoproj.io/secret-type` label is
-parked under `<labelPrefix>orphaned-secret-type` and it gains
-`<labelPrefix>superseded-by` and `<labelPrefix>stale-since`. ArgoCD finds clusters
-by that one label, so the stale entry disappears from ArgoCD immediately while
-nothing is destroyed: everything ArgoCD wrote into it, and any annotations you
-added, survive. Change the label back and the registration is restored intact, so
-a mistaken rename costs nothing. Demoted `Secret`s are still garbage collected
-once their source namespace is gone.
-
-### Who is allowed to set these labels
-
-The two labels are **policy input**, not decoration: together they decide whether
-a cluster gets registered at all and what name it takes in `argocd`, a namespace
-where writing a cluster `Secret` is an administrative act. Treat them as something
-the platform operator owns.
-
-Kubernetes helps here by default. The built-in `admin` role, bound into a
-namespace with a `RoleBinding`, grants no write access to the `Namespace` object
-itself, so an ordinary tenant cannot relabel their own namespace. But **whoever
-can create a namespace sets its labels at creation**, so a cluster where teams
-self-serve namespaces is a different situation.
-
-Incumbency means a registration cannot be stolen, which is the attack worth
-caring about. It does not, and cannot, stop someone who can label a namespace
-from registering a cluster of their own under any *free* name. No collision policy
-can, because the label is the authorization. If you cannot vouch for who sets
-these labels, constrain them where they are written rather than here: a
-`ValidatingAdmissionPolicy` binding permitted cluster names to namespace metadata
-is the usual answer, and is what Gateway API recommends for the same problem.
-
-### Changing `managedBy` or `labelPrefix` later
-
-Both are part of the ownership record written onto every cluster `Secret`, so
-changing either on a running install orphans everything already registered. The
-registrar will refuse to adopt those `Secret`s, because refusing to write objects
-that record a different owner is exactly the protection above, and garbage
-collection will not see them either since it selects on the same label.
-
-Neither value is meant to change, but if you must: delete the old cluster
-`Secret`s and let them be recreated, or relabel them by hand to the new values
-first. The refusal is logged per cluster, naming the `Secret` and the namespace.
+Renaming a cluster is the one other way a registration leaves ArgoCD, and it is
+not a deletion. The new name is registered and the old `Secret` is **demoted**:
+ArgoCD's `secret-type` label is parked under `<labelPrefix>orphaned-secret-type`,
+alongside `<labelPrefix>superseded-by` and `<labelPrefix>stale-since`. ArgoCD
+finds clusters by that one label, so the stale entry disappears at once while
+nothing is destroyed. Change the label back and the registration returns intact,
+so a mistaken rename costs nothing.
 
 RBAC is split by scope. Reads are cluster-wide (`namespaces` get/list, `secrets`
 list) because discovery is label-driven and the sources sit in one namespace per
@@ -334,3 +301,35 @@ child. Every **write** is a namespaced `Role` bound to
 `targetNamespace` alone, since that is the only place this ever creates, updates
 or deletes anything. Granting `secrets` write across the whole cluster would be a
 privilege-escalation path in exchange for nothing.
+
+## Operating
+
+### Who is allowed to set these labels
+
+The two labels are **policy input**, not decoration: together they decide whether
+a cluster is registered at all and what name it takes in `argocd`, where writing
+a cluster `Secret` is an administrative act. Treat them as the platform
+operator's to set.
+
+Kubernetes helps by default: the built-in `admin` role, bound into a namespace
+with a `RoleBinding`, grants no write access to the `Namespace` object itself, so
+an ordinary tenant cannot relabel their own namespace. But **whoever can create a
+namespace sets its labels at creation**, so a cluster where teams self-serve
+namespaces is a different situation.
+
+Incumbency stops a registration being taken. It cannot stop someone who can label
+a namespace from registering a cluster under any *free* name, and no collision
+rule could: the label is the authorization. If you cannot vouch for who sets
+these labels, constrain them where they are written, with a
+`ValidatingAdmissionPolicy` binding permitted cluster names to namespace metadata.
+
+### Changing `managedBy` or `labelPrefix` later
+
+Both are part of the ownership record written onto every cluster `Secret`, so
+changing either on a running install orphans everything already registered. The
+new instance refuses to adopt those `Secret`s, and garbage collection will not see
+them either, since it selects on the same label.
+
+Neither is meant to change, but if you must: delete the old cluster `Secret`s and
+let them be recreated, or relabel them by hand to the new values first. The
+refusal is logged per cluster, naming the `Secret` and the namespace.
