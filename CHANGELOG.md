@@ -82,6 +82,10 @@ upgrade` applies for you; see "Migrating from 0.3.x".
   restores the registration, credentials and all. Demoted `Secret`s are still
   collected once their namespace is gone.
 
+  A demoted registration keeps its cluster name reserved, which is what makes the
+  revert possible: another namespace claiming that name is refused while it exists.
+  Delete it if the name should pass to someone else.
+
 ### Changed
 
 - **Two namespaces claiming one cluster name no longer skip both.** Whoever holds
@@ -100,6 +104,15 @@ upgrade` applies for you; see "Migrating from 0.3.x".
   than also requiring ArgoCD's `secret-type` label, so demoted registrations stay
   collectable. Only `Secret`s carrying the ownership label are ever eligible, as
   before.
+
+- **A namespace deleted and recreated under the same name no longer strands its
+  predecessor's registration.** Namespace names are reusable and UIDs are not, so a
+  registration recording a UID other than the one the namespace now carries has a
+  source that is provably gone. Previously, if the replacement never became
+  discoverable, every path returned early rather than conclude anything about it
+  and the old registration went on pointing at a destroyed API server. Only
+  registrations that actually record a UID are eligible, so nothing written before
+  this release is affected.
 
 - Cluster `Secret`s now record `<prefix>source-namespace-uid`, and the garbage
   collection delete is preconditioned on the `Secret`'s own UID. Under a watch the

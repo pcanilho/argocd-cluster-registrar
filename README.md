@@ -305,7 +305,9 @@ ArgoCD's `secret-type` label is parked under `<labelPrefix>orphaned-secret-type`
 alongside `<labelPrefix>superseded-by` and `<labelPrefix>stale-since`. ArgoCD
 finds clusters by that one label, so the stale entry disappears at once while
 nothing is destroyed. Change the label back and the registration returns intact,
-so a mistaken rename costs nothing.
+so a mistaken rename costs nothing. It also keeps the old cluster name reserved,
+which is what makes that revert possible; delete it if a different namespace
+should take that name.
 
 RBAC is split by scope. Reads are cluster-wide (`namespaces` get/list/watch,
 `secrets` **list only**) because discovery is label-driven and the sources sit in

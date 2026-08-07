@@ -524,6 +524,12 @@ func (r *Registrar) ReconcileOne(ctx context.Context, nsName string) (bool, erro
 		return false, err
 	}
 
+	// Before discovery, because the early return below is exactly the path that
+	// would otherwise strand a predecessor's registration forever.
+	if err := r.collectStaleUID(ctx, nsName, ns.UID); err != nil {
+		return false, err
+	}
+
 	c, ok := r.discoverOne(ctx, ns)
 	if !ok {
 		// Could not be evaluated. Skip collection entirely rather than concluding
@@ -1339,6 +1345,61 @@ func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, 
 		return remaining, fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
 	return remaining, nil
+}
+
+// collectStaleUID removes registrations whose recorded source namespace has been
+// replaced by a different object of the same name.
+//
+// A namespace name is reusable; a UID is not. So a Secret recording
+// <prefix>source-namespace-uid=U1 while the namespace now called X is U2 is a
+// registration whose source is provably gone -- not merely unseen, gone, because
+// something else holds its name. That is positive proof of the same kind as a
+// NotFound, which is why this is allowed to delete.
+//
+// It runs BEFORE discovery, and that placement is the whole point. Delete and
+// recreate a namespace (a GitOps re-apply does exactly this) and, if the
+// replacement never becomes discoverable, every other path returns early to avoid
+// concluding anything about it -- leaving the predecessor's registration pointing
+// at a destroyed API server indefinitely.
+//
+// Guarded on the label being PRESENT. Secrets written before 0.4.0 do not carry
+// it, and absence must never be read as a mismatch.
+func (r *Registrar) collectStaleUID(ctx context.Context, nsName string, uid types.UID) error {
+	if uid == "" {
+		return nil
+	}
+	selector := fmt.Sprintf("%s=%s,%s=%s",
+		r.managedByLabel(), r.cfg.ManagedByValue, r.sourceNamespaceLabel(), nsName)
+	secrets, err := r.client.CoreV1().Secrets(r.cfg.TargetNamespace).
+		List(ctx, metaV1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return fmt.Errorf("list cluster secrets (%s): %w", selector, err)
+	}
+
+	var errs []string
+	for i := range secrets.Items {
+		s := &secrets.Items[i]
+		recorded := s.Labels[r.sourceNamespaceUIDLabel()]
+		if recorded == "" || recorded == string(uid) {
+			continue
+		}
+		if s.Labels[r.pruneLabel()] == PruneDisabled {
+			r.log.Debug("registration is opted out of collection; leaving it",
+				slog.String("secret", s.Name), slog.String("namespace", nsName))
+			continue
+		}
+		r.log.Info("source namespace was replaced by a different one of the same name",
+			slog.String("secret", s.Name), slog.String("namespace", nsName),
+			slog.String("recordedUID", recorded), slog.String("currentUID", string(uid)))
+		if err := r.deleteOrphan(ctx, s, nsName); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 // deleteOrphan removes a registration whose source namespace is provably gone.

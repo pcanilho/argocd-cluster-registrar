@@ -1026,6 +1026,82 @@ func TestPruneCannotBePropagatedFromTheSourceNamespace(t *testing.T) {
 	}
 }
 
+// Namespace names are reusable and UIDs are not. Deleting and recreating a
+// namespace -- which a GitOps re-apply does routinely -- leaves the predecessor's
+// registration pointing at a destroyed API server, and every other path returns
+// early rather than conclude anything about a namespace it could not evaluate.
+func TestReplacedNamespaceDoesNotStrandItsPredecessorsRegistration(t *testing.T) {
+	stale := registeredSecret("a", testNS)
+	stale.Labels[SourceNamespaceUIDLabel(testPrefix)] = "uid-old"
+
+	// The replacement exists but never becomes discoverable: no kubeconfig Secret.
+	replacement := managedNS(testNS, "a")
+	replacement.UID = "uid-new"
+
+	r, c := newTestRegistrar(replacement, stale)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if secretExists(t, c, "cluster-a") {
+		t.Error("a registration whose source namespace was replaced is still present, " +
+			"pointing at a cluster that no longer exists")
+	}
+}
+
+// Absence of the label is not a mismatch. Every Secret written before 0.4.0 lacks
+// it, so reading absence as "replaced" would deregister a fleet on upgrade.
+func TestRegistrationsWithoutARecordedUIDAreNeverCollectedAsStale(t *testing.T) {
+	legacy := registeredSecret("a", testNS)
+	if _, ok := legacy.Labels[SourceNamespaceUIDLabel(testPrefix)]; ok {
+		t.Fatal("precondition: the fixture must not carry a recorded UID")
+	}
+	ns := managedNS(testNS, "a")
+	ns.UID = "uid-whatever"
+
+	r, c := newTestRegistrar(ns, legacy)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !secretExists(t, c, "cluster-a") {
+		t.Error("a pre-0.4.0 registration was collected because it records no UID")
+	}
+}
+
+// A matching UID is the ordinary case and must be untouched, including on the
+// paths that skip discovery entirely.
+func TestMatchingUIDIsLeftAlone(t *testing.T) {
+	ns := managedNS(testNS, "a")
+	current := registeredSecret("a", testNS)
+	current.Labels[SourceNamespaceUIDLabel(testPrefix)] = string(ns.UID)
+
+	r, c := newTestRegistrar(ns, current) // no kubeconfig Secret: discovery fails
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !secretExists(t, c, "cluster-a") {
+		t.Error("a registration whose source namespace is unchanged was collected")
+	}
+}
+
+// The opt-out has to hold on this path too, or pinning a registration protects it
+// from one collector and not the other.
+func TestPruneDisabledSurvivesAReplacedNamespace(t *testing.T) {
+	pinned := registeredSecret("a", testNS)
+	pinned.Labels[SourceNamespaceUIDLabel(testPrefix)] = "uid-old"
+	pinned.Labels[PruneLabel(testPrefix)] = PruneDisabled
+
+	ns := managedNS(testNS, "a")
+	ns.UID = "uid-new"
+
+	r, c := newTestRegistrar(ns, pinned)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !secretExists(t, c, "cluster-a") {
+		t.Error("an opted-out registration was collected as stale")
+	}
+}
+
 func TestConfigValidate(t *testing.T) {
 	for name, mutate := range map[string]func(*Config){
 		"empty target namespace": func(c *Config) { c.TargetNamespace = "" },
