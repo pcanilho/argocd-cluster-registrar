@@ -85,6 +85,79 @@ func resolveProviders(cmd *cobra.Command) ([]registrar.Provider, error) {
 	return []registrar.Provider{p}, nil
 }
 
+// options is everything the flags decide, separated from the act of using them.
+//
+// Extracted because the two struct literals below are hand-written: a field left
+// off leaves the option at its zero value, and not every zero value is harmless.
+// Assembling them in a pure function is what makes "every flag reaches the option
+// it configures" a thing a test can assert without a cluster.
+//
+// Warnings are returned as DATA rather than logged in place. A function that logs
+// is a function whose warnings can only be tested by capturing a logger, which is
+// how a warning ends up silently never firing.
+type options struct {
+	cfg      registrar.Config
+	ctrl     registrar.ControllerOptions
+	warnings []string
+}
+
+// buildOptions maps the parsed flags onto the registrar's configuration.
+//
+// It talks to nothing. Everything below it in RunE -- building a client, taking a
+// lease, starting a manager -- needs a cluster and stays untestable; this is the
+// part that does not have to be.
+func buildOptions(cmd *cobra.Command) (options, error) {
+	if interval <= 0 {
+		// RequeueAfter: 0 means "do not requeue", so a Helm value of
+		// `interval: 0s` would leave every registration reconciled once and
+		// then never refreshed again -- silently, until a certificate
+		// rotation broke it days later.
+		return options{}, fmt.Errorf("--interval must be positive, got %s", interval)
+	}
+
+	providers, err := resolveProviders(cmd)
+	if err != nil {
+		return options{}, err
+	}
+
+	cfg := registrar.Config{
+		TargetNamespace: targetNamespace,
+		ManagedByValue:  managedByValue,
+		Providers:       providers,
+		LabelPrefix:     labelPrefix,
+		DryRun:          dryRun,
+	}
+	if err := cfg.Validate(); err != nil {
+		return options{}, err
+	}
+
+	var warnings []string
+
+	// A local, deliberately NOT the package variable. Assigning to `leaderElect`
+	// here mutated global state from inside a request path: harmless in a process
+	// that runs this once, but in a test binary the value leaks into every case
+	// that runs afterwards.
+	elect := leaderElect
+	if elect && dryRun {
+		// Same hazard as a second live instance, slower: a --dry-run process
+		// holding the lease is a registrar that reports what it would do while
+		// the real one waits.
+		warnings = append(warnings, "--dry-run disables leader election")
+		elect = false
+	}
+
+	return options{
+		cfg: cfg,
+		ctrl: registrar.ControllerOptions{
+			Interval:               interval,
+			LeaderElection:         elect,
+			LeaderElectionID:       leaderElectionID,
+			HealthProbeBindAddress: healthProbeBindAddress,
+		},
+		warnings: warnings,
+	}, nil
+}
+
 var rootCmd = &cobra.Command{
 	Use: "argocd-cluster-registrar",
 	// A runtime failure is not a usage error. Without these, any error out of
@@ -127,31 +200,17 @@ unclaimed name contested by several namespaces goes to the oldest.`,
 			AddSource: debug,
 		}))
 
-		if interval <= 0 {
-			// RequeueAfter: 0 means "do not requeue", so a Helm value of
-			// `interval: 0s` would leave every registration reconciled once and
-			// then never refreshed again -- silently, until a certificate
-			// rotation broke it days later.
-			return fmt.Errorf("--interval must be positive, got %s", interval)
-		}
-
-		providers, err := resolveProviders(cmd)
+		opts, err := buildOptions(cmd)
 		if err != nil {
 			return err
 		}
-
-		cfg := registrar.Config{
-			TargetNamespace: targetNamespace,
-			ManagedByValue:  managedByValue,
-			Providers:       providers,
-			LabelPrefix:     labelPrefix,
-			DryRun:          dryRun,
-		}
-		if err := cfg.Validate(); err != nil {
-			return err
+		// Emitted before the --once return below, deliberately: these describe the
+		// configuration, not the manager, so a pre-flight run must report them too.
+		for _, w := range opts.warnings {
+			log.Warn(w)
 		}
 
-		r, err := registrar.New(log, cfg)
+		r, err := registrar.New(log, opts.cfg)
 		if err != nil {
 			return err
 		}
@@ -163,8 +222,8 @@ unclaimed name contested by several namespaces goes to the oldest.`,
 		// default. This line is the only startup evidence of what the process is
 		// looking for, and logging `secretNamePattern` meant it always announced
 		// `k3k-*-kubeconfig` no matter what --provider was set to.
-		names := make([]string, 0, len(providers))
-		for _, p := range providers {
+		names := make([]string, 0, len(opts.cfg.Providers))
+		for _, p := range opts.cfg.Providers {
 			names = append(names, p.Name)
 		}
 		log.Info("resolved providers", slog.String("providers", strings.Join(names, ",")))
@@ -176,19 +235,7 @@ unclaimed name contested by several namespaces goes to the oldest.`,
 			return r.Reconcile(ctx)
 		}
 
-		if leaderElect && dryRun {
-			// Same hazard, slower: a --dry-run process holding the lease is a
-			// registrar that reports what it would do while the real one waits.
-			log.Warn("--dry-run disables leader election")
-			leaderElect = false
-		}
-
-		return r.Start(ctx, registrar.ControllerOptions{
-			Interval:               interval,
-			LeaderElection:         leaderElect,
-			LeaderElectionID:       leaderElectionID,
-			HealthProbeBindAddress: healthProbeBindAddress,
-		})
+		return r.Start(ctx, opts.ctrl)
 	},
 }
 
