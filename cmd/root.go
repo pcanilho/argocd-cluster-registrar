@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-	"github.com/pcanilho/vcluster-argocd-exporter/internal/vcluster"
-	"github.com/pkg/errors"
+	"github.com/pcanilho/argocd-cluster-registrar/internal/registrar"
 	"github.com/spf13/cobra"
 )
 
@@ -23,73 +25,124 @@ func Execute() error {
 }
 
 var (
-	debug           bool
-	autoDiscover    bool
-	targetNamespace string
-	clusters        []string
-	namedClusters   map[string]string
+	debug             bool
+	once              bool
+	dryRun            bool
+	interval          time.Duration
+	targetNamespace   string
+	managedByValue    string
+	secretNamePattern string
+	secretKey         string
+	labelPrefix       string
 )
 
 var rootCmd = &cobra.Command{
-	Use:     "vcluster-argocd-exporter",
+	Use:     "cluster-registrar",
+	Short:   "Register child Kubernetes clusters with ArgoCD",
 	Version: version + " (" + commit + ") " + date,
-	RunE: func(_ *cobra.Command, _ []string) error {
-		logLevel := slog.LevelInfo
+	Long: `Reconciles child-cluster kubeconfig Secrets into ArgoCD cluster Secrets.
+
+Discovery is namespace-driven: any namespace labelled
+` + registrar.ManagedByLabel(registrar.DefaultLabelPrefix) + `=<value> is inspected for a Secret matching
+--secret-name-pattern, whose kubeconfig is reshaped into an ArgoCD cluster
+Secret in --target-namespace.
+
+That indirection exists because the provisioner -- not this tool -- creates the
+kubeconfig Secret, so it carries none of our labels. The namespace is the
+nearest object we control, so per-cluster intent lives there.
+
+Nothing here is vcluster-specific: k3k, plain k3s and CAPI-style providers all
+publish a kubeconfig Secret, and any of them work by adjusting the pattern and
+key.
+
+Secrets whose source namespace has gone away are DELETED, so a destroyed cluster
+does not leave a broken entry behind in ArgoCD.`,
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		level := slog.LevelInfo
 		if debug {
-			logLevel = slog.LevelDebug
+			level = slog.LevelDebug
 		}
-
-		slogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-			Level:     logLevel,
+		log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+			Level:     level,
 			AddSource: debug,
-		})).With(
+		}))
+
+		if interval <= 0 {
+			// time.NewTicker panics on a non-positive duration, so a Helm value of
+			// `interval: 0s` would crash-loop the Deployment on a stack trace.
+			return fmt.Errorf("--interval must be positive, got %s", interval)
+		}
+
+		cfg := registrar.Config{
+			TargetNamespace:   targetNamespace,
+			ManagedByValue:    managedByValue,
+			SecretNamePattern: secretNamePattern,
+			SecretKey:         secretKey,
+			LabelPrefix:       labelPrefix,
+			DryRun:            dryRun,
+		}
+		if err := cfg.Validate(); err != nil {
+			return err
+		}
+
+		r, err := registrar.New(log, cfg)
+		if err != nil {
+			return err
+		}
+
+		ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+
+		if once {
+			return r.Reconcile(ctx)
+		}
+
+		log.Info("starting reconcile loop",
+			slog.Duration("interval", interval),
 			slog.String("targetNamespace", targetNamespace),
-			slog.String("clusters", fmt.Sprintf("%v", clusters)),
-			slog.String("namedClusters", fmt.Sprintf("%v", namedClusters)),
-			slog.Bool("autoDiscover", autoDiscover))
+			slog.String("managedBy", managedByValue),
+			slog.String("secretNamePattern", secretNamePattern))
 
-		slogger.Info("Processing...")
-		if autoDiscover {
-			slogger.Info("Auto discovering clusters...")
-			namedClusters = map[string]string{}
-
-			discoveredClusters, err := vcluster.DiscoverClusters(slogger)
-			if err != nil {
-				return errors.Wrap(err, "failed to discover clusters")
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			// select below can pick the ticker even when ctx is already done, so
+			// check explicitly or shutdown can run one extra full pass.
+			if ctx.Err() != nil {
+				log.Info("shutting down")
+				return nil
 			}
-			if len(discoveredClusters) == 0 {
-				return errors.New("no clusters discovered")
+			// A failed pass is logged, never fatal: one unreachable child must not
+			// take the registrar down for every other cluster.
+			if err := r.Reconcile(ctx); err != nil {
+				log.Error("reconcile failed", slog.Any("error", err))
 			}
-			slogger.Info(fmt.Sprintf("discovered [%d] clusters", len(discoveredClusters)), slog.String("clusters", fmt.Sprintf("%v", discoveredClusters)))
-			clusters = discoveredClusters
-		}
-
-		if len(namedClusters) == 0 && len(clusters) == 0 {
-			return errors.New("no clusters specified")
-		}
-
-		if len(targetNamespace) == 0 {
-			return errors.New("no target namespace specified")
-		}
-
-		if len(clusters) > 0 {
-			for _, cluster := range clusters {
-				namedClusters[cluster] = cluster
+			select {
+			case <-ctx.Done():
+				log.Info("shutting down")
+				return nil
+			case <-ticker.C:
 			}
 		}
-		slog.Info("Exporting clusters...", slog.String("clusters", fmt.Sprintf("%v", namedClusters)))
-		if err := vcluster.ExposeVirtualKubeconfigAsSecret(slogger, targetNamespace, namedClusters); err != nil {
-			return errors.Wrap(err, "failed to write virtual kubeconfig")
-		}
-		slogger.Info("Clusters exported successfully")
-		return nil
 	},
 }
 
 func init() {
-	rootCmd.PersistentFlags().BoolVar(&debug, "debug", false, "enable debug logging")
-	rootCmd.PersistentFlags().StringVarP(&targetNamespace, "target-namespace", "t", "argocd", "namespace where ArgoCD is installed")
-	rootCmd.PersistentFlags().StringSliceVarP(&clusters, "clusters", "c", []string{}, "clusters to export")
-	rootCmd.PersistentFlags().StringToStringVar(&namedClusters, "named-cluster", make(map[string]string), "named clusters to export")
-	rootCmd.PersistentFlags().BoolVar(&autoDiscover, "auto-discover", false, "auto discover clusters (overrides all other cluster flags)")
+	f := rootCmd.PersistentFlags()
+	f.BoolVar(&debug, "debug", false, "enable debug logging")
+	f.BoolVar(&dryRun, "dry-run", false, "log intended changes without writing")
+	// Long-running is the default. A one-shot Job cannot garbage-collect, because
+	// a cluster is usually destroyed long after the last sync that created it.
+	f.BoolVar(&once, "once", false, "run a single reconcile pass and exit")
+	f.DurationVar(&interval, "interval", 60*time.Second, "reconcile interval")
+	f.StringVarP(&targetNamespace, "target-namespace", "t", "argocd",
+		"namespace ArgoCD reads cluster Secrets from")
+	f.StringVar(&managedByValue, "managed-by", "cluster-registrar",
+		"value of the <label-prefix>managed-by label identifying namespaces to watch and Secrets to own")
+	f.StringVar(&secretNamePattern, "secret-name-pattern", "k3k-*-kubeconfig",
+		"glob matching the kubeconfig Secret within a watched namespace")
+	f.StringVar(&secretKey, "secret-key", "kubeconfig.yaml",
+		"key inside that Secret holding the kubeconfig")
+	f.StringVar(&labelPrefix, "label-prefix", registrar.DefaultLabelPrefix,
+		"prefix for the labels read from the source namespace and copied onto the cluster Secret")
 }

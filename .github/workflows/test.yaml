@@ -13,19 +13,25 @@ on:
   pull_request:
     paths-ignore:
       - README.md
+      - CHANGELOG.md
       - docs/**
-      - .goreleaser.yaml
-      - .pre-commit-config.yaml
       - LICENSE
-      - .ko.yaml
       - .gitignore
     branches:
       - main
       - release-*
+  # Also on push to main, so a merge that breaks something is caught even when
+  # the PR was green against an older base.
+  push:
+    branches:
+      - main
 
 env:
   GO_VERSION: 'stable'
-  GOLANGCI_VERSION: 'v1.60'
+  # Must be v2+. golangci-lint-action v9 rejects v1 outright
+  # ("golangci-lint v1 is not supported by golangci-lint-action >= v7"), so the
+  # previous 'v1.60' meant the lint job could never start.
+  GOLANGCI_VERSION: 'v2.12'
 
 jobs:
   lint:
@@ -47,10 +53,9 @@ jobs:
           version: ${{ env.GOLANGCI_VERSION }}
           github-token: ${{ github.token }}
 
-  deploy-test:
-    needs: lint
-    runs-on: ubuntu-22.04
-    timeout-minutes: 5
+  test:
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -60,25 +65,131 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
+      # There was no test step at all before, while the destructive paths
+      # (garbage collection especially) carry the tests that matter most.
+      - name: Test
+        run: go test -race -cover ./...
+
+  chart:
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # Rendering with defaults is not enough. commonLabels and commonAnnotations
+      # default to empty, so a template that only breaks when they are SET passed
+      # lint for as long as nobody set them.
+      - name: Lint chart across value combinations
+        run: |
+          set -euo pipefail
+          chart=deploy/charts/argocd-cluster-registrar
+          helm lint "$chart"
+          helm lint "$chart" --set commonLabels.team=platform
+          helm lint "$chart" --set commonAnnotations.owner=infra
+          helm lint "$chart" \
+            --set commonLabels.a=b \
+            --set commonAnnotations.c=d \
+            --set labelPrefix=example.com/ \
+            --set secretNamePattern='vc-*' \
+            --set secretKey=config
+
+  deploy-test:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - uses: ko-build/setup-ko@v0.9
+
       - name: Create k8s Kind Cluster
         uses: helm/kind-action@v1
 
-      - name: Prepare k8s Cluster
+      # Build locally rather than pulling from GHCR, so the test does not depend
+      # on a release having happened first.
+      - name: Build and load image
+        id: image
         run: |
+          set -euo pipefail
+          img=$(KO_DOCKER_REPO=ko.local ko build --bare --tags ci --platform linux/amd64 .)
+          kind load docker-image "$img" --name chart-testing
+          echo "ref=$img" >> "$GITHUB_OUTPUT"
+
+      # A synthetic child: a labelled namespace holding a kubeconfig Secret in
+      # the shape k3k produces. This exercises the real contract without waiting
+      # on a provisioner to boot.
+      - name: Seed a fake child cluster
+        run: |
+          set -euo pipefail
           kubectl create namespace argocd
-          kubectl get secret -n argocd vcluster-test || echo "Pass..."
-          helm repo add loft-sh https://charts.loft.sh && helm repo update
-          helm install test-cluster loft-sh/vcluster \
-            --set controlPlane.distro.k0s.enabled=true \
-            --version 0.21.0-beta.1 \
-            --namespace vcluster \
-            --create-namespace \
-            --wait
-          kubectl get sts -n vcluster
-          helm install test-cluster ./deploy/charts/vcluster-argocd-exporter \
-            --namespace exporter \
-            --timeout 1m \
-            --create-namespace \
-            --wait \
-            --wait-for-jobs || echo "Ignored..."
-          kubectl get secret -n argocd test-cluster || echo "Ignored..."
+          kubectl create namespace k3k-sandbox
+          kubectl label namespace k3k-sandbox \
+            argocd-cluster-registrar/managed-by=cluster-registrar \
+            argocd-cluster-registrar/cluster=sandbox
+          cat <<'EOF' > /tmp/kubeconfig.yaml
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - name: sandbox
+            cluster:
+              server: https://192.0.2.10
+              certificate-authority-data: Y2FkYXRh
+          users:
+          - name: sandbox
+            user:
+              client-certificate-data: Y2VydGRhdGE=
+              client-key-data: a2V5ZGF0YQ==
+          EOF
+          kubectl create secret generic k3k-sandbox-kubeconfig \
+            -n k3k-sandbox --from-file=kubeconfig.yaml=/tmp/kubeconfig.yaml
+
+      - name: Install the chart
+        run: |
+          set -euo pipefail
+          helm install registrar ./deploy/charts/argocd-cluster-registrar \
+            --namespace registrar --create-namespace \
+            --set image.repository="$(echo '${{ steps.image.outputs.ref }}' | cut -d: -f1)" \
+            --set image.tag="$(echo '${{ steps.image.outputs.ref }}' | cut -d: -f2)" \
+            --set image.pullPolicy=IfNotPresent \
+            --set interval=5s \
+            --wait --timeout 3m
+
+      # Assertions are real: no `|| echo "Ignored..."`, so a regression fails CI.
+      - name: It registers the cluster
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if kubectl get secret cluster-sandbox -n argocd >/dev/null 2>&1; then
+              echo "registered after ${i}0s"
+              kubectl get secret cluster-sandbox -n argocd \
+                -o jsonpath='{.metadata.labels}'; echo
+              test "$(kubectl get secret cluster-sandbox -n argocd -o jsonpath='{.data.server}' | base64 -d)" = "https://192.0.2.10"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::cluster-sandbox was never created"
+          kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar --tail=50
+          exit 1
+
+      - name: It deregisters when the source namespace is gone
+        run: |
+          set -euo pipefail
+          kubectl delete namespace k3k-sandbox --wait=true
+          for i in $(seq 1 30); do
+            if ! kubectl get secret cluster-sandbox -n argocd >/dev/null 2>&1; then
+              echo "deregistered after ${i}0s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::cluster-sandbox was never garbage collected"
+          kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar --tail=50
+          exit 1

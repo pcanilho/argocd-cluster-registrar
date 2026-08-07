@@ -1,0 +1,28 @@
+apiVersion: v2
+name: argocd-cluster-registrar
+description: Registers k3k and vcluster child clusters with ArgoCD, and removes them when they are deleted
+
+type: application
+version: 0.2.0
+appVersion: "0.2.0"
+
+home: https://github.com/pcanilho/argocd-cluster-registrar
+sources:
+  - https://github.com/pcanilho/argocd-cluster-registrar
+icon: https://raw.githubusercontent.com/pcanilho/argocd-cluster-registrar/main/docs/images/logo.png
+
+keywords:
+  - argocd
+  - gitops
+  - k3k
+  - vcluster
+  - multi-cluster
+  - kubernetes
+
+maintainers:
+  - name: pcanilho
+    url: https://github.com/pcanilho
+
+annotations:
+  org.opencontainers.image.source: https://github.com/pcanilho/argocd-cluster-registrar
+  org.opencontainers.image.licenses: Apache-2.0

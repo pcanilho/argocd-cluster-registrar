@@ -4,7 +4,7 @@ package main
 import (
 	"log"
 
-	"github.com/pcanilho/vcluster-argocd-exporter/cmd"
+	"github.com/pcanilho/argocd-cluster-registrar/cmd"
 )
 
 func main() {

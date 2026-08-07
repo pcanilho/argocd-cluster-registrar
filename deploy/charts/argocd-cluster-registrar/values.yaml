@@ -1,0 +1,58 @@
+---
+# The namespace ArgoCD reads cluster Secrets from. ArgoCD only ever looks in its
+# own namespace, so this is effectively always "argocd".
+targetNamespace: argocd
+
+# Prefix for the labels read off the source namespace and copied onto the ArgoCD
+# cluster Secret. Override it to fit an existing labelling convention.
+labelPrefix: argocd-cluster-registrar/
+
+# Value of the `<labelPrefix>managed-by` label that identifies both the namespaces
+# to watch and the ArgoCD cluster Secrets this release owns. Two registrars
+# pointed at the same value would fight over the same Secrets; give each its own.
+managedBy: cluster-registrar
+
+# Glob matching the kubeconfig Secret inside a watched namespace, and the key
+# within it. Defaults suit k3k, which names it `k3k-<cluster>-kubeconfig` with the
+# kubeconfig under `kubeconfig.yaml`.
+#
+# Matching by name rather than label is deliberate: the provisioner creates that
+# Secret, so it carries none of our labels. Adjust these two for a different
+# provisioner -- CAPI uses `<cluster>-kubeconfig` with the key `value`.
+secretNamePattern: "k3k-*-kubeconfig"
+secretKey: kubeconfig.yaml
+
+# How often to reconcile. Each pass re-reads every kubeconfig, which is what
+# keeps registrations valid across a k3s server restart -- those rotate the client
+# certificate and would otherwise leave a silently broken cluster Secret.
+interval: 60s
+
+# Log intended changes without writing. Worth using when first pointing this at
+# an existing cluster, to confirm the GC selector matches only what you expect.
+dryRun: false
+debug: false
+
+# Internals
+commonAnnotations: ~
+commonLabels: ~
+
+image:
+  repository: ghcr.io/pcanilho/argocd-cluster-registrar
+  # Empty on purpose: defaults to .Chart.AppVersion. The release workflow
+  # repackages the chart with --app-version from the git tag but does not touch
+  # this file, so a hardcoded tag here would quietly ship the previous image
+  # alongside a new chart. Set it only to pin against the chart's own version.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

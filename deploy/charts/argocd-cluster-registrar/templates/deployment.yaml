@@ -1,0 +1,78 @@
+---
+# A Deployment, replacing the previous Job.
+#
+# The Job could only ever run at sync time, and a cluster is normally destroyed
+# long after the last sync that created it -- so a Job can register a cluster but
+# can never deregister one. Continuous reconciliation is also what re-reads
+# kubeconfigs after a k3s server restart rotates its client certificate, which
+# would otherwise leave an authenticating-but-stale cluster Secret behind.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # Strictly one. Two replicas would race on the same ArgoCD cluster Secrets, and
+  # the work is far too cheap to be worth leader election.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "app.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "app.selectorLabels" . | nindent 8 }}
+      {{- with .Values.commonAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "app.serviceAccountName" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--target-namespace={{ .Values.targetNamespace }}"
+            - "--label-prefix={{ .Values.labelPrefix }}"
+            - "--managed-by={{ .Values.managedBy }}"
+            - "--secret-name-pattern={{ .Values.secretNamePattern }}"
+            - "--secret-key={{ .Values.secretKey }}"
+            - "--interval={{ .Values.interval }}"
+            {{- if .Values.dryRun }}
+            - --dry-run
+            {{- end }}
+            {{- if .Values.debug }}
+            - --debug
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

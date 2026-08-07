@@ -1,0 +1,71 @@
+---
+# Split into a cluster-scoped READ role and a namespaced WRITE role.
+#
+# The reads have to be cluster-wide: source Secrets live in one namespace per
+# child, and RBAC cannot express "namespaces carrying label X".
+#
+# The writes do not. Everything this tool creates, updates or deletes lands in
+# .Values.targetNamespace, so granting create/update/delete on Secrets across
+# every namespace was a standing privilege-escalation path (overwrite
+# argocd-secret, mint a token Secret for a privileged ServiceAccount, delete
+# kube-system Secrets) bought for nothing.
+#
+# `watch` and `patch` are gone as well: nothing here runs an informer, and
+# apply() uses Get plus Create/Update with a carried resourceVersion.
+#
+# Residual risk worth naming rather than hiding: cluster-wide Secret READ still
+# lets this ServiceAccount read every credential in the cluster. That is inherent
+# to label-driven discovery across arbitrary namespaces.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "app.fullname" . }}-role
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+rules:
+  # Discovery: find namespaces carrying the managed-by label, and confirm one is
+  # genuinely gone before deregistering its cluster.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list"]
+  # Read the provisioner-written kubeconfig Secrets in those namespaces.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["list"]
+---
+# The write half, confined to the single namespace this tool ever writes to.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "app.fullname" . }}-write
+  namespace: {{ .Values.targetNamespace }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "app.fullname" . }}-write
+  namespace: {{ .Values.targetNamespace }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "app.fullname" . }}-write
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "app.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

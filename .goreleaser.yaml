@@ -1,5 +1,10 @@
 version: 2
 
+# Pinned explicitly. goreleaser otherwise derives ProjectName from the git
+# REMOTE, not the module path, so a stale remote silently names every archive,
+# checksum file and image label after the old repository.
+project_name: argocd-cluster-registrar
+
 before:
   hooks:
     - go mod tidy
@@ -7,14 +12,14 @@ before:
 builds:
   - id: app
     main: .
-    binary: vcluster-argocd-exporter
+    binary: argocd-cluster-registrar
     env:
       - CGO_ENABLED=0
     mod_timestamp: "{{.CommitTimestamp}}"
     flags:
       - -trimpath
     ldflags:
-      - "-s -w -X cmd.version={{.Version}} -X main.commit={{.ShortCommit}} -X main.date={{.Date}}"
+      - "-s -w -X github.com/pcanilho/argocd-cluster-registrar/cmd.version={{.Version}} -X github.com/pcanilho/argocd-cluster-registrar/cmd.commit={{.ShortCommit}} -X github.com/pcanilho/argocd-cluster-registrar/cmd.date={{.Date}}"
     goos:
       - freebsd
       - windows
@@ -25,11 +30,11 @@ builds:
       - arm64
 
 archives:
-  - format: zip
+  - formats: [zip]
     name_template: "{{.ProjectName}}_{{.Version}}_{{.Os}}_{{.Arch}}"
 
 snapshot:
-  name_template: "{{.Tag}}-next"
+  version_template: "{{.Tag}}-next"
 
 checksum:
   name_template: "{{.ProjectName}}_{{.Version}}_SHA256SUMS"
@@ -38,16 +43,16 @@ checksum:
 release:
   draft: false
 
+# Release notes come from CHANGELOG.md, injected by the workflow via
+# --release-notes. Generating a second set from commit subjects would either be
+# ignored or appended as noise, so it is turned off here.
 changelog:
-  sort: asc
-  filters:
-    exclude:
-      - "^docs:"
-      - "^test:"
+  disable: true
 
 kos:
   - id: app
-    repository: ghcr.io/pcanilho/vcluster-argocd-exporter
+    repositories:
+      - ghcr.io/pcanilho/argocd-cluster-registrar
     main: .
     platforms:
       - linux/amd64
@@ -57,14 +62,17 @@ kos:
     flags:
       - -trimpath
     ldflags:
-      - -s -w
+      - "-s -w -X github.com/pcanilho/argocd-cluster-registrar/cmd.version={{.Version}} -X github.com/pcanilho/argocd-cluster-registrar/cmd.commit={{.ShortCommit}} -X github.com/pcanilho/argocd-cluster-registrar/cmd.date={{.Date}}"
     ko_data_creation_time: "{{.CommitTimestamp}}"
     labels:
       org.opencontainers.image.created: "{{.Date}}"
       org.opencontainers.image.name: "{{.ProjectName}}"
       org.opencontainers.image.revision: "{{.FullCommit}}"
       org.opencontainers.image.version: "{{.Version}}"
-      org.opencontainers.image.source: "{{.GitURL}}"
+      # Not {{.GitURL}}: that yields the SSH remote, which GHCR will not link.
+      org.opencontainers.image.source: "https://github.com/pcanilho/argocd-cluster-registrar"
+      org.opencontainers.image.licenses: "Apache-2.0"
+      org.opencontainers.image.description: "Registers k3k and vcluster child clusters with ArgoCD, and removes them when they are deleted"
     bare: true
     preserve_import_paths: false
     tags:

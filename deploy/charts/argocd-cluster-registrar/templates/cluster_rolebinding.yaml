@@ -4,9 +4,11 @@ kind: ClusterRoleBinding
 metadata:
   name: {{ include "app.fullname" . }}-rolebinding
   labels:
-    {{- include "app.commonLabels" . | indent 4 }}
+    {{- include "app.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
   annotations:
-    {{- include "app.commonAnnotations" . }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 subjects:
   - kind: ServiceAccount
     name: {{ include "app.serviceAccountName" . }}
