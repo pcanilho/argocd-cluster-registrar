@@ -532,10 +532,23 @@ jobs:
           done
           kubectl get secret cluster-audited -n argocd >/dev/null
 
-          # Delete the namespace FIRST. While it exists, its own reconcile reaches
-          # the orphan-adoption branch, restores source-namespace within seconds,
-          # and the Secret is routable again before the audit ever looks at it.
+          # Pin it BEFORE deleting the namespace. Deletion is event-driven, so the
+          # controller collects the registration within a second or two of the
+          # namespace going away, and it was racing the label command below: the
+          # step failed intermittently on a NotFound that had nothing to do with
+          # what it was testing. prune=disabled is checked ahead of every removal
+          # path, so this closes the window rather than widening it.
+          kubectl label secret cluster-audited -n argocd \
+            argocd-cluster-registrar/prune=disabled
+
+          # Delete the namespace before stripping source-namespace. While it
+          # exists, its own reconcile reaches the orphan-adoption branch, restores
+          # the label within seconds, and the Secret is routable again before the
+          # audit ever looks at it.
           kubectl delete namespace k3k-audit --wait=true
+          sleep 10
+          kubectl get secret cluster-audited -n argocd >/dev/null || {
+            echo "::error::a pinned registration was collected anyway"; exit 1; }
           kubectl label secret cluster-audited -n argocd \
             argocd-cluster-registrar/source-namespace-
           kubectl rollout restart deployment -n registrar registrar-argocd-cluster-registrar
