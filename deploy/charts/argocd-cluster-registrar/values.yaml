@@ -105,6 +105,8 @@ leaderElection:
 # replica is the leader, so a standby stays Ready.
 probes:
   enabled: true
+  # ":PORT" only. The container port is derived from this by stripping the colon,
+  # so "0.0.0.0:8081" would render containerPort 0. The chart rejects anything else.
   bindAddress: ":8081"
   liveness:
     initialDelaySeconds: 15
@@ -130,6 +132,7 @@ probes:
 # Service, or add a ServiceMonitor of your own.
 metrics:
   enabled: false
+  # ":PORT" only, as with probes.bindAddress above.
   bindAddress: ":8080"
   service:
     enabled: false

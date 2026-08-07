@@ -1146,6 +1146,9 @@ func TestConfigValidate(t *testing.T) {
 		// Under this prefix a source namespace could propagate
 		// argocd.argoproj.io/secret-type, which is not a reserved suffix, and the
 		// propagated labels are copied last so it would win.
+		// Not "use the default": with no prefix, propagatedLabels matches every
+		// label and the reserved list matches none of the keys actually written.
+		"empty prefix": func(c *Config) { c.LabelPrefix = "" },
 		"prefix that ArgoCD's own key falls under": func(c *Config) {
 			c.LabelPrefix = "argocd.argoproj.io/"
 		},

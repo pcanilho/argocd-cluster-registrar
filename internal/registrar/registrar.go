@@ -454,6 +454,16 @@ func (c Config) Validate() error {
 	if c.DemotedTTL < 0 {
 		return fmt.Errorf("--demoted-ttl must not be negative, got %s", c.DemotedTTL)
 	}
+	// Empty is not "use the default" here. With no prefix, propagatedLabels
+	// matches EVERY label on the source namespace and the reserved list computes
+	// as bare names that match nothing actually written, so a tenant could
+	// propagate argocd.argoproj.io/secret-type off its own namespace. The
+	// constructor happens to repair it, but a caller that validates without going
+	// through the constructor would get a silently different trust boundary.
+	if c.LabelPrefix == "" {
+		return fmt.Errorf("--label-prefix must not be empty; it is what keeps a source " +
+			"namespace from propagating labels this tool reserves")
+	}
 	if p := c.LabelPrefix; p != "" && !strings.HasSuffix(p, "/") {
 		// Without the slash the keys become nonsense like "example.commanaged-by"
 		// while propagatedLabels still matches "example.com/...", so it half-works.

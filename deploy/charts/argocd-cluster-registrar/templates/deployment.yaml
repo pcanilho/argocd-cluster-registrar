@@ -17,6 +17,15 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
+  {{- /* Both bind addresses are turned into a containerPort by stripping the colon,
+         so "0.0.0.0:8081" silently renders containerPort: 0 and "8081" hands the
+         binary an address it cannot listen on. Fail here, naming the key. */}}
+  {{- if and .Values.probes.enabled (not (regexMatch "^:[0-9]+$" .Values.probes.bindAddress)) }}
+  {{- fail (printf "probes.bindAddress must be of the form \":PORT\", got %q" .Values.probes.bindAddress) }}
+  {{- end }}
+  {{- if and .Values.metrics.enabled (not (regexMatch "^:[0-9]+$" .Values.metrics.bindAddress)) }}
+  {{- fail (printf "metrics.bindAddress must be of the form \":PORT\", got %q" .Values.metrics.bindAddress) }}
+  {{- end }}
   {{- if and (gt (int .Values.replicaCount) 1) (not .Values.leaderElection.enabled) }}
   {{- fail "replicaCount > 1 requires leaderElection.enabled. Two active instances sharing a managedBy value rewrite each other's provider label on every reconcile." }}
   {{- end }}

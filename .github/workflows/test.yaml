@@ -172,6 +172,29 @@ jobs:
       # The release workflow overrides it at package time so published charts were
       # fine, but `helm install` from a checkout pulled a stale image, and nothing
       # noticed because deploy-test overrides the tag explicitly.
+      # Both bind addresses become a containerPort by stripping the colon, so a
+      # host:port form renders containerPort 0 and a bare port hands the binary an
+      # address it cannot listen on. Neither should reach a cluster.
+      - name: A bind address that is not ":PORT" fails the render
+        run: |
+          set -euo pipefail
+          chart=deploy/charts/argocd-cluster-registrar
+          for v in "0.0.0.0:8081" "8081" ""; do
+            if helm template t "$chart" --set probes.bindAddress="$v" >/dev/null 2>&1; then
+              echo "::error::probes.bindAddress=${v} rendered instead of failing"
+              exit 1
+            fi
+          done
+          if helm template t "$chart" --set metrics.enabled=true \
+               --set metrics.bindAddress=0.0.0.0:8080 >/dev/null 2>&1; then
+            echo "::error::metrics.bindAddress=0.0.0.0:8080 rendered instead of failing"
+            exit 1
+          fi
+          # The supported form still works, for both.
+          helm template t "$chart" --set probes.bindAddress=":9" >/dev/null
+          helm template t "$chart" --set metrics.enabled=true \
+            --set metrics.bindAddress=":9090" >/dev/null
+
       - name: The in-tree chart version is not behind the latest tag
         run: |
           set -euo pipefail

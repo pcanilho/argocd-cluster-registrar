@@ -112,6 +112,19 @@ served or deleted unless you ask for it.
   a name produced a registration with the right CA and the right credentials that
   still failed hostname verification.
 
+- **An empty `--label-prefix` is rejected rather than silently repaired.** With no
+  prefix, label propagation matched every label on the source namespace and the
+  reserved set computed as bare names matching nothing actually written, so a
+  tenant could propagate `argocd.argoproj.io/secret-type` off its own namespace.
+  The constructor defaulted it, so this was unreachable through the CLI or the
+  chart, but validation and defaulting disagreeing is how it stops being
+  unreachable.
+
+- **A `bindAddress` that is not `:PORT` now fails the chart render, naming the
+  key.** The container port is derived by stripping the colon, so `0.0.0.0:8081`
+  rendered `containerPort: 0` and a bare `8081` handed the binary an address it
+  could not listen on. Both failed, neither said why.
+
 - **A `--label-prefix` that ArgoCD's own key falls under is rejected.** Under
   `argocd.argoproj.io/`, a source namespace could propagate
   `argocd.argoproj.io/secret-type`, which is not a reserved suffix, and the

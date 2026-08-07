@@ -341,6 +341,10 @@ instance's own decisions:
 | `..._registrations{state}` | registrations owned, `active` or `demoted` |
 | `..._unrouted_secrets` | owned `Secret`s no reconcile key can reach |
 
+Aggregate the two gauges across replicas (`sum by`, `max by`). They are set only
+by the reconcile that audits, so a leader-election standby serves them as zero for
+as long as it stands by, and a bare threshold or an `avg` quietly stops firing.
+
 `conflicts_total{reason="incumbent"}` is the one worth alerting on: a contested
 name stays contested until someone resolves it. *Which* cluster is in the log
 line, not the labels, so a tenant cannot mint series by naming a namespace.
