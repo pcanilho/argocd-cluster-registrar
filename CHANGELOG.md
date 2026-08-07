@@ -88,6 +88,35 @@ served or deleted unless you ask for it.
   parsing the same bytes twice, matching how a duplicate provider name is already
   handled.
 
+- **`<labelPrefix>prune: disabled` now works on an active registration.** It was
+  swept off by the same cleanup that removes a label deleted upstream, because it
+  has no upstream to be absent from. `changed()` also read the pin as drift, so the
+  update that stripped it ran even when nothing else had moved: the operator set
+  the label, the API accepted it, and it was gone within one `interval`. That is
+  the documented case, and it silently did not work. Present since the opt-out
+  shipped in 0.4.0.
+
+  Every existing test pinned a `Secret` that `apply` never touches, which is why
+  five of them passed throughout. The demotion labels are still swept, since that
+  is what restores a registration when a rename is reverted.
+
+- **A registration whose deletion loses its UID precondition is no longer
+  abandoned.** The delete leaves the `Secret` in place on purpose, but it was
+  counted as removed, which retired the reconcile key. The source namespace is
+  gone by then, so nothing could ever enqueue it again and the registration
+  outlived its cluster until the process restarted. That discarded exactly the
+  recovery the precondition was added for.
+
+- **`tls-server-name` is carried into the cluster `Secret`.** It was parsed by
+  nothing and dropped, so a kubeconfig reached by IP with a certificate issued for
+  a name produced a registration with the right CA and the right credentials that
+  still failed hostname verification.
+
+- **A `--label-prefix` that ArgoCD's own key falls under is rejected.** Under
+  `argocd.argoproj.io/`, a source namespace could propagate
+  `argocd.argoproj.io/secret-type`, which is not a reserved suffix, and the
+  propagated labels are copied last, so it would override the key this tool sets.
+
 ### Changed
 
 - The `--dry-run` de-escalation of `--leader-elect` no longer writes back into the

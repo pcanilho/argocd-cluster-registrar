@@ -1143,6 +1143,12 @@ func TestConfigValidate(t *testing.T) {
 			c.Providers[0].Name = strings.Repeat("a", 64)
 		},
 		"prefix without slash": func(c *Config) { c.LabelPrefix = "example.com" },
+		// Under this prefix a source namespace could propagate
+		// argocd.argoproj.io/secret-type, which is not a reserved suffix, and the
+		// propagated labels are copied last so it would win.
+		"prefix that ArgoCD's own key falls under": func(c *Config) {
+			c.LabelPrefix = "argocd.argoproj.io/"
+		},
 		// Negative would expire every demoted registration on sight, since
 		// time.Since is always greater than a negative duration.
 		"negative demoted TTL": func(c *Config) { c.DemotedTTL = -time.Second },

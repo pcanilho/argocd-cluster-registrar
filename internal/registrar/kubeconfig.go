@@ -18,6 +18,10 @@ type kubeconfigCluster struct {
 	CertificateAuthorityData string `yaml:"certificate-authority-data"`
 	CertificateAuthority     string `yaml:"certificate-authority"`
 	InsecureSkipTLSVerify    bool   `yaml:"insecure-skip-tls-verify"`
+	// TLSServerName is what the certificate must be valid for when it does not
+	// match the address in Server. Dropping it produced a registration with the
+	// right CA and the right credentials that still failed hostname verification.
+	TLSServerName string `yaml:"tls-server-name"`
 }
 
 type kubeconfigUser struct {
@@ -168,8 +172,9 @@ func parseKubeconfig(raw []byte) (server string, config string, err error) {
 
 	cfg := argoClusterConfig{
 		TLSClientConfig: argoTLSClientConfig{
-			Insecure: c.InsecureSkipTLSVerify,
-			CaData:   c.CertificateAuthorityData,
+			Insecure:   c.InsecureSkipTLSVerify,
+			CaData:     c.CertificateAuthorityData,
+			ServerName: c.TLSServerName,
 		},
 	}
 

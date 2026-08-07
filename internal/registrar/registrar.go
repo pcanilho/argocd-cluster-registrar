@@ -441,6 +441,15 @@ func (c Config) Validate() error {
 				p.Name, p.SecretNamePattern, err)
 		}
 	}
+	// A prefix that ArgoCD's own key falls under would let a source namespace
+	// propagate `argocd.argoproj.io/secret-type` -- it is not a reserved suffix,
+	// so nothing withholds it -- and the propagated labels are copied last, so it
+	// would override the key this tool sets. Absurd to configure on purpose, but
+	// the trust boundary should not depend on that.
+	if c.LabelPrefix != "" && strings.HasPrefix(argoSecretTypeLabel, c.LabelPrefix) {
+		return fmt.Errorf("--label-prefix %q would let a source namespace override %q",
+			c.LabelPrefix, argoSecretTypeLabel)
+	}
 	// Negative is a typo, not "disabled", and would expire everything on sight.
 	if c.DemotedTTL < 0 {
 		return fmt.Errorf("--demoted-ttl must not be negative, got %s", c.DemotedTTL)
@@ -1254,7 +1263,16 @@ func (r *Registrar) apply(ctx context.Context, c child) error {
 	maps.Copy(updated.Labels, want.Labels)
 	// Drop prefixed labels that no longer exist upstream, so a cluster can be
 	// opted back OUT of a selector (e.g. flux=true) once it was opted in.
+	//
+	// Except the prune opt-out, which is set on the cluster Secret by whoever owns
+	// the ArgoCD namespace and has no upstream to be absent from. Sweeping it was
+	// how pinning a LIVE registration silently undid itself one reconcile later:
+	// exactly the case the feature is documented for. The demotion labels are
+	// deliberately still swept, because that is the self-heal on a reverted rename.
 	for k := range updated.Labels {
+		if k == r.pruneLabel() {
+			continue
+		}
 		if strings.HasPrefix(k, r.cfg.LabelPrefix) {
 			if _, keep := want.Labels[k]; !keep {
 				delete(updated.Labels, k)
@@ -1340,8 +1358,13 @@ func changed(existing, want *coreV1.Secret, labelPrefix string) bool {
 		}
 	}
 	// A label removed from the source must disappear here too, or a cluster could
-	// never be opted OUT of Flux once opted in.
+	// never be opted OUT of Flux once opted in. The prune opt-out is exempt for
+	// the same reason apply does not sweep it: it is set here, not upstream, so
+	// reading it as drift makes every pinned registration write on every pass.
 	for k := range existing.Labels {
+		if k == PruneLabel(labelPrefix) {
+			continue
+		}
 		if strings.HasPrefix(k, labelPrefix) {
 			if _, ok := want.Labels[k]; !ok {
 				return true
@@ -1408,11 +1431,18 @@ func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, 
 		}
 
 		if !exists {
-			if err := r.deleteOrphan(ctx, s, nsName); err != nil {
+			removed, err := r.deleteOrphan(ctx, s, nsName)
+			if err != nil {
 				errs = append(errs, err.Error())
 				continue
 			}
-			remaining--
+			// Only when it is genuinely gone. A UID conflict leaves the Secret in
+			// place on purpose, and counting it as removed retires the key: the
+			// source namespace no longer exists, so nothing can ever enqueue it
+			// again and the registration outlives its cluster until a restart.
+			if removed {
+				remaining--
+			}
 			continue
 		}
 
@@ -1582,7 +1612,9 @@ func (r *Registrar) collectStaleUID(ctx context.Context, nsName string, uid type
 		r.log.Info("source namespace was replaced by a different one of the same name",
 			slog.String("secret", s.Name), slog.String("namespace", nsName),
 			slog.String("recordedUID", recorded), slog.String("currentUID", string(uid)))
-		if err := r.deleteOrphan(ctx, s, nsName); err != nil {
+		// The bool is genuinely unused here: collectStaleUID reports only errors,
+		// and nothing downstream counts what it removed.
+		if _, err := r.deleteOrphan(ctx, s, nsName); err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
@@ -1594,11 +1626,14 @@ func (r *Registrar) collectStaleUID(ctx context.Context, nsName string, uid type
 }
 
 // deleteOrphan removes a registration whose source namespace is provably gone.
-func (r *Registrar) deleteOrphan(ctx context.Context, s *coreV1.Secret, nsName string) error {
+// The bool reports whether the object is gone, which is NOT the same as "no error
+// occurred": a UID conflict is reported as success because it needs no retry, and
+// the caller must not count it as one fewer registration.
+func (r *Registrar) deleteOrphan(ctx context.Context, s *coreV1.Secret, nsName string) (bool, error) {
 	if r.cfg.DryRun {
 		r.log.Info("[dry-run] would delete orphaned cluster secret",
 			slog.String("secret", s.Name), slog.String("namespace", nsName))
-		return nil
+		return false, nil
 	}
 	// Preconditioned on the Secret's own UID. Under the poll loop the gap between
 	// the existence proof and this call was microseconds and single-threaded; under
@@ -1612,19 +1647,20 @@ func (r *Registrar) deleteOrphan(ctx context.Context, s *coreV1.Secret, nsName s
 	case err == nil:
 		r.log.Info("deregistered cluster (source namespace gone)",
 			slog.String("secret", s.Name), slog.String("namespace", nsName))
-		return nil
+		return true, nil
 	case apiErrors.IsNotFound(err):
-		return nil
+		// Already gone, by whatever hand.
+		return true, nil
 	case apiErrors.IsConflict(err):
 		// The Secret was replaced between the read and the delete, so it is no
 		// longer the object the proof was about. Leave it; the next reconcile sees
 		// the new one and decides again.
 		r.log.Info("cluster secret changed identity before deletion; leaving it",
 			slog.String("secret", s.Name), slog.String("namespace", nsName))
-		return nil
+		return false, nil
 	default:
 		// Keep going. One Secret held up by a finalizer or an admission webhook
 		// must not stall collection for the rest.
-		return fmt.Errorf("delete %s: %w", s.Name, err)
+		return false, fmt.Errorf("delete %s: %w", s.Name, err)
 	}
 }

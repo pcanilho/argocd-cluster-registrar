@@ -59,9 +59,14 @@ type ControllerOptions struct {
 	// HealthProbeBindAddress serves /healthz and /readyz. Empty disables it.
 	HealthProbeBindAddress string
 
-	// RestConfig overrides the ambient cluster connection. Nil, the normal case,
+	// RestConfig overrides the connection the MANAGER uses. Nil, the normal case,
 	// means in-cluster config or the caller's own kubeconfig. Set by tests that
 	// drive a real manager against envtest.
+	//
+	// It does NOT redirect the clientset. A Registrar built by New already holds
+	// one against the ambient cluster, so setting this on that Registrar points
+	// the watch at one cluster while every read and write goes to another. Pair it
+	// with NewWithClient and a client built from the same config.
 	RestConfig *rest.Config
 
 	// MetricsBindAddress serves Prometheus metrics. "0" disables it, and that is
