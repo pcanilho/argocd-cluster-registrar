@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -31,10 +32,53 @@ var (
 	interval          time.Duration
 	targetNamespace   string
 	managedByValue    string
+	providerSpecs     []string
 	secretNamePattern string
 	secretKey         string
 	labelPrefix       string
 )
+
+// resolveProviders turns the flags into the provider list, honouring the
+// pre-0.3.0 single-provider flags.
+//
+// The gate is `Changed`, NOT emptiness, and that distinction is the whole point:
+// --secret-name-pattern and --secret-key both carry non-empty defaults, so they
+// are never unset. Testing them for "" would take the legacy branch every single
+// time and silently ignore --provider entirely -- the same class of quiet
+// misconfiguration the 0.1.x migration note warns about, which is precisely what
+// this compatibility path exists to avoid.
+func resolveProviders(cmd *cobra.Command) ([]registrar.Provider, error) {
+	legacy := cmd.Flags().Changed("secret-name-pattern") || cmd.Flags().Changed("secret-key")
+
+	if len(providerSpecs) > 0 {
+		if legacy {
+			return nil, fmt.Errorf(
+				"--provider cannot be combined with --secret-name-pattern/--secret-key; " +
+					"express the old flags as a provider spec instead")
+		}
+		out := make([]registrar.Provider, 0, len(providerSpecs))
+		for _, spec := range providerSpecs {
+			p, err := registrar.ParseProvider(spec)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, p)
+		}
+		return out, nil
+	}
+
+	if legacy {
+		return []registrar.Provider{{
+			Name:              "custom",
+			SecretNamePattern: secretNamePattern,
+			SecretKeys:        []string{secretKey},
+		}}, nil
+	}
+
+	// Neither set: the shipped default, unchanged from 0.2.x.
+	p, _ := registrar.Preset("k3k")
+	return []registrar.Provider{p}, nil
+}
 
 var rootCmd = &cobra.Command{
 	Use:     "cluster-registrar",
@@ -43,17 +87,17 @@ var rootCmd = &cobra.Command{
 	Long: `Reconciles child-cluster kubeconfig Secrets into ArgoCD cluster Secrets.
 
 Discovery is namespace-driven: any namespace labelled
-` + registrar.ManagedByLabel(registrar.DefaultLabelPrefix) + `=<value> is inspected for a Secret matching
---secret-name-pattern, whose kubeconfig is reshaped into an ArgoCD cluster
-Secret in --target-namespace.
+` + registrar.ManagedByLabel(registrar.DefaultLabelPrefix) + `=<value> is inspected for a Secret
+matching one of the configured --provider shapes, whose kubeconfig is reshaped
+into an ArgoCD cluster Secret in --target-namespace.
 
 That indirection exists because the provisioner -- not this tool -- creates the
 kubeconfig Secret, so it carries none of our labels. The namespace is the
 nearest object we control, so per-cluster intent lives there.
 
-Nothing here is vcluster-specific: k3k, plain k3s and CAPI-style providers all
-publish a kubeconfig Secret, and any of them work by adjusting the pattern and
-key.
+The tool is provisioner-neutral. Anything that writes a kubeconfig into a Secret
+works; presets ship for ` + strings.Join(registrar.PresetNames(), ", ") + `, and --provider takes several at
+once so one instance can serve a mixed fleet.
 
 Secrets whose source namespace has gone away are DELETED, so a destroyed cluster
 does not leave a broken entry behind in ArgoCD.`,
@@ -73,13 +117,17 @@ does not leave a broken entry behind in ArgoCD.`,
 			return fmt.Errorf("--interval must be positive, got %s", interval)
 		}
 
+		providers, err := resolveProviders(cmd)
+		if err != nil {
+			return err
+		}
+
 		cfg := registrar.Config{
-			TargetNamespace:   targetNamespace,
-			ManagedByValue:    managedByValue,
-			SecretNamePattern: secretNamePattern,
-			SecretKey:         secretKey,
-			LabelPrefix:       labelPrefix,
-			DryRun:            dryRun,
+			TargetNamespace: targetNamespace,
+			ManagedByValue:  managedByValue,
+			Providers:       providers,
+			LabelPrefix:     labelPrefix,
+			DryRun:          dryRun,
 		}
 		if err := cfg.Validate(); err != nil {
 			return err
@@ -97,11 +145,19 @@ does not leave a broken entry behind in ArgoCD.`,
 			return r.Reconcile(ctx)
 		}
 
+		// Report the providers actually in force, not the deprecated flag's
+		// default. This line is the only startup evidence of what the process is
+		// looking for, and logging `secretNamePattern` meant it always announced
+		// `k3k-*-kubeconfig` no matter what --provider was set to.
+		names := make([]string, 0, len(providers))
+		for _, p := range providers {
+			names = append(names, p.Name)
+		}
 		log.Info("starting reconcile loop",
 			slog.Duration("interval", interval),
 			slog.String("targetNamespace", targetNamespace),
 			slog.String("managedBy", managedByValue),
-			slog.String("secretNamePattern", secretNamePattern))
+			slog.String("providers", strings.Join(names, ",")))
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -139,10 +195,18 @@ func init() {
 		"namespace ArgoCD reads cluster Secrets from")
 	f.StringVar(&managedByValue, "managed-by", "cluster-registrar",
 		"value of the <label-prefix>managed-by label identifying namespaces to watch and Secrets to own")
+	// StringArray, not StringSlice: a custom spec's key list is comma-separated,
+	// and StringSlice would split it into separate providers.
+	f.StringArrayVar(&providerSpecs, "provider", nil,
+		"provisioner to look for; repeatable. One of "+strings.Join(registrar.PresetNames(), ", ")+
+			", or a custom \"name=pattern=key[,key...]\". Defaults to k3k")
+	// Superseded by --provider, kept so a 0.2.x values file keeps working. Note
+	// these defaults are never empty, which is why resolveProviders gates on
+	// Changed() rather than on the values.
 	f.StringVar(&secretNamePattern, "secret-name-pattern", "k3k-*-kubeconfig",
-		"glob matching the kubeconfig Secret within a watched namespace")
+		"DEPRECATED, use --provider: glob matching the kubeconfig Secret within a watched namespace")
 	f.StringVar(&secretKey, "secret-key", "kubeconfig.yaml",
-		"key inside that Secret holding the kubeconfig")
+		"DEPRECATED, use --provider: key inside that Secret holding the kubeconfig")
 	f.StringVar(&labelPrefix, "label-prefix", registrar.DefaultLabelPrefix,
 		"prefix for the labels read from the source namespace and copied onto the cluster Secret")
 }

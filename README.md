@@ -11,7 +11,7 @@
     <br>
     <i><b>argocd-cluster-registrar</b></i>
     <br>
-    Registers <a href="https://github.com/rancher/k3k">k3k</a> and <a href="https://www.vcluster.com/">vcluster</a> child clusters with ArgoCD, and removes them again when they are deleted
+    A cluster registrar made for ArgoCD
     <br>
     <br>
     ⚙️ <a href="#installing">Installing</a> | 🔎 <a href="#configuring">Configuring</a> | 🧩 <a href="#how-it-works">How it works</a>
@@ -19,13 +19,20 @@
     <br>
 </p>
 
-You spin up a cluster inside your cluster with [k3k](https://github.com/rancher/k3k)
-or [vcluster](https://www.vcluster.com/), and ArgoCD cannot see it. The provisioner
-writes a kubeconfig `Secret` into the cluster's namespace, but ArgoCD only reads
-`Secret`s in its own namespace labelled `argocd.argoproj.io/secret-type: cluster`.
-So you end up registering clusters by hand, or with a script.
+If you are running clusters inside your cluster with
+[k3k](https://github.com/rancher/k3k), [vcluster](https://www.vcluster.com/),
+[Kamaji](https://kamaji.clastix.io/) or [Cluster API](https://cluster-api.sigs.k8s.io/),
+and you use [ArgoCD](https://argoproj.github.io/argo-cd/), stop reading and jump to
+[installing](#installing)!
 
-This does it for you, and it also does the part scripts usually skip:
+Why? You have probably noticed that ArgoCD does not detect them out-of-the-box. The
+provisioner writes a kubeconfig `Secret` into the cluster's namespace, but ArgoCD only
+reads `Secret`s in its own namespace labelled
+`argocd.argoproj.io/secret-type: cluster`, so you end up registering clusters by hand,
+or with a somewhat painful ad-hoc script.
+
+I have got you covered. This does it for you, and it also does the part scripts
+usually skip:
 
 * Registers each child cluster it finds, so ArgoCD can target it by name.
 * Deletes the registration when the cluster is gone. Otherwise a destroyed
@@ -37,13 +44,16 @@ This does it for you, and it also does the part scripts usually skip:
 > [!IMPORTANT]
 > Upgrading from `0.1.x` (`vcluster-argocd-exporter`)? The flags, values, Secret
 > names and labels all changed, and a stale values file fails silently. See
-> [Migrating from 0.1.x](CHANGELOG.md#migrating-from-01x).
+> [Migrating from 0.1.x](CHANGELOG.md#migrating-from-01x). That section predates
+> `providers`; where it tells you to set `secretNamePattern`/`secretKey`, prefer a
+> `providers` entry instead.
 
 ## Installing
 
 Install it once, as a singleton. Do not add it as a dependency of a per-cluster
 chart: every instance reconciles cluster-wide and garbage collects, so two
-instances sharing a `managedBy` value will delete each other's `Secret`s.
+instances sharing a `managedBy` value fight over the same `Secret`s, each
+overwriting the other's work every pass.
 
 ### Helm `dependency`
 
@@ -79,10 +89,9 @@ labelPrefix: argocd-cluster-registrar/
 # watch, and which cluster Secrets this release owns. Give each instance its own.
 managedBy: cluster-registrar
 
-# Glob matching the kubeconfig Secret in a watched namespace, and the key inside
-# it. The defaults suit k3k.
-secretNamePattern: "k3k-*-kubeconfig"
-secretKey: kubeconfig.yaml
+# Provisioners to look for, in precedence order. Presets: k3k, vcluster, kamaji,
+# capi. Empty means the binary's own default, which is k3k. See "Providers" below.
+providers: []
 
 # Each pass re-reads every kubeconfig, which is what keeps registrations working
 # after a certificate rotation.
@@ -103,15 +112,110 @@ cluster, so you can try it before installing anything:
 argocd-cluster-registrar --once --dry-run --debug
 ```
 
-### Settings per provisioner
+### Providers
 
-| Provisioner | `secretNamePattern` | `secretKey` | Status |
-|---|---|---|---|
-| [k3k](https://github.com/rancher/k3k) v1.2.0-rc3 | `k3k-*-kubeconfig` | `kubeconfig.yaml` | tested |
-| [vcluster](https://www.vcluster.com/) 0.36.1 | `vc-*` | `config` | tested, see below |
+`providers` lists the provisioner shapes to look for, **in precedence order**.
+Each preset is a `Secret`-name glob plus the keys that may hold the kubeconfig:
 
-Anything else that writes a kubeconfig into a `Secret` should work by setting
-those two values, but only the two above have actually been run.
+| Preset | Provisioner | `Secret` name | Key(s) | Status |
+|---|---|---|---|---|
+| `k3k` | [k3k](https://github.com/rancher/k3k) v1.2.0-rc3 | `k3k-*-kubeconfig` | `kubeconfig.yaml` | tested |
+| `vcluster` | [vcluster](https://www.vcluster.com/) 0.36.1 | `vc-*` | `config` | tested, see below |
+| `kamaji` | [Kamaji](https://kamaji.clastix.io/) v1.0.0 standalone | `*-admin-kubeconfig` | `admin.conf`, `admin.svc` | tested, see below |
+| `capi` | [Cluster API](https://cluster-api.sigs.k8s.io/) contract | `*-kubeconfig` | `value` | assumed |
+
+`Status` is meant literally: **tested** has been run against the real thing,
+**assumed** was taken from upstream source but not exercised here.
+
+Several can run at once, which is rather the point. One instance serves a mixed
+fleet:
+
+```yaml
+providers:
+  - k3k
+  - capi
+```
+
+Anything else that writes a kubeconfig into a `Secret` works too, spelled out in
+full:
+
+```yaml
+providers:
+  - name: mytool
+    secretNamePattern: "mytool-*-kubeconfig"
+    secretKeys: [kubeconfig]
+```
+
+The matched provider is recorded on the cluster `Secret` as
+`<labelPrefix>provider`, so an ApplicationSet can select by provisioner.
+
+#### Scope
+
+This registers clusters **provisioned inside the host cluster**: something running
+here writes a kubeconfig `Secret` into a namespace you can label, and that `Secret`
+is the only input. A standalone cluster elsewhere has no such object, so there is
+nothing to discover. That is a different problem, usually one of reachability.
+
+#### Why order matters
+
+The globs overlap deliberately. `capi`'s `*-kubeconfig` also matches k3k's
+`k3k-<cluster>-kubeconfig`. Correctness comes from the **key**, not the name: the
+k3k `Secret` carries no `value`, so `capi` falls through. Where two providers could
+both claim a `Secret`, the one declared first wins, and a `Secret` already claimed
+is never offered twice, so one cluster is registered once.
+
+That is not hypothetical. Driving Kamaji through its Cluster API control-plane
+provider produces **two** `Secret`s for one cluster: Kamaji's own
+`<tcp>-admin-kubeconfig`, and a CAPI-shaped `<cluster>-kubeconfig` copied from it.
+With both presets enabled, both match.
+
+#### Kamaji
+
+Tested against Kamaji v1.0.0: a `TenantControlPlane` named `tenant-00` produced
+`tenant-00-admin-kubeconfig`, and the resulting registration authenticated to the
+tenant API server with `insecure: false` and full x509 verification.
+
+Two things worth knowing. The `Secret` also carries `super-admin.conf` and
+`super-admin.svc`; the preset tries `admin.conf` first, so the ordinary admin
+credential wins and the more privileged one is never copied. And Kamaji writes
+sibling `<tcp>-controller-manager-kubeconfig` and `<tcp>-scheduler-kubeconfig`
+`Secret`s, which do **not** end in `-admin-kubeconfig` and so never match the
+`kamaji` preset. They do match `capi`'s looser `*-kubeconfig`, but carry no
+`value` key, so they are rejected there too.
+
+`admin.conf` points at the control plane's `Service` address. When
+`spec.networkProfile.address` advertises a different one, Kamaji writes it to
+`admin.svc` as well, hence two keys. Both are normally present at once: a live
+v1.0.0 `TenantControlPlane` carried `admin.conf`, `admin.svc`, `super-admin.conf`
+and `super-admin.svc` on the same `Secret`.
+
+Whichever key is present first in the list wins, and only that one is tried. If
+`admin.conf` is unusable, `admin.svc` is not attempted as a fallback; reorder them
+in a custom provider entry if you need the other.
+
+#### About `capi`
+
+It is the *mandatory* Cluster API control-plane contract rather than a convention:
+`<cluster>-kubeconfig` in the Cluster's namespace, type `cluster.x-k8s.io/secret`,
+kubeconfig under `value`. One entry therefore covers any CAPI cluster whatever the
+**infrastructure** provider. Note that the kubeconfig is written by the
+*control-plane* provider (KCP, KamajiControlPlane, K0sControlPlane,
+KThreesControlPlane, Talos CACPPT), not by CAPD, Proxmox or Metal3. Standalone
+k0smotron adopts the same shape, so it is covered as well.
+[CAPI + KubeVirt](https://github.com/kubernetes-sigs/cluster-api-provider-kubevirt)
+is the closest peer to k3k and vcluster: child clusters as VMs inside the host
+cluster.
+
+It does **not** usefully cover managed cloud control planes. CAPA's EKS path writes
+a second `<cluster>-user-kubeconfig` holding an `exec` credential, which cannot be
+copied into an ArgoCD `Secret` at all, and the CAPI-internal one holds a token that
+rotates every ~15 minutes. A candidate that fails to parse is skipped in favour of
+the next, so the `exec` case degrades safely. A short-lived token is worse: it
+parses, registers, and then quietly expires. So
+treat `capi` as self-managed control planes only.
+
+`capi` is also the loosest pattern shipped: `*-kubeconfig` matches anything in a
+managed namespace ending that way. Put a more specific provider first.
 
 #### vcluster
 
@@ -141,9 +245,11 @@ controlPlane:
 ```
 
 Note that `vc-*` also matches vcluster's own `vc-config-<name>` `Secret`, which
-holds no kubeconfig. That is handled: a `Secret` is only used if it matches the
-name pattern *and* carries `secretKey`. Do not rely on ordering to save you here
-(`vc-config-abc` sorts before `vc-abc`, but after `vc-xyz`).
+holds no kubeconfig (its key is `config.yaml`, not `config`). That is handled: a
+`Secret` is only used if it matches the name pattern *and* carries one of the
+provider's keys. Do not rely on ordering to save you here: whether the decoy sorts
+first depends entirely on the names. `vc-config-x` sorts before `vc-x`, but
+`vc-config-abc` sorts *after* `vc-abc`. The key check is what saves you, not the sort.
 
 ### Marking a cluster for registration
 
@@ -223,6 +329,9 @@ Cluster `Secret`s that carry the ownership label but whose source namespace has
 gone are deleted. Anything without that label is left alone, so clusters you
 registered by hand are safe.
 
-RBAC is `namespaces` (read) and `secrets` (read, write, delete). It is
-cluster-scoped because the sources sit in one namespace per child while the
-destination sits in `argocd`.
+RBAC is split by scope. Reads are cluster-wide (`namespaces` get/list, `secrets`
+list) because discovery is label-driven and the sources sit in one namespace per
+child. Every **write** is a namespaced `Role` bound to
+`targetNamespace` alone, since that is the only place this ever creates, updates
+or deletes anything. Granting `secrets` write across the whole cluster would be a
+privilege-escalation path in exchange for nothing.

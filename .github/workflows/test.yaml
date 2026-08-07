@@ -87,12 +87,74 @@ jobs:
           helm lint "$chart"
           helm lint "$chart" --set commonLabels.team=platform
           helm lint "$chart" --set commonAnnotations.owner=infra
+          # The deprecated single-provider form, exactly as a 0.2.x values file
+          # would express it: the old scalars and NO mention of providers.
           helm lint "$chart" \
             --set commonLabels.a=b \
             --set commonAnnotations.c=d \
             --set labelPrefix=example.com/ \
             --set secretNamePattern='vc-*' \
             --set secretKey=config
+          # Several presets at once, which is the point of 0.3.0.
+          helm lint "$chart" \
+            --set 'providers[0]=k3k' \
+            --set 'providers[1]=kamaji' \
+            --set 'providers[2]=capi'
+          # A custom shape spelled out in full, including a multi-key list.
+          helm lint "$chart" \
+            --set 'providers[0]=k3k' \
+            --set 'providers[1].name=mytool' \
+            --set 'providers[1].secretNamePattern=mytool-*-kubeconfig' \
+            --set 'providers[1].secretKeys={admin.conf,admin.svc}'
+
+      # A 0.2.x values file sets the old scalars and says nothing about
+      # `providers`. Helm still coalesces the chart default in, so if that default
+      # is non-empty the legacy branch is unreachable and the user's settings are
+      # dropped without a word: the pod looks healthy and registers nothing. This
+      # is the regression test for that.
+      - name: A 0.2.x values file still renders the deprecated flags
+        run: |
+          set -euo pipefail
+          chart=deploy/charts/argocd-cluster-registrar
+          cat <<'EOF' > /tmp/legacy-values.yaml
+          secretNamePattern: "vc-*"
+          secretKey: config
+          EOF
+          out=$(helm template t "$chart" -f /tmp/legacy-values.yaml)
+          grep -q -- "--secret-name-pattern=vc-\*" <<<"$out" || {
+            echo "::error::a 0.2.x values file no longer renders its own settings"
+            grep -- '--' <<<"$out"; exit 1
+          }
+          grep -q -- '--secret-key=config' <<<"$out"
+          if grep -q -- '--provider=' <<<"$out"; then
+            echo "::error::chart injected a default provider over the user's legacy settings"
+            exit 1
+          fi
+
+      # Setting both forms is ambiguous, and quietly honouring either one is how an
+      # upgrade ends up looking healthy while registering nothing. The chart must
+      # fail rather than choose.
+      - name: Setting both provider forms fails the render
+        run: |
+          set -euo pipefail
+          chart=deploy/charts/argocd-cluster-registrar
+          if helm template t "$chart" --set 'providers[0]=k3k' \
+               --set secretNamePattern='vc-*' --set secretKey=config >/dev/null 2>&1; then
+            echo "::error::chart rendered with both provider forms set; it must fail"
+            exit 1
+          fi
+
+      # With neither set, the chart must emit no provider flags at all and let the
+      # binary apply its own default. Emitting one here is what broke the case above.
+      - name: A default install emits no provider flags
+        run: |
+          set -euo pipefail
+          chart=deploy/charts/argocd-cluster-registrar
+          out=$(helm template t "$chart")
+          if grep -qE -- '--provider=|--secret-name-pattern=|--secret-key=' <<<"$out"; then
+            echo "::error::default install should defer to the binary's own default"
+            grep -- '--' <<<"$out"; exit 1
+          fi
 
   deploy-test:
     needs: [lint, test]
@@ -122,13 +184,15 @@ jobs:
           kind load docker-image "$img" --name chart-testing
           echo "ref=$img" >> "$GITHUB_OUTPUT"
 
-      # A synthetic child: a labelled namespace holding a kubeconfig Secret in
-      # the shape k3k produces. This exercises the real contract without waiting
-      # on a provisioner to boot.
-      - name: Seed a fake child cluster
+      # Two synthetic children in DIFFERENT shapes: one as k3k writes it, one as
+      # the Cluster API contract requires. This exercises the real contract
+      # without waiting on a provisioner to boot, and proves a single instance
+      # serves a mixed fleet -- which was impossible before 0.3.0.
+      - name: Seed fake child clusters
         run: |
           set -euo pipefail
           kubectl create namespace argocd
+
           kubectl create namespace k3k-sandbox
           kubectl label namespace k3k-sandbox \
             argocd-cluster-registrar/managed-by=cluster-registrar \
@@ -150,6 +214,35 @@ jobs:
           kubectl create secret generic k3k-sandbox-kubeconfig \
             -n k3k-sandbox --from-file=kubeconfig.yaml=/tmp/kubeconfig.yaml
 
+          # CAPI shape: `<cluster>-kubeconfig`, key `value`, multiple entries
+          # with an explicit current-context.
+          kubectl create namespace capi-child
+          kubectl label namespace capi-child \
+            argocd-cluster-registrar/managed-by=cluster-registrar \
+            argocd-cluster-registrar/cluster=capichild
+          cat <<'EOF' > /tmp/value
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - name: capichild
+            cluster:
+              server: https://192.0.2.20
+              certificate-authority-data: Y2FkYXRh
+          users:
+          - name: capichild-admin
+            user:
+              client-certificate-data: Y2VydGRhdGE=
+              client-key-data: a2V5ZGF0YQ==
+          contexts:
+          - name: capichild-admin@capichild
+            context:
+              cluster: capichild
+              user: capichild-admin
+          current-context: capichild-admin@capichild
+          EOF
+          kubectl create secret generic capichild-kubeconfig \
+            -n capi-child --from-file=value=/tmp/value
+
       - name: Install the chart
         run: |
           set -euo pipefail
@@ -158,38 +251,87 @@ jobs:
             --set image.repository="$(echo '${{ steps.image.outputs.ref }}' | cut -d: -f1)" \
             --set image.tag="$(echo '${{ steps.image.outputs.ref }}' | cut -d: -f2)" \
             --set image.pullPolicy=IfNotPresent \
+            --set 'providers[0]=k3k' \
+            --set 'providers[1]=capi' \
             --set interval=5s \
             --wait --timeout 3m
 
       # Assertions are real: no `|| echo "Ignored..."`, so a regression fails CI.
-      - name: It registers the cluster
+      - name: It registers both shapes, under one instance
         run: |
           set -euo pipefail
           for i in $(seq 1 30); do
-            if kubectl get secret cluster-sandbox -n argocd >/dev/null 2>&1; then
-              echo "registered after ${i}0s"
-              kubectl get secret cluster-sandbox -n argocd \
-                -o jsonpath='{.metadata.labels}'; echo
+            if kubectl get secret cluster-sandbox -n argocd >/dev/null 2>&1 \
+               && kubectl get secret cluster-capichild -n argocd >/dev/null 2>&1; then
+              echo "both registered after ${i}0s"
+              kubectl get secret cluster-sandbox -n argocd -o jsonpath='{.metadata.labels}'; echo
+              kubectl get secret cluster-capichild -n argocd -o jsonpath='{.metadata.labels}'; echo
               test "$(kubectl get secret cluster-sandbox -n argocd -o jsonpath='{.data.server}' | base64 -d)" = "https://192.0.2.10"
+              test "$(kubectl get secret cluster-capichild -n argocd -o jsonpath='{.data.server}' | base64 -d)" = "https://192.0.2.20"
+              # The provider label is what makes a mixed fleet introspectable.
+              test "$(kubectl get secret cluster-sandbox -n argocd -o jsonpath='{.metadata.labels.argocd-cluster-registrar/provider}')" = "k3k"
+              test "$(kubectl get secret cluster-capichild -n argocd -o jsonpath='{.metadata.labels.argocd-cluster-registrar/provider}')" = "capi"
               exit 0
             fi
             sleep 10
           done
-          echo "::error::cluster-sandbox was never created"
+          echo "::error::both cluster Secrets were never created"
+          kubectl get secrets -n argocd
           kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar --tail=50
           exit 1
 
-      - name: It deregisters when the source namespace is gone
+      # Collection must be per-cluster. Deleting one child must not disturb the
+      # other, and -- before 0.3.0 -- one unevaluable namespace suppressed GC for
+      # the entire fleet.
+      - name: It deregisters only the cluster whose namespace is gone
         run: |
           set -euo pipefail
           kubectl delete namespace k3k-sandbox --wait=true
           for i in $(seq 1 30); do
             if ! kubectl get secret cluster-sandbox -n argocd >/dev/null 2>&1; then
               echo "deregistered after ${i}0s"
+              if ! kubectl get secret cluster-capichild -n argocd >/dev/null 2>&1; then
+                echo "::error::cluster-capichild was collected too; GC is not per-cluster"
+                exit 1
+              fi
               exit 0
             fi
             sleep 10
           done
           echo "::error::cluster-sandbox was never garbage collected"
+          kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar --tail=50
+          exit 1
+
+      # A Secret that matches the shape but does not parse must never look like a
+      # deletion, and must not stop OTHER clusters being collected. A starting k3k
+      # child is in exactly this state for roughly its first ninety seconds.
+      - name: A half-written kubeconfig neither deregisters nor blocks GC
+        run: |
+          set -euo pipefail
+          kubectl create namespace k3k-broken
+          kubectl label namespace k3k-broken \
+            argocd-cluster-registrar/managed-by=cluster-registrar \
+            argocd-cluster-registrar/cluster=broken
+          printf '<html>not a kubeconfig</html>' > /tmp/broken
+          kubectl create secret generic k3k-broken-kubeconfig \
+            -n k3k-broken --from-file=kubeconfig.yaml=/tmp/broken
+          sleep 20
+          if kubectl get secret cluster-broken -n argocd >/dev/null 2>&1; then
+            echo "::error::an unparseable kubeconfig was registered"
+            exit 1
+          fi
+          # The still-healthy child must remain registered throughout.
+          kubectl get secret cluster-capichild -n argocd >/dev/null
+
+          # ...and GC must still work for everything else while it is stuck.
+          kubectl delete namespace capi-child --wait=true
+          for i in $(seq 1 24); do
+            if ! kubectl get secret cluster-capichild -n argocd >/dev/null 2>&1; then
+              echo "collected despite a stuck namespace, after ${i}0s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::a stuck namespace suppressed garbage collection for the fleet"
           kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar --tail=50
           exit 1
