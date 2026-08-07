@@ -11,6 +11,7 @@ import (
 	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -71,7 +72,7 @@ type Reconciler struct {
 // Reconcile has exactly two return statements and both go through done.
 func (rc *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	if req.Name == auditKey {
-		return rc.done(rc.registrar.AuditUnrouted(ctx))
+		return rc.done(false, rc.registrar.AuditUnrouted(ctx))
 	}
 	return rc.done(rc.registrar.ReconcileOne(ctx, req.Name))
 }
@@ -81,11 +82,24 @@ func (rc *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Res
 // On error the Result is deliberately empty: controller-runtime discards
 // RequeueAfter when an error is returned and requeues rate-limited instead, so
 // setting both would just log a warning on every failure.
-func (rc *Reconciler) done(err error) (ctrl.Result, error) {
-	if err != nil {
+//
+// `finished` drops the key. Only a namespace that is provably gone and owns
+// nothing further qualifies, because everything else has a reason to come back:
+// a live cluster needs its credentials refreshed, and a namespace that merely
+// stopped being ours has to stay queued, since the filtered cache has already
+// forgotten it and will never report its deletion. Without this every namespace
+// ever seen would be revisited forever, each visit costing a LIST of the ArgoCD
+// namespace -- which the sweep never did, because it recomputed its key set from
+// scratch each pass.
+func (rc *Reconciler) done(finished bool, err error) (ctrl.Result, error) {
+	switch {
+	case err != nil:
 		return ctrl.Result{}, err
+	case finished:
+		return ctrl.Result{}, nil
+	default:
+		return ctrl.Result{RequeueAfter: rc.interval}, nil
 	}
-	return ctrl.Result{RequeueAfter: rc.interval}, nil
 }
 
 // scheme carries only what is watched. corev1 is the whole of it: this tool has
@@ -96,6 +110,42 @@ func newScheme() (*runtime.Scheme, error) {
 		return nil, fmt.Errorf("build scheme: %w", err)
 	}
 	return s, nil
+}
+
+// managerOptions is separate so the options with dangerous defaults can be
+// asserted in a test. Start itself cannot be: it builds a client against the
+// ambient cluster.
+func managerOptions(cfg Config, opts ControllerOptions, scheme *runtime.Scheme) ctrl.Options {
+	return ctrl.Options{
+		Scheme: scheme,
+		Cache: cache.Options{
+			// A cached read of anything we forgot to configure is an error, not a
+			// new cluster-wide informer started silently in the background.
+			ReaderFailOnMissingInformer: true,
+			ByObject: map[client.Object]cache.ByObject{
+				&coreV1.Namespace{}: {
+					Label: labels.SelectorFromSet(labels.Set{
+						ManagedByLabel(cfg.LabelPrefix): cfg.ManagedByValue,
+					}),
+				},
+			},
+			// Nothing reads managedFields and they dominate the size of a cached
+			// object.
+			DefaultTransform: cache.TransformStripManagedFields(),
+		},
+		// Belt and braces: no Secret may ever be served from cache. Every read
+		// here goes through the clientset, so this should be unreachable.
+		Client: client.Options{
+			Cache: &client.CacheOptions{DisableFor: []client.Object{&coreV1.Secret{}}},
+		},
+		// "0" disables. An empty string would bind :8080 unauthenticated.
+		Metrics:                       metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress:        opts.HealthProbeBindAddress,
+		LeaderElection:                opts.LeaderElection,
+		LeaderElectionID:              opts.LeaderElectionID,
+		LeaderElectionNamespace:       cfg.TargetNamespace,
+		LeaderElectionReleaseOnCancel: true,
+	}
 }
 
 // Start runs the controller until ctx is cancelled.
@@ -137,36 +187,7 @@ func (r *Registrar) Start(ctx context.Context, opts ControllerOptions) error {
 	// including the queue and leader-election detail that makes a failure legible.
 	ctrl.SetLogger(logr.FromSlogHandler(r.log.Handler()))
 
-	mgr, err := ctrl.NewManager(base, ctrl.Options{
-		Scheme: scheme,
-		Cache: cache.Options{
-			// A cached read of anything we forgot to configure is an error, not a
-			// new cluster-wide informer started silently in the background.
-			ReaderFailOnMissingInformer: true,
-			ByObject: map[client.Object]cache.ByObject{
-				&coreV1.Namespace{}: {
-					Label: labels.SelectorFromSet(labels.Set{
-						r.managedByLabel(): r.cfg.ManagedByValue,
-					}),
-				},
-			},
-			// Nothing reads managedFields and they dominate the size of a cached
-			// object.
-			DefaultTransform: cache.TransformStripManagedFields(),
-		},
-		// Belt and braces: no Secret may ever be served from cache. Every read
-		// here goes through the clientset, so this should be unreachable.
-		Client: client.Options{
-			Cache: &client.CacheOptions{DisableFor: []client.Object{&coreV1.Secret{}}},
-		},
-		// "0" disables. An empty string would bind :8080 unauthenticated.
-		Metrics:                       metricsserver.Options{BindAddress: "0"},
-		HealthProbeBindAddress:        opts.HealthProbeBindAddress,
-		LeaderElection:                opts.LeaderElection,
-		LeaderElectionID:              opts.LeaderElectionID,
-		LeaderElectionNamespace:       r.cfg.TargetNamespace,
-		LeaderElectionReleaseOnCancel: true,
-	})
+	mgr, err := ctrl.NewManager(base, managerOptions(r.cfg, opts, scheme))
 	if err != nil {
 		return fmt.Errorf("build manager: %w", err)
 	}
@@ -180,11 +201,16 @@ func (r *Registrar) Start(ctx context.Context, opts ControllerOptions) error {
 		}
 	}
 
-	kube, err := ClientFor(base)
-	if err != nil {
-		return err
+	// Only build a client if the caller did not supply one. Overwriting an
+	// injected client would make Start untestable -- a test passing a fake would
+	// silently talk to the ambient cluster instead.
+	if r.client == nil {
+		kube, err := ClientFor(base)
+		if err != nil {
+			return err
+		}
+		r.client = kube
 	}
-	r.client = kube
 
 	rec := &Reconciler{registrar: r, interval: opts.Interval}
 
@@ -212,9 +238,23 @@ func (r *Registrar) Start(ctx context.Context, opts ControllerOptions) error {
 	// namespaces known only from the registrations they left behind.
 	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 		defer close(seeds)
-		keys, err := r.reconcileKeys(ctx)
-		if err != nil {
-			return fmt.Errorf("seed reconcile queue: %w", err)
+		// Retry rather than return. An error here reaches the manager's error
+		// channel and tears the process down, so one API blip at the wrong second
+		// would take out a healthy leader and, with ReleaseOnCancel, drop the
+		// lease and force a re-election.
+		keys := make([]string, 0, seedBuffer)
+		if err := wait.PollUntilContextCancel(ctx, 2*time.Second, true,
+			func(ctx context.Context) (bool, error) {
+				var err error
+				keys, err = r.reconcileKeys(ctx)
+				if err != nil {
+					r.log.Warn("could not seed reconcile queue; retrying",
+						slog.Any("error", err))
+					return false, nil
+				}
+				return true, nil
+			}); err != nil {
+			return nil // context cancelled: shutting down, not a failure
 		}
 		// The audit key last: it is the cheapest and the least urgent.
 		keys = append(keys, auditKey)

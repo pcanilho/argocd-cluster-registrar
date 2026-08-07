@@ -227,13 +227,15 @@ kind: Namespace
 metadata:
   name: k3k-sandbox
   labels:
-    argocd-cluster-registrar/managed-by: cluster-registrar   # discovery and GC ownership
+    argocd-cluster-registrar/managed-by: cluster-registrar   # ownership
     argocd-cluster-registrar/cluster: sandbox                # the ArgoCD cluster name
-    argocd-cluster-registrar/flux: "true"                    # extra labels get copied over
+    argocd-cluster-registrar/flux: "true"                    # copied to the Secret
 ```
 
-Any other label under the same prefix is copied onto the cluster `Secret`, which
-is how an ApplicationSet cluster generator can select on it:
+Any label under the same prefix is copied onto the cluster `Secret`, except the
+handful this tool writes itself (`managed-by`, `cluster`, `source-namespace`,
+`provider`, and the demotion and prune markers below). Copying is how an
+ApplicationSet cluster generator selects on them:
 
 ```yaml
 generators:
@@ -286,13 +288,16 @@ stateDiagram-v2
     Registered --> Registered: kubeconfig re-read every interval<br/>(requeue; survives cert rotation)
     Registered --> Demoted: cluster label renamed<br/>hidden from ArgoCD, kept intact
     Demoted --> Registered: rename reverted
+    Registered --> Pinned: prune=disabled
+    Pinned --> Registered: label removed
     Registered --> [*]: source namespace deleted<br/>cluster Secret removed
     Demoted --> [*]: source namespace deleted
 ```
 
 Cluster `Secret`s that carry the ownership label but whose source namespace has
 gone are deleted. Anything without that label is left alone, so clusters you
-registered by hand are safe.
+registered by hand are safe. To pin one that this tool *does* own, label it
+`<labelPrefix>prune: disabled` and neither deletion nor demotion will touch it.
 
 Renaming a cluster is the one other way a registration leaves ArgoCD, and it is
 not a deletion. The new name is registered and the old `Secret` is **demoted**:

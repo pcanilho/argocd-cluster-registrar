@@ -9,9 +9,11 @@ labelPrefix: argocd-cluster-registrar/
 
 # Value of the `<labelPrefix>managed-by` label that identifies both the namespaces
 # to watch and the ArgoCD cluster Secrets this release owns. Give each release its
-# own: two registrars sharing a value do not corrupt each other's Secrets, since
-# neither will take over a registration the other holds, but whichever loses the
-# race registers nothing and logs a conflict every interval instead.
+# own: two registrars sharing a value discover the same namespaces and do the same
+# work twice. They do not corrupt each other -- neither will take over a
+# registration the other holds -- but if they are configured with different
+# `providers` they rewrite each other's `<labelPrefix>provider` label on every
+# reconcile, forever. `leaderElection` is the fix if you must run two.
 #
 # Changing this later orphans every Secret already registered. It is part of the
 # ownership record, so the new instance refuses to adopt them and garbage

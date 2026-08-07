@@ -86,9 +86,14 @@ func resolveProviders(cmd *cobra.Command) ([]registrar.Provider, error) {
 }
 
 var rootCmd = &cobra.Command{
-	Use:     "cluster-registrar",
-	Short:   "Kubernetes controller that registers child clusters with ArgoCD",
-	Version: version + " (" + commit + ") " + date,
+	Use: "argocd-cluster-registrar",
+	// A runtime failure is not a usage error. Without these, any error out of
+	// RunE prints the whole Long help after it, which in pod logs buries the
+	// thing that actually went wrong.
+	SilenceUsage:  true,
+	SilenceErrors: false,
+	Short:         "Kubernetes controller that registers child clusters with ArgoCD",
+	Version:       version + " (" + commit + ") " + date,
 	Long: `A controller that reconciles child-cluster kubeconfig Secrets into ArgoCD cluster Secrets.
 
 Discovery is namespace-driven: any namespace labelled
@@ -200,8 +205,11 @@ func registerFlags(f *pflag.FlagSet) {
 	f.BoolVar(&dryRun, "dry-run", false, "log intended changes without writing")
 	// Long-running is the default. A one-shot Job cannot garbage-collect, because
 	// a cluster is usually destroyed long after the last sync that created it.
-	f.BoolVar(&once, "once", false, "run a single reconcile pass and exit")
-	f.DurationVar(&interval, "interval", 60*time.Second, "reconcile interval")
+	f.BoolVar(&once, "once", false,
+		"run a single sweep and exit, without building a manager or taking a lease")
+	f.DurationVar(&interval, "interval", 60*time.Second,
+		"how long before a settled cluster is revisited; bounds credential freshness, "+
+			"not registration latency")
 	f.StringVarP(&targetNamespace, "target-namespace", "t", "argocd",
 		"namespace ArgoCD reads cluster Secrets from")
 	f.StringVar(&managedByValue, "managed-by", "cluster-registrar",

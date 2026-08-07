@@ -183,9 +183,8 @@ type Provider struct {
 // presets are the provisioner shapes shipped with the tool, so that configuring
 // one is `providers: [k3k, capi]` rather than a glob a user has to get right.
 //
-// Only k3k, vcluster and kamaji have been run against the real thing; see the
-// provisioner table in README.md, which distinguishes tested from assumed and
-// should be kept honest.
+// All four have been run against the real thing; see the provisioner table in
+// README.md, which distinguishes tested from assumed and should be kept honest.
 //
 // Every entry carries `#nosec G101`. gosec matches that rule on identifiers like
 // `Secret*` sitting next to a string literal, which describes this map exactly --
@@ -483,15 +482,21 @@ func BaseRestConfig() (*rest.Config, error) {
 // synthetic Deleted when an object stops matching the selector, so a cached
 // NotFound cannot tell "the namespace was deleted" from "someone removed the
 // managed-by label" -- and the second must never deregister anything.
-func (r *Registrar) ReconcileOne(ctx context.Context, nsName string) error {
+// The bool reports that this key is DONE: the namespace is gone and it owns
+// nothing further, so there is no reason to visit it again. Anything else is
+// false, including the case where the namespace merely stopped being ours --
+// that key must stay in the queue, because the filtered cache has already
+// forgotten the namespace and will not report its eventual deletion.
+func (r *Registrar) ReconcileOne(ctx context.Context, nsName string) (bool, error) {
 	ns, err := r.client.CoreV1().Namespaces().Get(ctx, nsName, metaV1.GetOptions{})
 	switch {
 	case apiErrors.IsNotFound(err):
 		// The proof. This is the only path that may delete.
-		return r.collectOne(ctx, nsName, false, "")
+		remaining, cErr := r.collectOne(ctx, nsName, false, "")
+		return remaining == 0 && cErr == nil, cErr
 	case err != nil:
 		// Nothing is proven, so nothing may be collected.
-		return fmt.Errorf("confirm namespace %s: %w", nsName, err)
+		return false, fmt.Errorf("confirm namespace %s: %w", nsName, err)
 	}
 
 	// Still ours? Under a watch this is not redundant with discovery. A cache
@@ -506,7 +511,7 @@ func (r *Registrar) ReconcileOne(ctx context.Context, nsName string) error {
 	if ns.Labels[r.managedByLabel()] != r.cfg.ManagedByValue {
 		r.log.Warn("namespace no longer carries the ownership label; leaving its registrations alone",
 			slog.String("namespace", ns.Name), slog.String("label", r.managedByLabel()))
-		return nil
+		return false, nil
 	}
 
 	// A namespace being torn down still reads back; registering from it would
@@ -515,14 +520,15 @@ func (r *Registrar) ReconcileOne(ctx context.Context, nsName string) error {
 	// this is the sole caller reaching.
 	if ns.DeletionTimestamp != nil {
 		r.log.Debug("skipping terminating namespace", slog.String("namespace", ns.Name))
-		return r.collectOne(ctx, nsName, true, "")
+		_, err := r.collectOne(ctx, nsName, true, "")
+		return false, err
 	}
 
 	c, ok := r.discoverOne(ctx, ns)
 	if !ok {
 		// Could not be evaluated. Skip collection entirely rather than concluding
 		// its registrations are orphaned.
-		return nil
+		return false, nil
 	}
 
 	if err := r.apply(ctx, c); err != nil {
@@ -537,14 +543,15 @@ func (r *Registrar) ReconcileOne(ctx context.Context, nsName string) error {
 			// earlier registrations must not be read as superseded.
 			r.log.Error("refused to register cluster", slog.String("cluster", c.cluster),
 				slog.String("namespace", c.namespace), slog.Any("reason", err))
-			return nil
+			return false, nil
 		}
 		r.log.Error("failed to register cluster",
 			slog.String("cluster", c.cluster), slog.Any("error", err))
-		return fmt.Errorf("%s: %w", c.cluster, err)
+		return false, fmt.Errorf("%s: %w", c.cluster, err)
 	}
 
-	return r.collectOne(ctx, nsName, true, secretName(c.cluster))
+	_, err = r.collectOne(ctx, nsName, true, secretName(c.cluster))
+	return false, err
 }
 
 // AuditUnrouted reports owned Secrets that record no source namespace.
@@ -634,7 +641,7 @@ func (r *Registrar) Reconcile(ctx context.Context) error {
 	for _, k := range keys {
 		// One bad namespace must not stop the others, or a single broken cluster
 		// would stall the whole fleet.
-		if err := r.ReconcileOne(ctx, k); err != nil {
+		if _, err := r.ReconcileOne(ctx, k); err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
@@ -1174,7 +1181,19 @@ func (r *Registrar) demote(ctx context.Context, s *coreV1.Secret, supersededBy s
 		updated.Labels[r.orphanedSecretTypeLabel()] = v
 		delete(updated.Labels, argoSecretTypeLabel)
 	}
-	updated.Labels[r.supersededByLabel()] = supersededBy
+	// superseded-by is a breadcrumb, and it is derived from a cluster name that is
+	// only bounded by the 63 bytes a LABEL VALUE allows -- so "cluster-" + name can
+	// be 71, which the apiserver rejects. Dropping the breadcrumb is very much
+	// better than failing the write: the load-bearing half of demotion is parking
+	// the ArgoCD label above, and without it the stale registration stays visible
+	// and ArgoCD ends up with two live clusters on one server URL.
+	if errs := validation.IsValidLabelValue(supersededBy); len(errs) > 0 {
+		r.log.Warn("superseded-by would not be a valid label value; demoting without it",
+			slog.String("secret", s.Name), slog.String("supersededBy", supersededBy),
+			slog.String("reason", strings.Join(errs, "; ")))
+	} else {
+		updated.Labels[r.supersededByLabel()] = supersededBy
+	}
 	updated.Labels[r.staleSinceLabel()] = time.Now().UTC().Format(staleSinceFormat)
 
 	if _, err := r.client.CoreV1().Secrets(r.cfg.TargetNamespace).
@@ -1231,7 +1250,10 @@ func changed(existing, want *coreV1.Secret, labelPrefix string) bool {
 // registration behind, demoted, still recorded against this namespace. That is
 // why the selector matches a set and not a single name -- handling only one would
 // leak every superseded registration the moment its namespace was deleted.
-func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, applied string) error {
+// The int reports how many owned Secrets still record this namespace after the
+// pass. Zero, together with a namespace that is provably gone, means there is
+// nothing left to come back for.
+func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, applied string) (int, error) {
 	// Selected on ownership and source ALONE. Selecting on secret-type as well
 	// would hide already-demoted registrations, which still need collecting once
 	// their namespace finally goes away. managed-by is the ownership marker; the
@@ -1242,9 +1264,10 @@ func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, 
 	secrets, err := r.client.CoreV1().Secrets(r.cfg.TargetNamespace).
 		List(ctx, metaV1.ListOptions{LabelSelector: selector})
 	if err != nil {
-		return fmt.Errorf("list cluster secrets (%s): %w", selector, err)
+		return 0, fmt.Errorf("list cluster secrets (%s): %w", selector, err)
 	}
 
+	remaining := len(secrets.Items)
 	var errs []string
 	for i := range secrets.Items {
 		s := &secrets.Items[i]
@@ -1258,7 +1281,7 @@ func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, 
 		// out of ArgoCD's sight, which is exactly what someone pinning a
 		// registration is asking not to happen.
 		if s.Labels[r.pruneLabel()] == PruneDisabled {
-			r.log.Info("registration is opted out of collection; leaving it",
+			r.log.Debug("registration is opted out of collection; leaving it",
 				slog.String("secret", s.Name), slog.String("namespace", nsName),
 				slog.String("label", r.pruneLabel()))
 			continue
@@ -1267,7 +1290,9 @@ func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, 
 		if !exists {
 			if err := r.deleteOrphan(ctx, s, nsName); err != nil {
 				errs = append(errs, err.Error())
+				continue
 			}
+			remaining--
 			continue
 		}
 
@@ -1311,9 +1336,9 @@ func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, 
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf("%s", strings.Join(errs, "; "))
+		return remaining, fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
-	return nil
+	return remaining, nil
 }
 
 // deleteOrphan removes a registration whose source namespace is provably gone.

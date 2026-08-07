@@ -12,6 +12,7 @@ import (
 	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
@@ -64,12 +65,18 @@ func TestEveryReturnPathRequeues(t *testing.T) {
 	}}
 
 	for name, tc := range map[string]struct {
-		key  string
-		objs []runtime.Object
+		key      string
+		objs     []runtime.Object
+		finished bool // the key is done and must NOT be requeued
 	}{
 		"namespace gone, registration collected": {
-			key:  "k3k-gone",
-			objs: []runtime.Object{registeredSecret("gone", "k3k-gone")},
+			key:      "k3k-gone",
+			objs:     []runtime.Object{registeredSecret("gone", "k3k-gone")},
+			finished: true,
+		},
+		"namespace gone, nothing was ever registered": {
+			key:      "k3k-never",
+			finished: true,
 		},
 		"namespace terminating": {
 			key:  "k3k-x",
@@ -127,10 +134,18 @@ func TestEveryReturnPathRequeues(t *testing.T) {
 			rec, _ := newTestReconciler(tc.objs...)
 			res, err := rec.Reconcile(context.Background(),
 				ctrl.Request{NamespacedName: types.NamespacedName{Name: tc.key}})
+
+			// Asserting "no error" is the point. Skipping the case on error --
+			// as this test first did -- means a regression that turns a happy
+			// path into a permanent error scores as a pass, and a permanently
+			// erroring key is exactly how a registration ages out unnoticed.
 			if err != nil {
-				return // errors requeue rate-limited; RequeueAfter would be discarded
+				t.Fatalf("unexpected error, which would rate-limit this key: %v", err)
 			}
-			if res.RequeueAfter <= 0 {
+			switch {
+			case tc.finished && res.RequeueAfter != 0:
+				t.Errorf("nothing left to do, but the key was requeued: %+v", res)
+			case !tc.finished && res.RequeueAfter <= 0:
 				t.Errorf("returned without scheduling a revisit: %+v", res)
 			}
 		})
@@ -161,7 +176,7 @@ func TestErrorsDoNotCarryARequeue(t *testing.T) {
 		registrar: &Registrar{cfg: testConfig(), log: slog.New(slog.NewTextHandler(io.Discard, nil))},
 		interval:  testInterval,
 	}
-	res, err := rec.done(io.ErrUnexpectedEOF)
+	res, err := rec.done(false, io.ErrUnexpectedEOF)
 	if err == nil {
 		t.Fatal("expected the error through")
 	}
@@ -224,5 +239,98 @@ func TestReconcileRefreshesRotatedKubeconfig(t *testing.T) {
 		t.Error("credentials were not refreshed after rotation; every Application " +
 			"targeting this cluster would start failing authentication once the old " +
 			"certificate expired")
+	}
+}
+
+// A cluster name is bounded only by what a LABEL VALUE allows, 63 bytes, so
+// "cluster-" + name reaches 71 -- longer than the label value demotion wants to
+// write it into. Failing that write would leave the superseded registration
+// still carrying ArgoCD's label, which is precisely the two-clusters-one-server
+// state demotion exists to prevent, and it would fail again on every retry.
+func TestDemotionSurvivesAClusterNameTooLongForALabelValue(t *testing.T) {
+	long := strings.Repeat("c", 56)
+	if errs := validation.IsValidLabelValue(long); len(errs) > 0 {
+		t.Fatalf("precondition: %q should be a legal cluster label value: %v", long, errs)
+	}
+	if errs := validation.IsValidLabelValue(secretName(long)); len(errs) == 0 {
+		t.Fatal("precondition: cluster-<56 chars> should be too long for a label value")
+	}
+
+	rec, r := newTestReconciler(
+		managedNS("k3k-x", long), kubeconfigSecret("k3k-x", "k3k-x-kubeconfig"),
+		registeredSecret("a", "k3k-x"),
+	)
+	if _, err := rec.Reconcile(context.Background(),
+		ctrl.Request{NamespacedName: types.NamespacedName{Name: "k3k-x"}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	old, err := r.client.CoreV1().Secrets(testTargetNS).
+		Get(context.Background(), "cluster-a", metaV1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if _, ok := old.Labels[argoSecretTypeLabel]; ok {
+		t.Error("the superseded registration is still visible to ArgoCD")
+	}
+	if old.Labels[OrphanedSecretTypeLabel(testPrefix)] != argoSecretTypeValue {
+		t.Error("secret-type was not parked")
+	}
+	// Every label written must be legal, or a real apiserver rejects the update
+	// and demotion never happens at all. The fake does not validate.
+	for k, v := range old.Labels {
+		if errs := validation.IsValidLabelValue(v); len(errs) > 0 {
+			t.Errorf("label %s=%q is not a valid label value: %v", k, v, errs)
+		}
+	}
+}
+
+// The manager wiring has no other coverage: Start builds a real client and talks
+// to the ambient cluster, so it cannot be driven from a test. These are the
+// options whose defaults are actively dangerous.
+func TestManagerOptionsPinTheDangerousDefaults(t *testing.T) {
+	scheme, err := newScheme()
+	if err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+	opts := managerOptions(testConfig(), ControllerOptions{
+		Interval:               time.Minute,
+		HealthProbeBindAddress: ":8081",
+	}, scheme)
+
+	if !opts.Cache.ReaderFailOnMissingInformer {
+		t.Error("a cached read of an unconfigured resource would silently start a " +
+			"cluster-wide informer instead of failing")
+	}
+	if opts.Metrics.BindAddress != "0" {
+		t.Errorf("metrics BindAddress = %q; anything but \"0\" serves :8080 unauthenticated",
+			opts.Metrics.BindAddress)
+	}
+	if opts.Client.Cache == nil || len(opts.Client.Cache.DisableFor) == 0 {
+		t.Fatal("Secrets are not excluded from the cached client")
+	}
+	if _, ok := opts.Client.Cache.DisableFor[0].(*coreV1.Secret); !ok {
+		t.Errorf("DisableFor[0] = %T, want *v1.Secret", opts.Client.Cache.DisableFor[0])
+	}
+	// Only namespaces may be cached; a Secret entry here would mean an informer
+	// holding every child cluster's credentials in memory. The map is keyed by
+	// object pointer, so it has to be walked by type rather than looked up.
+	if len(opts.Cache.ByObject) != 1 {
+		t.Errorf("cache configured for %d kinds, want exactly 1", len(opts.Cache.ByObject))
+	}
+	for k, byObj := range opts.Cache.ByObject {
+		if _, ok := k.(*coreV1.Namespace); !ok {
+			t.Errorf("cache configured for %T; only Namespace may be", k)
+			continue
+		}
+		if byObj.Label == nil || byObj.Label.Empty() {
+			t.Error("the Namespace cache is unfiltered; it would hold every namespace " +
+				"in the cluster")
+		}
+	}
+	if opts.LeaderElectionNamespace != testTargetNS {
+		t.Errorf("LeaderElectionNamespace = %q, want %q; unset means the pod's own "+
+			"namespace, which is not where two colliding releases meet",
+			opts.LeaderElectionNamespace, testTargetNS)
 	}
 }
