@@ -8,8 +8,15 @@ targetNamespace: argocd
 labelPrefix: argocd-cluster-registrar/
 
 # Value of the `<labelPrefix>managed-by` label that identifies both the namespaces
-# to watch and the ArgoCD cluster Secrets this release owns. Two registrars
-# pointed at the same value would fight over the same Secrets; give each its own.
+# to watch and the ArgoCD cluster Secrets this release owns. Give each release its
+# own: two registrars sharing a value do not corrupt each other's Secrets, since
+# neither will take over a registration the other holds, but whichever loses the
+# race registers nothing and logs a conflict every interval instead.
+#
+# Changing this later orphans every Secret already registered. It is part of the
+# ownership record, so the new instance refuses to adopt them and garbage
+# collection no longer selects them. See "Changing managedBy or labelPrefix" in
+# the README.
 managedBy: cluster-registrar
 
 # Provisioners to look for, in precedence order. Order matters, because the

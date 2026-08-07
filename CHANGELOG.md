@@ -7,7 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A cluster `Secret` is never taken over by a namespace that did not create it.**
+  `apply` did an unconditional `Get`, and if `cluster-<name>` existed it was
+  overwritten and relabelled as ours no matter who wrote it. Anyone able to label a
+  namespace `<prefix>managed-by` and `<prefix>cluster` could therefore repoint an
+  existing registration at their own API server with their own credentials and,
+  because the takeover rewrote `source-namespace` too, make it garbage collectable
+  on their terms. Present in 0.2.0 and 0.3.0. Reaching it needs the ability to set
+  labels on a namespace, which the documented deployment model does not grant to
+  tenants; the new "Who is allowed to set these labels" section of the README says
+  what to do if yours does.
+
+  An owned `Secret` that records no source namespace is still adoptable, but only
+  by the cluster it already names.
+
+- **Renaming a cluster no longer leaves a working duplicate behind.** Changing a
+  namespace's `<prefix>cluster` label registered the new name and stranded the old
+  `Secret` forever, because its source namespace still existed. That was not inert:
+  `apply` only runs over what discovery returned, so the stale `Secret` was never
+  rewritten and went on working from a frozen kubeconfig for as long as its
+  certificate lasted. With two registrations sharing one server URL, which one
+  ArgoCD acts on is undefined.
+
+  The old registration is now **demoted** rather than deleted: its
+  `argocd.argoproj.io/secret-type` label is parked under
+  `<prefix>orphaned-secret-type`, and `<prefix>superseded-by` and
+  `<prefix>stale-since` are added. ArgoCD stops seeing it at once, but nothing is
+  destroyed, so the `namespaces`, `clusterResources` and `project` keys ArgoCD
+  writes, plus any annotations you added, all survive. Reverting the rename
+  restores the registration, credentials and all. Demoted `Secret`s are still
+  collected once their namespace is gone.
+
 ### Changed
+
+- **Two namespaces claiming one cluster name no longer skip both.** Whoever holds
+  the registration keeps it and the other namespace is refused and logged; an
+  unclaimed name contested by several namespaces goes to the **oldest** claimant.
+  Previously neither registered, so a stale or copy-pasted namespace could deny a
+  healthy cluster its registration indefinitely. A refusal is logged at error level
+  but does not fail the pass, because a contested name persists until a human
+  fixes it.
+
+  A namespace that never produced a usable kubeconfig also used to poison a healthy
+  namespace claiming the same name, because the name was claimed before the
+  kubeconfig was read. It no longer does.
+
+- Garbage collection selects owned `Secret`s on `<prefix>managed-by` alone rather
+  than also requiring ArgoCD's `secret-type` label, so demoted registrations stay
+  collectable. Only `Secret`s carrying the ownership label are ever eligible, as
+  before.
+
+- Cluster `Secret`s now record `<prefix>source-namespace-uid`. Nothing reads it
+  yet; it is what will let a later release tell a namespace apart from a new one
+  reusing its name.
 
 - `capi` promoted from *assumed* to *tested*. Verified against Cluster API v1.13.4
   with the Docker infrastructure provider: the kubeadm control-plane controller

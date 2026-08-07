@@ -201,7 +201,12 @@ controlPlane:
 Both labels below are required. A namespace carrying `managed-by` but no
 `cluster` is skipped with a warning, and the cluster name must be usable as a
 Kubernetes object name, since the resulting Secret is called `cluster-<name>`.
-Two namespaces must never claim the same cluster name.
+
+Cluster names are unique across the fleet, and a collision resolves by
+**incumbency**: whoever holds a registration keeps it, and another namespace
+claiming that name is refused and logged. If nobody holds it yet, the **oldest**
+claiming namespace wins. A registration is never taken over, so a cluster you
+registered by hand, or one belonging to a different registrar, is left alone.
 
 Label the namespace that holds the kubeconfig `Secret`. It reads the namespace
 rather than the `Secret` because the provisioner owns that `Secret`. k3k, for
@@ -249,8 +254,8 @@ flowchart LR
 
     NS -->|"1. discover by label"| REG
     KC -->|"2. read kubeconfig"| REG
-    REG -->|"3. create or update"| CS
-    REG -.->|"4. delete once the namespace is gone"| CS
+    REG -->|"3. create or update, never take over"| CS
+    REG -.->|"4. delete once the namespace is gone<br/>demote once the cluster is renamed"| CS
     CS -->|"selected by"| APPSET
 ```
 
@@ -266,13 +271,62 @@ stateDiagram-v2
     [*] --> Waiting: namespace labelled
     Waiting --> Registered: kubeconfig Secret appears
     Waiting --> Waiting: provisioner still booting
+    Waiting --> Refused: name held by another namespace
+    Refused --> Registered: the holder goes away
     Registered --> Registered: kubeconfig re-read every interval<br/>(survives cert rotation)
+    Registered --> Demoted: cluster label renamed<br/>hidden from ArgoCD, kept intact
+    Demoted --> Registered: rename reverted
     Registered --> [*]: source namespace deleted<br/>cluster Secret removed
+    Demoted --> [*]: source namespace deleted
 ```
 
 Cluster `Secret`s that carry the ownership label but whose source namespace has
 gone are deleted. Anything without that label is left alone, so clusters you
 registered by hand are safe.
+
+Renaming a cluster is the one other way a registration goes away, and it is not a
+deletion. If a namespace's `cluster` label changes, the new name is registered and
+the old `Secret` is **demoted**: its `argocd.argoproj.io/secret-type` label is
+parked under `<labelPrefix>orphaned-secret-type` and it gains
+`<labelPrefix>superseded-by` and `<labelPrefix>stale-since`. ArgoCD finds clusters
+by that one label, so the stale entry disappears from ArgoCD immediately while
+nothing is destroyed: everything ArgoCD wrote into it, and any annotations you
+added, survive. Change the label back and the registration is restored intact, so
+a mistaken rename costs nothing. Demoted `Secret`s are still garbage collected
+once their source namespace is gone.
+
+### Who is allowed to set these labels
+
+The two labels are **policy input**, not decoration: together they decide whether
+a cluster gets registered at all and what name it takes in `argocd`, a namespace
+where writing a cluster `Secret` is an administrative act. Treat them as something
+the platform operator owns.
+
+Kubernetes helps here by default. The built-in `admin` role, bound into a
+namespace with a `RoleBinding`, grants no write access to the `Namespace` object
+itself, so an ordinary tenant cannot relabel their own namespace. But **whoever
+can create a namespace sets its labels at creation**, so a cluster where teams
+self-serve namespaces is a different situation.
+
+Incumbency means a registration cannot be stolen, which is the attack worth
+caring about. It does not, and cannot, stop someone who can label a namespace
+from registering a cluster of their own under any *free* name. No collision policy
+can, because the label is the authorization. If you cannot vouch for who sets
+these labels, constrain them where they are written rather than here: a
+`ValidatingAdmissionPolicy` binding permitted cluster names to namespace metadata
+is the usual answer, and is what Gateway API recommends for the same problem.
+
+### Changing `managedBy` or `labelPrefix` later
+
+Both are part of the ownership record written onto every cluster `Secret`, so
+changing either on a running install orphans everything already registered. The
+registrar will refuse to adopt those `Secret`s, because refusing to write objects
+that record a different owner is exactly the protection above, and garbage
+collection will not see them either since it selects on the same label.
+
+Neither value is meant to change, but if you must: delete the old cluster
+`Secret`s and let them be recreated, or relabel them by hand to the new values
+first. The refusal is logged per cluster, naming the `Secret` and the namespace.
 
 RBAC is split by scope. Reads are cluster-wide (`namespaces` get/list, `secrets`
 list) because discovery is label-driven and the sources sit in one namespace per

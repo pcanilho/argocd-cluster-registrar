@@ -100,7 +100,13 @@ works; presets ship for ` + strings.Join(registrar.PresetNames(), ", ") + `, and
 once so one instance can serve a mixed fleet.
 
 Secrets whose source namespace has gone away are DELETED, so a destroyed cluster
-does not leave a broken entry behind in ArgoCD.`,
+does not leave a broken entry behind in ArgoCD. Renaming a cluster instead
+DEMOTES the old Secret: it is hidden from ArgoCD but kept, so reverting the
+rename restores it.
+
+A registration is never taken over. If the Secret already exists and records a
+different source namespace, or is not ours at all, it is refused and logged. An
+unclaimed name contested by several namespaces goes to the oldest.`,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		level := slog.LevelInfo
 		if debug {
