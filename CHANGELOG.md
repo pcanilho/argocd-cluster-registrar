@@ -144,15 +144,15 @@ What is worth knowing before you upgrade:
    level. That is the takeover fix working. See *Fixed* above; the resolution is
    to remove the duplicate claim.
 
-2. **RBAC widens.** `watch` on `namespaces` and `get` on `secrets`, both
-   cluster-wide. Nothing new in `targetNamespace` unless you enable
+2. **RBAC widens.** `watch` on `namespaces`, cluster-wide. Nothing new in
+   `targetNamespace` unless you enable
    `leaderElection`, which adds `leases` (get/create/update) and `events`
    (create/patch) there. `helm upgrade` applies all of it, but if you mirror this
    chart's RBAC into your own GitOps repo, or gate writes to the ArgoCD namespace
    with an admission policy, allow the new rules first.
 
-   Note `watch` is **not** granted on `secrets` anywhere: they are read directly
-   and never cached.
+   Note `watch` is **not** granted on `secrets` anywhere, and cluster-wide access
+   to them is still `list` only: they are read directly and never cached.
 
 3. **Probes are new.** If a `NetworkPolicy` restricts ingress to the registrar
    pod, permit the kubelet to reach `:8081` or the pod will fail its probes after

@@ -308,8 +308,8 @@ nothing is destroyed. Change the label back and the registration returns intact,
 so a mistaken rename costs nothing.
 
 RBAC is split by scope. Reads are cluster-wide (`namespaces` get/list/watch,
-`secrets` get/list) because discovery is label-driven and the sources sit in one
-namespace per child. Every **write** is a namespaced `Role` bound to
+`secrets` **list only**) because discovery is label-driven and the sources sit in
+one namespace per child. Every **write** is a namespaced `Role` bound to
 `targetNamespace` alone, since that is the only place this ever creates, updates
 or deletes anything. Granting `secrets` write across the whole cluster would be a
 privilege-escalation path in exchange for nothing. Note `watch` is granted on

@@ -389,10 +389,20 @@ jobs:
       - name: It can read Secrets but never watch them
         run: |
           set -euo pipefail
-          sa="system:serviceaccount:registrar:$(kubectl get sa -n registrar -o name \
-            | head -1 | cut -d/ -f2)"
-          test "$(kubectl auth can-i get secrets --all-namespaces --as="$sa")" = "yes"
+          # NOT `head -1`: every namespace has a `default` ServiceAccount and it
+          # sorts before ours, so that silently tested the wrong identity.
+          name=$(kubectl get sa -n registrar -o name \
+            | grep argocd-cluster-registrar | head -1 | cut -d/ -f2)
+          test -n "$name"
+          sa="system:serviceaccount:registrar:$name"
+          echo "asserting against $sa"
           test "$(kubectl auth can-i list secrets --all-namespaces --as="$sa")" = "yes"
+          # Reads of the provisioner-written Secrets are LISTs; every Get this tool
+          # issues is inside targetNamespace and covered by the namespaced Role.
+          if [ "$(kubectl auth can-i get secrets --all-namespaces --as="$sa")" != "no" ]; then
+            echo "::error::cluster-wide get on secrets is granted and never used"
+            exit 1
+          fi
           if [ "$(kubectl auth can-i watch secrets --all-namespaces --as="$sa")" != "no" ]; then
             echo "::error::the ServiceAccount can watch Secrets cluster-wide"
             exit 1
@@ -421,15 +431,21 @@ jobs:
           done
           kubectl get secret cluster-audited -n argocd >/dev/null
 
+          # Delete the namespace FIRST. While it exists, its own reconcile reaches
+          # the orphan-adoption branch, restores source-namespace within seconds,
+          # and the Secret is routable again before the audit ever looks at it.
+          kubectl delete namespace k3k-audit --wait=true
           kubectl label secret cluster-audited -n argocd \
             argocd-cluster-registrar/source-namespace-
           kubectl rollout restart deployment -n registrar registrar-argocd-cluster-registrar
           kubectl rollout status deployment -n registrar registrar-argocd-cluster-registrar --timeout=2m
           for i in $(seq 1 12); do
+            # Grep the distinctive half: "records no source namespace" also appears
+            # in the adoption warning, which would make this pass without the audit
+            # having run at all.
             if kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar \
-                 | grep -q 'records no source namespace'; then
+                 | grep -q 'it can never be collected'; then
               echo "audit reported it after $((i*5))s"
-              kubectl delete namespace k3k-audit --wait=true
               kubectl delete secret cluster-audited -n argocd
               exit 0
             fi
