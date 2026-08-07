@@ -10,12 +10,19 @@
 # argocd-secret, mint a token Secret for a privileged ServiceAccount, delete
 # kube-system Secrets) bought for nothing.
 #
-# `watch` and `patch` are gone as well: nothing here runs an informer, and
-# apply() uses Get plus Create/Update with a carried resourceVersion.
+# `patch` is still absent: apply() uses Get plus Create/Update with a carried
+# resourceVersion, and demotion follows the same read-modify-write.
+#
+# `watch` is granted on namespaces ONLY. The controller watches namespaces and
+# nothing else -- in particular it does not watch the provisioner-written
+# kubeconfig Secrets, which would mean an informer over every Secret in the
+# cluster that could not be narrowed (they carry none of our labels). Those are
+# still read directly, which is why `get` appears below alongside `list`.
 #
 # Residual risk worth naming rather than hiding: cluster-wide Secret READ still
 # lets this ServiceAccount read every credential in the cluster. That is inherent
-# to label-driven discovery across arbitrary namespaces.
+# to label-driven discovery across arbitrary namespaces. What it does NOT do is
+# hold them in memory: nothing Secret-shaped is ever cached.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -31,11 +38,12 @@ rules:
   # genuinely gone before deregistering its cluster.
   - apiGroups: [""]
     resources: ["namespaces"]
-    verbs: ["get", "list"]
-  # Read the provisioner-written kubeconfig Secrets in those namespaces.
+    verbs: ["get", "list", "watch"]
+  # Read the provisioner-written kubeconfig Secrets in those namespaces. `get` is
+  # required as well as `list`: reads go direct rather than through a cache.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["list"]
+    verbs: ["get", "list"]
 ---
 # The write half, confined to the single namespace this tool ever writes to.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -53,6 +61,18 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "create", "update", "delete"]
+{{- if .Values.leaderElection.enabled }}
+  # Leader election. The lock only ever does get/create/update, so list and watch
+  # are not granted even though the usual scaffold includes them.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+  # The lock records an event on every acquire and renew. Without this the
+  # election still works but logs an RBAC failure each time.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

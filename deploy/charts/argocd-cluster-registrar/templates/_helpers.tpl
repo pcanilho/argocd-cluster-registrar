@@ -50,3 +50,19 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- define "app.serviceAccountName" -}}
 {{ .Release.Name }}-{{ .Chart.Name }}-sa
 {{- end }}
+
+{{/*
+Lease name for leader election.
+
+Derived from labelPrefix and managedBy, NOT the release name: ownership is
+established purely by those two labels, so two releases differing only in name
+contend for the same cluster Secrets and must therefore contend for the same
+lease. Deriving from managedBy alone would over-serialise instead -- two releases
+using different prefixes never collide and must not block each other.
+
+Hashed because labelPrefix contains a "/", which is illegal in an object name,
+and managedBy is a label value, which permits characters a name does not.
+*/}}
+{{- define "app.leaderElectionID" -}}
+{{- printf "acr-%s" (printf "%s|%s" .Values.labelPrefix .Values.managedBy | sha256sum | trunc 16) -}}
+{{- end }}

@@ -3,9 +3,9 @@
 #
 # The Job could only ever run at sync time, and a cluster is normally destroyed
 # long after the last sync that created it -- so a Job can register a cluster but
-# can never deregister one. Continuous reconciliation is also what re-reads
-# kubeconfigs after a k3s server restart rotates its client certificate, which
-# would otherwise leave an authenticating-but-stale cluster Secret behind.
+# can never deregister one. Running continuously is also what re-reads kubeconfigs
+# after a k3s server restart rotates its client certificate, which would otherwise
+# leave an authenticating-but-stale cluster Secret behind.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -17,11 +17,17 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  # Strictly one. Two replicas would race on the same ArgoCD cluster Secrets, and
-  # the work is far too cheap to be worth leader election.
-  replicas: 1
+  {{- if and (gt (int .Values.replicaCount) 1) (not .Values.leaderElection.enabled) }}
+  {{- fail "replicaCount > 1 requires leaderElection.enabled. Two active instances sharing a managedBy value rewrite each other's provider label on every reconcile." }}
+  {{- end }}
+  # One by default. Two active replicas would not corrupt each other's Secrets --
+  # neither will take over a registration the other holds -- but they would do the
+  # same work twice, and rewrite each other's provider label if configured with
+  # different providers. Leader election, not replica count, is what makes more
+  # than one safe.
+  replicas: {{ .Values.replicaCount }}
   strategy:
-    type: Recreate
+    {{- toYaml .Values.strategy | nindent 4 }}
   selector:
     matchLabels:
       {{- include "app.selectorLabels" . | nindent 6 }}
@@ -35,6 +41,7 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "app.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -74,12 +81,37 @@ spec:
             - "--secret-key={{ required "secretKey is required when secretNamePattern is set" .Values.secretKey }}"
             {{- end }}
             - "--interval={{ .Values.interval }}"
+            {{- if .Values.leaderElection.enabled }}
+            - --leader-elect
+            - "--leader-election-id={{ include "app.leaderElectionID" . }}"
+            {{- end }}
+            {{- if .Values.probes.enabled }}
+            - "--health-probe-bind-address={{ .Values.probes.bindAddress }}"
+            {{- else }}
+            - "--health-probe-bind-address="
+            {{- end }}
             {{- if .Values.dryRun }}
             - --dry-run
             {{- end }}
             {{- if .Values.debug }}
             - --debug
             {{- end }}
+          {{- if .Values.probes.enabled }}
+          ports:
+            - name: probes
+              containerPort: {{ .Values.probes.bindAddress | trimPrefix ":" | int }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probes
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probes
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
+          {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

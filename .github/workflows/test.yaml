@@ -76,6 +76,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          # The chart-version guard compares against the latest tag.
+          fetch-depth: 0
 
       # Rendering with defaults is not enough. commonLabels and commonAnnotations
       # default to empty, so a template that only breaks when they are SET passed
@@ -106,6 +109,48 @@ jobs:
             --set 'providers[1].name=mytool' \
             --set 'providers[1].secretNamePattern=mytool-*-kubeconfig' \
             --set 'providers[1].secretKeys={admin.conf,admin.svc}'
+          # The 0.4.0 operational surface.
+          helm lint "$chart" --set leaderElection.enabled=true
+          helm lint "$chart" --set probes.enabled=false
+          helm lint "$chart" --set replicaCount=2 --set leaderElection.enabled=true
+
+      # Two active replicas do not corrupt each other, but they do the work twice
+      # and rewrite each other's provider label when configured differently.
+      # Leader election is what makes more than one safe, so asking for more
+      # without it must fail rather than quietly misbehave.
+      - name: More than one replica without leader election fails the render
+        run: |
+          set -euo pipefail
+          chart=deploy/charts/argocd-cluster-registrar
+          if helm template t "$chart" --set replicaCount=2 >/dev/null 2>&1; then
+            echo "::error::chart rendered 2 replicas without leader election"
+            exit 1
+          fi
+
+      # Chart.yaml sat at 0.2.0 while the latest tag was v0.3.0 for two releases.
+      # The release workflow overrides it at package time so published charts were
+      # fine, but `helm install` from a checkout pulled a stale image, and nothing
+      # noticed because deploy-test overrides the tag explicitly.
+      - name: The in-tree chart version is not behind the latest tag
+        run: |
+          set -euo pipefail
+          chart=deploy/charts/argocd-cluster-registrar
+          chart_version=$(grep -E '^version:' "$chart/Chart.yaml" | awk '{print $2}')
+          app_version=$(grep -E '^appVersion:' "$chart/Chart.yaml" | tr -d '"' | awk '{print $2}')
+          if [ "$chart_version" != "$app_version" ]; then
+            echo "::error::Chart.yaml version ($chart_version) and appVersion ($app_version) disagree"
+            exit 1
+          fi
+          latest=$(git tag -l 'v*.*.*' --sort=-v:refname | head -1 | sed 's/^v//')
+          if [ -z "$latest" ]; then
+            echo "no tags yet, nothing to compare against"
+            exit 0
+          fi
+          oldest=$(printf '%s\n%s\n' "$chart_version" "$latest" | sort -V | head -1)
+          if [ "$chart_version" != "$latest" ] && [ "$oldest" = "$chart_version" ]; then
+            echo "::error::Chart.yaml is $chart_version but the latest tag is $latest; a local install would pull a stale image"
+            exit 1
+          fi
 
       # A 0.2.x values file sets the old scalars and says nothing about
       # `providers`. Helm still coalesces the chart default in, so if that default
@@ -336,6 +381,64 @@ jobs:
           kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar --tail=50
           exit 1
 
+      # The controller must not watch Secrets. A cluster-wide Secret informer is
+      # what this design deliberately avoids -- it could not be narrowed, since
+      # the provisioner-written Secrets carry none of our labels. Asserting on
+      # RBAC rather than on manager options is stronger: the pod physically
+      # cannot start that informer, whatever the code later says.
+      - name: It can read Secrets but never watch them
+        run: |
+          set -euo pipefail
+          sa="system:serviceaccount:registrar:$(kubectl get sa -n registrar -o name \
+            | head -1 | cut -d/ -f2)"
+          test "$(kubectl auth can-i get secrets --all-namespaces --as="$sa")" = "yes"
+          test "$(kubectl auth can-i list secrets --all-namespaces --as="$sa")" = "yes"
+          if [ "$(kubectl auth can-i watch secrets --all-namespaces --as="$sa")" != "no" ]; then
+            echo "::error::the ServiceAccount can watch Secrets cluster-wide"
+            exit 1
+          fi
+          # ...and it must be able to watch namespaces, or nothing is event-driven.
+          test "$(kubectl auth can-i watch namespaces --as="$sa")" = "yes"
+
+      # An owned Secret whose source-namespace label is stripped matches no
+      # collection selector and routes to no key, so nothing would ever mention it
+      # again. That is the one observability regression the migration could cause.
+      - name: It reports registrations that can never be collected
+        run: |
+          set -euo pipefail
+          kubectl create namespace k3k-audit
+          kubectl label namespace k3k-audit \
+            argocd-cluster-registrar/managed-by=cluster-registrar \
+            argocd-cluster-registrar/cluster=audited
+          sed 's|https://192.0.2.10|https://192.0.2.41|' /tmp/kubeconfig.yaml > /tmp/audit.yaml
+          kubectl create secret generic k3k-audit-kubeconfig \
+            -n k3k-audit --from-file=kubeconfig.yaml=/tmp/audit.yaml
+          for i in $(seq 1 12); do
+            if kubectl get secret cluster-audited -n argocd >/dev/null 2>&1; then
+              break
+            fi
+            sleep 5
+          done
+          kubectl get secret cluster-audited -n argocd >/dev/null
+
+          kubectl label secret cluster-audited -n argocd \
+            argocd-cluster-registrar/source-namespace-
+          kubectl rollout restart deployment -n registrar registrar-argocd-cluster-registrar
+          kubectl rollout status deployment -n registrar registrar-argocd-cluster-registrar --timeout=2m
+          for i in $(seq 1 12); do
+            if kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar \
+                 | grep -q 'records no source namespace'; then
+              echo "audit reported it after $((i*5))s"
+              kubectl delete namespace k3k-audit --wait=true
+              kubectl delete secret cluster-audited -n argocd
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::an unroutable registration was never reported"
+          kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar --tail=50
+          exit 1
+
       # The escalation closed in 0.4.0. apply() used to overwrite and relabel any
       # pre-existing cluster-<name>, so labelling a namespace was enough to
       # repoint someone else's registration at your own API server. The fake
@@ -411,15 +514,28 @@ jobs:
             echo "::error::contested name went to $(owner), want the older zzz-first"
             exit 1
           fi
-          # Several intervals later it must still be the same winner: the pod has
-          # no persistent state, so a re-elected winner would show up here.
+          # The winner must survive several REVISITS, not merely several seconds.
+          # Under a watch nothing re-runs unless RequeueAfter fires, so sleeping
+          # and re-reading would pass just as happily if the reconciler had
+          # stopped revisiting the key entirely -- which is the single most
+          # dangerous regression this migration can produce. So count the
+          # reconciles first and require that they actually happened.
+          before="$(kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar \
+            | grep -c 'refused to register cluster' || true)"
           sleep 20
+          after="$(kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar \
+            | grep -c 'refused to register cluster' || true)"
+          if [ "$after" -le "$before" ]; then
+            echo "::error::no reconcile happened in 20s at interval=5s; RequeueAfter is not being stamped"
+            kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar --tail=50
+            exit 1
+          fi
           if [ "$(owner)" != "zzz-first" ]; then
             echo "::error::the winner flapped to $(owner)"
             exit 1
           fi
-          # The registrar must stay up. There are no probes, so pod-Ready means
-          # only "container running"; restarts are the real signal.
+          # The registrar must stay up. Probes exist now, so a wedged manager also
+          # shows as NotReady; restarts remain the cheapest signal.
           restarts="$(kubectl get pods -n registrar \
             -o jsonpath='{.items[*].status.containerStatuses[*].restartCount}' | tr -d ' ')"
           if [ "$restarts" != "0" ]; then
