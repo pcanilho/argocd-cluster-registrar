@@ -42,8 +42,10 @@ const (
 	// the source is genuinely gone rather than merely unseen this pass.
 	SuffixSourceNamespace = "source-namespace"
 
-	// argoSecretTypeLabel is what makes ArgoCD treat a Secret as a cluster.
-	argoSecretTypeLabel = "argocd.argoproj.io/secret-type"
+	// argoSecretTypeLabel is what makes ArgoCD treat a Secret as a cluster. It is
+	// a label key, not a credential; gosec G101 matches on the identifier holding
+	// "Secret" next to a string literal.
+	argoSecretTypeLabel = "argocd.argoproj.io/secret-type" // #nosec G101
 	argoSecretTypeValue = "cluster"
 )
 
