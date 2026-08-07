@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -57,6 +58,11 @@ type ControllerOptions struct {
 
 	// HealthProbeBindAddress serves /healthz and /readyz. Empty disables it.
 	HealthProbeBindAddress string
+
+	// RestConfig overrides the ambient cluster connection. Nil, the normal case,
+	// means in-cluster config or the caller's own kubeconfig. Set by tests that
+	// drive a real manager against envtest.
+	RestConfig *rest.Config
 
 	// MetricsBindAddress serves Prometheus metrics. "0" disables it, and that is
 	// the default.
@@ -126,8 +132,7 @@ func newScheme() (*runtime.Scheme, error) {
 }
 
 // managerOptions is separate so the options with dangerous defaults can be
-// asserted in a test. Start itself cannot be: it builds a client against the
-// ambient cluster.
+// asserted without standing up a manager at all.
 func managerOptions(cfg Config, opts ControllerOptions, scheme *runtime.Scheme) ctrl.Options {
 	// Empty means "off" here, even though controller-runtime reads it as ":8080".
 	// Without this, a ControllerOptions that simply does not mention metrics --
@@ -205,9 +210,15 @@ func (r *Registrar) Start(ctx context.Context, opts ControllerOptions) error {
 	if err != nil {
 		return err
 	}
-	base, err := BaseRestConfig()
-	if err != nil {
-		return err
+	// Injected config wins, mirroring the client seam below. Without it Start can
+	// only ever be run against the ambient cluster, which is what kept the manager
+	// wiring out of reach of the test suite.
+	base := opts.RestConfig
+	if base == nil {
+		var err error
+		if base, err = BaseRestConfig(); err != nil {
+			return err
+		}
 	}
 
 	// controller-runtime logs through logr. Without this it prints one warning to

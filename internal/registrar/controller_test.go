@@ -285,9 +285,9 @@ func TestDemotionSurvivesAClusterNameTooLongForALabelValue(t *testing.T) {
 	}
 }
 
-// The manager wiring has no other coverage: Start builds a real client and talks
-// to the ambient cluster, so it cannot be driven from a test. These are the
-// options whose defaults are actively dangerous.
+// These are the options whose defaults are actively dangerous, asserted here
+// rather than through a running manager because the failure mode is silent: the
+// wrong value works fine and merely exposes something it should not.
 func TestManagerOptionsPinTheDangerousDefaults(t *testing.T) {
 	scheme, err := newScheme()
 	if err != nil {
