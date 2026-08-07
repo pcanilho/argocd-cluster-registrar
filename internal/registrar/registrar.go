@@ -470,6 +470,21 @@ func (r *Registrar) ReconcileOne(ctx context.Context, nsName string) error {
 		return fmt.Errorf("confirm namespace %s: %w", nsName, err)
 	}
 
+	// Still ours? Under a watch this is not redundant with discovery. A cache
+	// filtered on the ownership label reports an object that stops matching as a
+	// synthetic Delete, so removing the label enqueues the namespace exactly like
+	// deleting it would -- and the namespace itself is still there, cluster label
+	// and all. Without this check the next reconcile would happily re-register a
+	// namespace that had just been taken out of our scope.
+	//
+	// Not a deletion either: nothing here proves the cluster is gone, so its
+	// registrations are left exactly as they are.
+	if ns.Labels[r.managedByLabel()] != r.cfg.ManagedByValue {
+		r.log.Warn("namespace no longer carries the ownership label; leaving its registrations alone",
+			slog.String("namespace", ns.Name), slog.String("label", r.managedByLabel()))
+		return nil
+	}
+
 	// A namespace being torn down still reads back; registering from it would
 	// re-create a Secret that collection is about to remove. Deliberately NOT
 	// treated as unevaluable: see the applied == "" guard in collectOne, which

@@ -37,6 +37,10 @@ var (
 	secretNamePattern string
 	secretKey         string
 	labelPrefix       string
+
+	leaderElect            bool
+	leaderElectionID       string
+	healthProbeBindAddress string
 )
 
 // resolveProviders turns the flags into the provider list, honouring the
@@ -119,8 +123,10 @@ unclaimed name contested by several namespaces goes to the oldest.`,
 		}))
 
 		if interval <= 0 {
-			// time.NewTicker panics on a non-positive duration, so a Helm value of
-			// `interval: 0s` would crash-loop the Deployment on a stack trace.
+			// RequeueAfter: 0 means "do not requeue", so a Helm value of
+			// `interval: 0s` would leave every registration reconciled once and
+			// then never refreshed again -- silently, until a certificate
+			// rotation broke it days later.
 			return fmt.Errorf("--interval must be positive, got %s", interval)
 		}
 
@@ -148,10 +154,6 @@ unclaimed name contested by several namespaces goes to the oldest.`,
 		ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 
-		if once {
-			return r.Reconcile(ctx)
-		}
-
 		// Report the providers actually in force, not the deprecated flag's
 		// default. This line is the only startup evidence of what the process is
 		// looking for, and logging `secretNamePattern` meant it always announced
@@ -160,33 +162,28 @@ unclaimed name contested by several namespaces goes to the oldest.`,
 		for _, p := range providers {
 			names = append(names, p.Name)
 		}
-		log.Info("starting reconcile loop",
-			slog.Duration("interval", interval),
-			slog.String("targetNamespace", targetNamespace),
-			slog.String("managedBy", managedByValue),
-			slog.String("providers", strings.Join(names, ",")))
+		log.Info("resolved providers", slog.String("providers", strings.Join(names, ",")))
 
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			// select below can pick the ticker even when ctx is already done, so
-			// check explicitly or shutdown can run one extra full pass.
-			if ctx.Err() != nil {
-				log.Info("shutting down")
-				return nil
-			}
-			// A failed pass is logged, never fatal: one unreachable child must not
-			// take the registrar down for every other cluster.
-			if err := r.Reconcile(ctx); err != nil {
-				log.Error("reconcile failed", slog.Any("error", err))
-			}
-			select {
-			case <-ctx.Done():
-				log.Info("shutting down")
-				return nil
-			case <-ticker.C:
-			}
+		// --once never builds a manager. It is documented as a pre-flight check to
+		// run against a live cluster, so acquiring the lease would take the running
+		// instance offline for the duration of a dry run.
+		if once {
+			return r.Reconcile(ctx)
 		}
+
+		if leaderElect && dryRun {
+			// Same hazard, slower: a --dry-run process holding the lease is a
+			// registrar that reports what it would do while the real one waits.
+			log.Warn("--dry-run disables leader election")
+			leaderElect = false
+		}
+
+		return r.Start(ctx, registrar.ControllerOptions{
+			Interval:               interval,
+			LeaderElection:         leaderElect,
+			LeaderElectionID:       leaderElectionID,
+			HealthProbeBindAddress: healthProbeBindAddress,
+		})
 	},
 }
 
@@ -223,4 +220,14 @@ func registerFlags(f *pflag.FlagSet) {
 		"DEPRECATED, use --provider: key inside that Secret holding the kubeconfig")
 	f.StringVar(&labelPrefix, "label-prefix", registrar.DefaultLabelPrefix,
 		"prefix for the labels read from the source namespace and copied onto the cluster Secret")
+	f.BoolVar(&leaderElect, "leader-elect", false,
+		"only reconcile while holding the lease, so two identically configured instances do not both run")
+	// Derived from the configuration that decides whether two instances actually
+	// collide, NOT from the release name: ownership is established purely by
+	// label-prefix and managed-by, so instances differing only in release name
+	// contend for the same Secrets and must contend for the same lease.
+	f.StringVar(&leaderElectionID, "leader-election-id", "argocd-cluster-registrar",
+		"name of the Lease used for leader election, within --target-namespace")
+	f.StringVar(&healthProbeBindAddress, "health-probe-bind-address", ":8081",
+		"address serving /healthz and /readyz; empty disables it")
 }
