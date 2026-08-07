@@ -12,6 +12,7 @@ import (
 
 	"github.com/pcanilho/argocd-cluster-registrar/internal/registrar"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 var (
@@ -190,7 +191,14 @@ unclaimed name contested by several namespaces goes to the oldest.`,
 }
 
 func init() {
-	f := rootCmd.PersistentFlags()
+	registerFlags(rootCmd.PersistentFlags())
+}
+
+// registerFlags is separate from init so that tests can build a command with the
+// real flag definitions rather than a copy that drifts from them. The `Changed`
+// gate in resolveProviders is only meaningful against flags declared exactly as
+// they are here, defaults included.
+func registerFlags(f *pflag.FlagSet) {
 	f.BoolVar(&debug, "debug", false, "enable debug logging")
 	f.BoolVar(&dryRun, "dry-run", false, "log intended changes without writing")
 	// Long-running is the default. A one-shot Job cannot garbage-collect, because
