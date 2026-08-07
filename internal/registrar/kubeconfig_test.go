@@ -158,7 +158,7 @@ func TestParseKubeconfigClientCerts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if server != "https://192.168.1.192" {
+	if server != k3kServer {
 		t.Errorf("server = %q, want https://192.168.1.192", server)
 	}
 

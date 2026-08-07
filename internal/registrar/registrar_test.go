@@ -30,6 +30,10 @@ const (
 	testSourceNS = "k3k-src"
 	// keyConfig is the ArgoCD cluster Secret's credential key.
 	keyConfig = "config"
+	// testNS is the source namespace most fixtures use.
+	testNS = "k3k-a"
+	// k3kServer is the endpoint inside the k3k kubeconfig fixture.
+	k3kServer = "https://192.168.1.192"
 )
 
 func testConfig() Config {
@@ -144,7 +148,7 @@ func discoverNS(t *testing.T, r *Registrar, name string) (child, bool) {
 // failure as the reassuring "no kubeconfig secret yet".
 func TestTransientSecretListErrorDoesNotDeregisterAnything(t *testing.T) {
 	r, c := newTestRegistrar(
-		managedNS("k3k-a", "a"), kubeconfigSecret("k3k-a", "k3k-a-kubeconfig"), registeredSecret("a", "k3k-a"),
+		managedNS(testNS, "a"), kubeconfigSecret(testNS, "k3k-a-kubeconfig"), registeredSecret("a", testNS),
 		managedNS("k3k-b", "b"), kubeconfigSecret("k3k-b", "k3k-b-kubeconfig"), registeredSecret("b", "k3k-b"),
 	)
 	c.PrependReactor("list", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
@@ -170,10 +174,10 @@ func TestTransientSecretListErrorDoesNotDeregisterAnything(t *testing.T) {
 func TestCollectRequiresProofTheNamespaceIsGone(t *testing.T) {
 	// The namespace exists but carries no cluster label, so it yields no child.
 	unlabelled := &coreV1.Namespace{ObjectMeta: metaV1.ObjectMeta{
-		Name:   "k3k-a",
+		Name:   testNS,
 		Labels: map[string]string{ManagedByLabel(testPrefix): testManagedBy},
 	}}
-	r, c := newTestRegistrar(unlabelled, registeredSecret("a", "k3k-a"))
+	r, c := newTestRegistrar(unlabelled, registeredSecret("a", testNS))
 
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -212,7 +216,7 @@ func TestCollectNeverTouchesUnlabelledSecrets(t *testing.T) {
 
 // One undeletable Secret must not stall GC for every other cluster.
 func TestCollectContinuesPastDeleteErrors(t *testing.T) {
-	r, c := newTestRegistrar(registeredSecret("a", "k3k-a"), registeredSecret("b", "k3k-b"))
+	r, c := newTestRegistrar(registeredSecret("a", testNS), registeredSecret("b", "k3k-b"))
 	c.PrependReactor("delete", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		if action.(k8stesting.DeleteAction).GetName() == "cluster-a" {
 			return true, nil, apiErrors.NewForbidden(schema.GroupResource{Resource: "secrets"}, "cluster-a", io.ErrUnexpectedEOF)
@@ -231,7 +235,7 @@ func TestCollectContinuesPastDeleteErrors(t *testing.T) {
 // Update replaces the whole object, so a freshly-built Secret would silently drop
 // ArgoCD's own fields and any operator-set annotations.
 func TestApplyPreservesForeignFieldsAndAnnotations(t *testing.T) {
-	existing := registeredSecret("a", "k3k-a")
+	existing := registeredSecret("a", testNS)
 	existing.Data["namespaces"] = []byte("team-a")
 	existing.Data["project"] = []byte("infra")
 	existing.Annotations = map[string]string{"managed-by": "argocd.argoproj.io"}
@@ -239,7 +243,7 @@ func TestApplyPreservesForeignFieldsAndAnnotations(t *testing.T) {
 
 	r, c := newTestRegistrar(existing)
 	err := r.apply(context.Background(), child{
-		cluster: "a", namespace: "k3k-a",
+		cluster: "a", namespace: testNS,
 		server: "https://new", config: `{"tlsClientConfig":{"insecure":false}}`,
 	})
 	if err != nil {
@@ -305,7 +309,7 @@ func secretWith(ns, name, key, body string) *coreV1.Secret {
 // managed-by value garbage collect each other's Secrets.
 func TestMultipleProvidersRegisterSideBySide(t *testing.T) {
 	r, c := newTestRegistrar(
-		managedNS("k3k-a", "a"), kubeconfigSecret("k3k-a", "k3k-a-kubeconfig"),
+		managedNS(testNS, "a"), kubeconfigSecret(testNS, "k3k-a-kubeconfig"),
 		managedNS("tenant-b", "b"), secretWith("tenant-b", "b-admin-kubeconfig", "admin.conf", kamajiKubeconfig),
 	)
 	r.cfg.Providers = mustPresets(t, "k3k", "kamaji")
@@ -330,7 +334,7 @@ func TestMultipleProvidersRegisterSideBySide(t *testing.T) {
 // is the way this change could destroy data, so it is asserted directly.
 func TestGarbageCollectionIsPerClusterAcrossProviders(t *testing.T) {
 	r, c := newTestRegistrar(
-		managedNS("k3k-a", "a"), kubeconfigSecret("k3k-a", "k3k-a-kubeconfig"), registeredSecret("a", "k3k-a"),
+		managedNS(testNS, "a"), kubeconfigSecret(testNS, "k3k-a-kubeconfig"), registeredSecret("a", testNS),
 		// b's namespace is gone; only its registration remains.
 		registeredSecret("b", "tenant-b"),
 	)
@@ -409,9 +413,9 @@ func TestPrefersUsableCandidateOverExecCredential(t *testing.T) {
 // does not parse. That window must never look like a deletion.
 func TestUnparseableKubeconfigDoesNotDeregister(t *testing.T) {
 	r, c := newTestRegistrar(
-		managedNS("k3k-a", "a"),
-		secretWith("k3k-a", "k3k-a-kubeconfig", "kubeconfig.yaml", "<html>not a kubeconfig</html>"),
-		registeredSecret("a", "k3k-a"),
+		managedNS(testNS, "a"),
+		secretWith(testNS, "k3k-a-kubeconfig", "kubeconfig.yaml", "<html>not a kubeconfig</html>"),
+		registeredSecret("a", testNS),
 	)
 
 	if err := r.Reconcile(context.Background()); err != nil {
@@ -614,7 +618,7 @@ func TestIncumbentKeepsNameAgainstAnOlderChallenger(t *testing.T) {
 	if got.Labels[ProviderLabel(testPrefix)] != "k3k" {
 		t.Errorf("provider = %q, want the incumbent's k3k", got.Labels[ProviderLabel(testPrefix)])
 	}
-	if s := string(got.Data["server"]); s != "https://192.168.1.192" {
+	if s := string(got.Data["server"]); s != k3kServer {
 		t.Errorf("the registration was repointed at the challenger's endpoint: %q", s)
 	}
 }
@@ -804,7 +808,7 @@ func TestRevertedRenameRestoresDemotedRegistrationWithForeignData(t *testing.T) 
 	if got.Labels["unrelated"] != "keepme" {
 		t.Errorf("foreign label was lost: %v", got.Labels)
 	}
-	if string(got.Data["server"]) != "https://192.168.1.192" {
+	if string(got.Data["server"]) != k3kServer {
 		t.Errorf("credentials were not refreshed on restore: %q", got.Data["server"])
 	}
 }
@@ -909,7 +913,7 @@ func TestSweepVisitsNamespacesKnownOnlyFromTheirRegistrations(t *testing.T) {
 // An owned Secret whose source-namespace label was stripped matches no collection
 // selector and routes to no key, so it is invisible unless something goes looking.
 func TestAuditReportsSecretsThatCanNeverBeCollected(t *testing.T) {
-	stranded := registeredSecret("a", "k3k-a")
+	stranded := registeredSecret("a", testNS)
 	delete(stranded.Labels, SourceNamespaceLabel(testPrefix))
 
 	var buf strings.Builder
