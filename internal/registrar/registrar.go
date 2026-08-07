@@ -294,18 +294,45 @@ type Registrar struct {
 // New builds a Registrar against the ambient cluster (in-cluster config when
 // running as a Deployment, otherwise the caller's kubeconfig).
 func New(log *slog.Logger, cfg Config) (*Registrar, error) {
-	restCfg, err := restConfig()
+	base, err := BaseRestConfig()
 	if err != nil {
 		return nil, err
 	}
-	client, err := kubernetes.NewForConfig(restCfg)
+	client, err := ClientFor(base)
 	if err != nil {
-		return nil, fmt.Errorf("build kubernetes client: %w", err)
+		return nil, err
 	}
+	return NewWithClient(log, cfg, client), nil
+}
+
+// NewWithClient builds a Registrar around a client the caller already has.
+//
+// The controller needs this: its manager owns the connection, and the registrar
+// must read and write through a clientset built from the same base config but
+// with a different timeout. See ClientFor.
+func NewWithClient(log *slog.Logger, cfg Config, client kubernetes.Interface) *Registrar {
 	if cfg.LabelPrefix == "" {
 		cfg.LabelPrefix = DefaultLabelPrefix
 	}
-	return &Registrar{client: client, cfg: cfg, log: log}, nil
+	return &Registrar{client: client, cfg: cfg, log: log}
+}
+
+// ClientFor builds the clientset used for every read and write, with the request
+// timeout applied to a COPY of the config.
+//
+// The copy matters. rest.Config.Timeout becomes http.Client.Timeout, which the
+// client appends to watch requests as ?timeout=30s, so a manager sharing this
+// config would have every watch stream severed every thirty seconds and silently
+// re-established. Give the manager the untouched base and keep the timeout here,
+// where it protects exactly what it was added for.
+func ClientFor(base *rest.Config) (kubernetes.Interface, error) {
+	cfg := rest.CopyConfig(base)
+	cfg.Timeout = clientTimeout
+	client, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("build kubernetes client: %w", err)
+	}
+	return client, nil
 }
 
 // Validate checks configuration that would otherwise fail late, per-namespace,
@@ -392,15 +419,20 @@ func (r *Registrar) orphanedSecretTypeLabel() string {
 func (r *Registrar) supersededByLabel() string { return SupersededByLabel(r.cfg.LabelPrefix) }
 func (r *Registrar) staleSinceLabel() string   { return StaleSinceLabel(r.cfg.LabelPrefix) }
 
-// clientTimeout bounds every API call. Without it rest.Config.Timeout is 0, so a
-// hung request inside Reconcile blocks forever: the ticker never fires again and
-// the pod sits Running and Ready while doing nothing at all. Nothing else in the
-// stack detects that, because the process has not crashed.
+// clientTimeout bounds every ordinary API call. Without it a hung request inside
+// a reconcile blocks forever and the pod sits Running and Ready while doing
+// nothing at all; nothing else in the stack detects that, because the process has
+// not crashed.
+//
+// It is applied to the clientset's own copy of the config and nowhere else. A
+// watch must never carry it -- see ClientFor.
 const clientTimeout = 30 * time.Second
 
-func restConfig() (*rest.Config, error) {
+// BaseRestConfig is the ambient connection with NO timeout applied. Callers that
+// issue ordinary requests should go through ClientFor; anything that watches must
+// use this untouched.
+func BaseRestConfig() (*rest.Config, error) {
 	if cfg, err := rest.InClusterConfig(); err == nil {
-		cfg.Timeout = clientTimeout
 		return cfg, nil
 	}
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
@@ -410,7 +442,6 @@ func restConfig() (*rest.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("no in-cluster config and no usable kubeconfig: %w", err)
 	}
-	cfg.Timeout = clientTimeout
 	return cfg, nil
 }
 
