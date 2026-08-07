@@ -1392,3 +1392,36 @@ func TestEveryRefusalCarriesItsOwnReason(t *testing.T) {
 		})
 	}
 }
+
+// The binary and the chart must derive the same lease name.
+//
+// The chart computes it in _helpers.tpl. If they disagree, an instance deployed
+// from a plain manifest and one deployed by Helm with identical labelPrefix and
+// managedBy contend for the same cluster Secrets while holding different leases,
+// and both reconcile: exactly what leader election is for. The literal below is
+// what `helm template --set leaderElection.enabled=true` renders for the chart's
+// default values, so changing either side alone fails here.
+func TestLeaderElectionIDMatchesTheChart(t *testing.T) {
+	const fromChart = "acr-991221237547448b"
+	if got := LeaderElectionID(DefaultLabelPrefix, "cluster-registrar"); got != fromChart {
+		t.Errorf("LeaderElectionID = %q, chart renders %q", got, fromChart)
+	}
+}
+
+// Two installs that would contend for the same Secrets must contend for the same
+// lease, and two that never meet must not.
+func TestLeaderElectionIDSerialisesExactlyTheCollidingInstalls(t *testing.T) {
+	base := LeaderElectionID(DefaultLabelPrefix, "cluster-registrar")
+	if got := LeaderElectionID(DefaultLabelPrefix, "cluster-registrar"); got != base {
+		t.Error("identical configuration produced different leases")
+	}
+	if got := LeaderElectionID(DefaultLabelPrefix, "other"); got == base {
+		t.Error("a different managed-by shares a lease; installs that never meet are serialised")
+	}
+	if got := LeaderElectionID("example.com/", "cluster-registrar"); got == base {
+		t.Error("a different label-prefix shares a lease")
+	}
+	if errs := validation.IsDNS1123Subdomain(base); len(errs) > 0 {
+		t.Errorf("%q is not a valid object name: %s", base, strings.Join(errs, "; "))
+	}
+}

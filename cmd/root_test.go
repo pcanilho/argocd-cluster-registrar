@@ -297,3 +297,38 @@ func TestMetricsAreOffUnlessAskedFor(t *testing.T) {
 			"serves :8080 unauthenticated", opts.ctrl.MetricsBindAddress)
 	}
 }
+
+// An unset --leader-election-id must derive the same lease the chart does.
+//
+// The binary used to default it to a constant while the chart derived it from
+// labelPrefix and managedBy. So an instance deployed from a plain manifest and a
+// chart-deployed one with identical configuration, contending for the same
+// cluster Secrets, held different leases and both reconciled: precisely the state
+// leader election exists to prevent, reached by not using the chart.
+func TestAnUnsetLeaseNameIsDerivedNotConstant(t *testing.T) {
+	opts, err := buildOptions(parseFlags(t))
+	if err != nil {
+		t.Fatalf("buildOptions: %v", err)
+	}
+	want := registrar.LeaderElectionID(registrar.DefaultLabelPrefix, "cluster-registrar")
+	if opts.ctrl.LeaderElectionID != want {
+		t.Errorf("lease = %q, want %q", opts.ctrl.LeaderElectionID, want)
+	}
+
+	// ...and it must follow the values it is derived from, or two installs that
+	// never meet are serialised against each other.
+	other, err := buildOptions(parseFlags(t, "--managed-by=something-else"))
+	if err != nil {
+		t.Fatalf("buildOptions: %v", err)
+	}
+	if other.ctrl.LeaderElectionID == opts.ctrl.LeaderElectionID {
+		t.Error("changing --managed-by did not change the derived lease")
+	}
+}
+
+// An explicit empty value is a mistake, not a request to derive.
+func TestAnExplicitlyEmptyLeaseNameIsRejected(t *testing.T) {
+	if _, err := buildOptions(parseFlags(t, "--leader-election-id=")); err == nil {
+		t.Error("an empty lease name was accepted; the manager would fail to start")
+	}
+}

@@ -112,6 +112,20 @@ served or deleted unless you ask for it.
   a name produced a registration with the right CA and the right credentials that
   still failed hostname verification.
 
+- **`--leader-election-id` now defaults to the same lease the chart derives.** The
+  chart computes it from `labelPrefix` and `managedBy`, because those are what
+  decide whether two instances contend for the same cluster `Secret`s; the binary
+  defaulted to a constant. So an instance deployed from a plain manifest and a
+  chart-deployed one with identical configuration held *different* leases and both
+  reconciled, which is the state leader election exists to prevent, reached by not
+  using the chart. Set the flag explicitly to override. Only affects installs with
+  `leaderElection` enabled, which is off by default.
+
+- **Errors are printed once.** `main` wrapped every failure in a second message on
+  a second stream in a different format, while cobra had already printed it, and
+  the wording was inherited from `vcluster-argocd-exporter` so a flag validation
+  error read as a failure to export clusters.
+
 - **An empty `--label-prefix` is rejected rather than silently repaired.** With no
   prefix, label propagation matched every label on the source namespace and the
   reserved set computed as bare names matching nothing actually written, so a

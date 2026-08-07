@@ -77,7 +77,10 @@ kos:
     preserve_import_paths: false
     tags:
       - "{{.Version}}"
-      - latest
+      # Not on a prerelease. Cutting v0.6.0-rc1 would otherwise republish latest
+      # pointing at a release candidate, and the people tracking latest are
+      # exactly the ones not using the chart, which pins a version.
+      - "{{ if not .Prerelease }}latest{{ end }}"
 
 docker_signs:
   - id: server

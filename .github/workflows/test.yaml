@@ -172,6 +172,23 @@ jobs:
       # The release workflow overrides it at package time so published charts were
       # fine, but `helm install` from a checkout pulled a stale image, and nothing
       # noticed because deploy-test overrides the tag explicitly.
+      # The chart derives the lease name in _helpers.tpl and the binary derives it
+      # in Go. If they drift, an instance deployed from a plain manifest and a
+      # chart-deployed one with identical configuration hold different leases while
+      # contending for the same cluster Secrets, and both reconcile. A Go test pins
+      # the same literal from the other side.
+      - name: The chart and the binary derive the same lease name
+        run: |
+          set -euo pipefail
+          chart=deploy/charts/argocd-cluster-registrar
+          got=$(helm template t "$chart" --set leaderElection.enabled=true \
+            | grep -o 'leader-election-id=[a-z0-9-]*' | head -1 | cut -d= -f2)
+          want=acr-991221237547448b
+          if [ "$got" != "$want" ]; then
+            echo "::error::chart renders lease ${got}, the binary derives ${want}"
+            exit 1
+          fi
+
       # Both bind addresses become a containerPort by stripping the colon, so a
       # host:port form renders containerPort 0 and a bare port hands the binary an
       # address it cannot listen on. Neither should reach a cluster.

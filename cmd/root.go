@@ -136,6 +136,20 @@ func buildOptions(cmd *cobra.Command) (options, error) {
 
 	var warnings []string
 
+	// Derived unless it was set, so an instance deployed from a plain manifest
+	// takes the same lease as a chart-deployed one with identical configuration.
+	// The chart has always derived it; the binary defaulted to a constant, so the
+	// two would not contend and both would reconcile.
+	//
+	// Gated on Changed rather than emptiness, matching resolveProviders: an
+	// explicit empty value is a mistake worth reporting, not a request to derive.
+	lease := leaderElectionID
+	if !cmd.Flags().Changed("leader-election-id") {
+		lease = registrar.LeaderElectionID(labelPrefix, managedByValue)
+	} else if lease == "" {
+		return options{}, fmt.Errorf("--leader-election-id must not be empty; omit it to derive one")
+	}
+
 	// A local, deliberately NOT the package variable. Assigning to `leaderElect`
 	// here mutated global state from inside a request path: harmless in a process
 	// that runs this once, but in a test binary the value leaks into every case
@@ -163,7 +177,7 @@ func buildOptions(cmd *cobra.Command) (options, error) {
 		ctrl: registrar.ControllerOptions{
 			Interval:               interval,
 			LeaderElection:         elect,
-			LeaderElectionID:       leaderElectionID,
+			LeaderElectionID:       lease,
 			HealthProbeBindAddress: healthProbeBindAddress,
 			MetricsBindAddress:     metricsBindAddress,
 		},
@@ -294,8 +308,9 @@ func registerFlags(f *pflag.FlagSet) {
 	// collide, NOT from the release name: ownership is established purely by
 	// label-prefix and managed-by, so instances differing only in release name
 	// contend for the same Secrets and must contend for the same lease.
-	f.StringVar(&leaderElectionID, "leader-election-id", "argocd-cluster-registrar",
-		"name of the Lease used for leader election, within --target-namespace")
+	f.StringVar(&leaderElectionID, "leader-election-id", "",
+		"name of the Lease used for leader election, within --target-namespace; "+
+			"unset derives it from --label-prefix and --managed-by")
 	f.StringVar(&healthProbeBindAddress, "health-probe-bind-address", ":8081",
 		"address serving /healthz and /readyz; empty disables it")
 	// "0", not "": controller-runtime reads an empty metrics address as ":8080"

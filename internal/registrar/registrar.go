@@ -2,6 +2,8 @@ package registrar
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -238,6 +240,27 @@ var presets = map[string]Provider{
 		SecretNamePattern: "*-kubeconfig",
 		SecretKeys:        []string{"value"},
 	},
+}
+
+// LeaderElectionID derives the lease name from the two values that decide whether
+// two instances collide at all.
+//
+// NOT the release name, and not either value alone. Ownership is established
+// purely by label-prefix and managed-by, so two deployments differing only in
+// name contend for the same cluster Secrets and must contend for the same lease;
+// managed-by alone would over-serialise two installs that never meet.
+//
+// Hashed because labelPrefix contains a "/", which is illegal in an object name,
+// and managedBy is a label value, which permits characters a name does not.
+//
+// The chart computes the same thing in _helpers.tpl. The two must agree, or an
+// instance deployed from a plain manifest takes a different lease from a
+// chart-deployed one with identical configuration and both reconcile, which is
+// the state leader election exists to prevent. TestLeaderElectionIDMatchesTheChart
+// pins them together.
+func LeaderElectionID(labelPrefix, managedBy string) string {
+	sum := sha256.Sum256([]byte(labelPrefix + "|" + managedBy))
+	return "acr-" + hex.EncodeToString(sum[:])[:16]
 }
 
 // Preset returns a built-in provider by name.
