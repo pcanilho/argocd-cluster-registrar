@@ -103,6 +103,29 @@ probes:
     initialDelaySeconds: 5
     periodSeconds: 10
 
+# Prometheus metrics. Four series, all counts of this instance's own decisions:
+# registrations refused and why, orphans adopted, registrations owned by state,
+# and owned Secrets that no reconcile key can reach.
+#
+# OFF by default, and served UNAUTHENTICATED when on. Protecting the endpoint
+# means controller-runtime's authn/authz filter, which pulls in k8s.io/apiserver
+# and needs `tokenreviews`/`subjectaccessreviews` RBAC. Nothing published here
+# carries a cluster name, a namespace or any credential, so a NetworkPolicy is
+# the proportionate control. Which cluster is contested stays in the logs, where
+# it does not become unbounded monitoring cardinality anyone able to label a
+# namespace could mint.
+#
+# No ServiceMonitor ships. It needs a CRD that `helm template` cannot check for,
+# so it could not be proven correct in CI. Point your scrape config at the
+# Service, or add a ServiceMonitor of your own.
+metrics:
+  enabled: false
+  bindAddress: ":8080"
+  service:
+    enabled: false
+    port: 8080
+    annotations: {}
+
 # One is the right number. There is no work to parallelise and no HA requirement;
 # a brief outage of this controller costs nothing, since it converges on restart.
 # More than one requires leaderElection.enabled, or they would rewrite each

@@ -574,6 +574,10 @@ func (r *Registrar) ReconcileOne(ctx context.Context, nsName string) (bool, erro
 			// already taken by the error itself, and a TextHandler emits both
 			// rather than choosing, which would break anything already grepping
 			// the existing field.
+			// The one place every refusal passes through, whichever check produced
+			// it, which is why the counter lives here rather than at the five sites
+			// that construct the error.
+			conflictsTotal.WithLabelValues(conflict.reason).Inc()
 			r.log.Error("refused to register cluster", slog.String("cluster", c.cluster),
 				slog.String("namespace", c.namespace),
 				slog.String("conflict", conflict.reason), slog.Any("reason", err))
@@ -605,15 +609,28 @@ func (r *Registrar) AuditUnrouted(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list cluster secrets (%s): %w", selector, err)
 	}
+	// Counted while we are here. This LIST is the only place anything sees the
+	// whole owned population at once, so the gauges are free; taking them anywhere
+	// else would mean listing the ArgoCD namespace again for no other reason.
+	var active, demoted, unrouted int
 	for i := range secrets.Items {
 		s := &secrets.Items[i]
+		if s.Labels[r.orphanedSecretTypeLabel()] != "" {
+			demoted++
+		} else {
+			active++
+		}
 		if s.Labels[r.sourceNamespaceLabel()] != "" {
 			continue
 		}
+		unrouted++
 		r.log.Warn("owned cluster secret records no source namespace; it can never be collected",
 			slog.String("secret", s.Name), slog.String("label", r.sourceNamespaceLabel()),
 			slog.String("fix", "restore the label, or delete the secret if the cluster is gone"))
 	}
+	registrations.WithLabelValues(stateActive).Set(float64(active))
+	registrations.WithLabelValues(stateDemoted).Set(float64(demoted))
+	unroutedSecrets.Set(float64(unrouted))
 	return nil
 }
 
@@ -1054,6 +1071,10 @@ func (r *Registrar) checkOwnership(existing *coreV1.Secret, c child) error {
 				r.cfg.TargetNamespace, existing.Name, r.clusterLabel(),
 				existing.Labels[r.clusterLabel()], c.cluster, c.namespace)
 		}
+		// Counted here rather than at the refusal choke point, because this branch
+		// is a SUCCESS: it returns nil and the registration proceeds. Look for it
+		// alongside the conflict counter and you will conclude it is missing.
+		adoptionsTotal.Inc()
 		r.log.Warn("adopting an owned cluster secret that records no source namespace",
 			slog.String("secret", existing.Name), slog.String("cluster", c.cluster),
 			slog.String("namespace", c.namespace),

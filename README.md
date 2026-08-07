@@ -111,6 +111,10 @@ dryRun: false
 
 # Verbose logging.
 debug: false
+
+# Prometheus metrics. Off by default, unauthenticated when on. See "Operating".
+metrics:
+  enabled: false
 ```
 
 The binary also falls back to your own kubeconfig when it is not running in a
@@ -330,9 +334,21 @@ A controller, so: `/healthz` and `/readyz` on `:8081` by default, tunable under
 `probes`. Readiness means the manager is running, not that this replica holds the
 lease, so a standby stays Ready.
 
-Metrics are **not** served. Enabling them would mean either an unauthenticated
-port or pulling in the API server authn/authz stack, and there is nothing here
-worth either yet.
+Metrics are off by default, under `metrics`, and **unauthenticated** when on, so
+put a NetworkPolicy in front of the port. Four series, all counts of this
+instance's own decisions:
+
+| Metric | |
+|---|---|
+| `..._conflicts_total{reason}` | registrations refused, and why |
+| `..._adoptions_total` | orphaned `Secret`s adopted by a matching namespace |
+| `..._registrations{state}` | registrations owned, `active` or `demoted` |
+| `..._unrouted_secrets` | owned `Secret`s no reconcile key can reach |
+
+`conflicts_total{reason="incumbent"}` is the one worth alerting on: a contested
+name stays contested until someone resolves it. *Which* cluster is in the log
+line, not the labels, so a tenant cannot mint series by naming a namespace.
+`metrics.service.enabled` adds a `Service`; no `ServiceMonitor` ships.
 
 `leaderElection` is off by default and needs `leases` and `events` in
 `targetNamespace`. The lease is named for `labelPrefix` and `managedBy`, not for

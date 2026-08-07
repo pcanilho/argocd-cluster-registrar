@@ -38,6 +38,9 @@ const auditKey = ""
 // needs to be large enough that a normal fleet does not serialise on it.
 const seedBuffer = 256
 
+// metricsDisabled is the value controller-runtime treats as "do not serve".
+const metricsDisabled = "0"
+
 // ControllerOptions configures the manager. Everything here is operational; what
 // the registrar actually does is in Config.
 type ControllerOptions struct {
@@ -54,6 +57,16 @@ type ControllerOptions struct {
 
 	// HealthProbeBindAddress serves /healthz and /readyz. Empty disables it.
 	HealthProbeBindAddress string
+
+	// MetricsBindAddress serves Prometheus metrics. "0" disables it, and that is
+	// the default.
+	//
+	// Note the asymmetry with HealthProbeBindAddress above, which is not an
+	// oversight and must not be tidied away: controller-runtime reads an EMPTY
+	// metrics address as ":8080" rather than as "off", so the two fields disable
+	// on different values. managerOptions normalises empty to "0" so that a
+	// zero-valued ControllerOptions cannot open an unauthenticated port.
+	MetricsBindAddress string
 }
 
 // Reconciler adapts a Registrar to controller-runtime.
@@ -116,6 +129,17 @@ func newScheme() (*runtime.Scheme, error) {
 // asserted in a test. Start itself cannot be: it builds a client against the
 // ambient cluster.
 func managerOptions(cfg Config, opts ControllerOptions, scheme *runtime.Scheme) ctrl.Options {
+	// Empty means "off" here, even though controller-runtime reads it as ":8080".
+	// Without this, a ControllerOptions that simply does not mention metrics --
+	// a zero value, a caller that forgot the field, a test -- would serve an
+	// unauthenticated endpoint on a port nobody chose. The flag default is "0" as
+	// well; both are wanted, because either alone can be undone by a plausible
+	// edit to the other.
+	metricsBind := opts.MetricsBindAddress
+	if metricsBind == "" {
+		metricsBind = metricsDisabled
+	}
+
 	return ctrl.Options{
 		Scheme: scheme,
 		Cache: cache.Options{
@@ -138,8 +162,12 @@ func managerOptions(cfg Config, opts ControllerOptions, scheme *runtime.Scheme) 
 		Client: client.Options{
 			Cache: &client.CacheOptions{DisableFor: []client.Object{&coreV1.Secret{}}},
 		},
-		// "0" disables. An empty string would bind :8080 unauthenticated.
-		Metrics:                       metricsserver.Options{BindAddress: "0"},
+		// Served unauthenticated when enabled, deliberately. Protecting it means
+		// controller-runtime's authn/authz filter, which drags in k8s.io/apiserver
+		// and needs tokenreviews/subjectaccessreviews RBAC; the four series here
+		// are counts of the instance's own decisions and carry no cluster
+		// identity, so a NetworkPolicy is the proportionate control.
+		Metrics:                       metricsserver.Options{BindAddress: metricsBind},
 		HealthProbeBindAddress:        opts.HealthProbeBindAddress,
 		LeaderElection:                opts.LeaderElection,
 		LeaderElectionID:              opts.LeaderElectionID,

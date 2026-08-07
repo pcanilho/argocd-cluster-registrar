@@ -90,17 +90,31 @@ spec:
             {{- else }}
             - "--health-probe-bind-address="
             {{- end }}
+            {{- /* No else branch, unlike probes above: an empty --metrics-bind-address
+                   means ":8080", not "off". Leave it unset and the binary defaults to "0". */}}
+            {{- if .Values.metrics.enabled }}
+            - "--metrics-bind-address={{ .Values.metrics.bindAddress }}"
+            {{- end }}
             {{- if .Values.dryRun }}
             - --dry-run
             {{- end }}
             {{- if .Values.debug }}
             - --debug
             {{- end }}
-          {{- if .Values.probes.enabled }}
+          {{- if or .Values.probes.enabled .Values.metrics.enabled }}
           ports:
+            {{- if .Values.probes.enabled }}
             - name: probes
               containerPort: {{ .Values.probes.bindAddress | trimPrefix ":" | int }}
               protocol: TCP
+            {{- end }}
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.bindAddress | trimPrefix ":" | int }}
+              protocol: TCP
+            {{- end }}
+          {{- end }}
+          {{- if .Values.probes.enabled }}
           livenessProbe:
             httpGet:
               path: /healthz

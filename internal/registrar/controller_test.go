@@ -302,9 +302,13 @@ func TestManagerOptionsPinTheDangerousDefaults(t *testing.T) {
 		t.Error("a cached read of an unconfigured resource would silently start a " +
 			"cluster-wide informer instead of failing")
 	}
-	if opts.Metrics.BindAddress != "0" {
-		t.Errorf("metrics BindAddress = %q; anything but \"0\" serves :8080 unauthenticated",
-			opts.Metrics.BindAddress)
+	// An UNSET metrics address, which is what a zero-valued ControllerOptions and
+	// any caller that forgets the field both produce. controller-runtime reads
+	// empty as ":8080", so without the normalisation this is how an installation
+	// that never asked for metrics ends up serving them unauthenticated.
+	if opts.Metrics.BindAddress != metricsDisabled {
+		t.Errorf("metrics BindAddress = %q for an unset option; anything but %q "+
+			"serves :8080 unauthenticated", opts.Metrics.BindAddress, metricsDisabled)
 	}
 	if opts.Client.Cache == nil || len(opts.Client.Cache.DisableFor) == 0 {
 		t.Fatal("Secrets are not excluded from the cached client")
@@ -332,5 +336,28 @@ func TestManagerOptionsPinTheDangerousDefaults(t *testing.T) {
 		t.Errorf("LeaderElectionNamespace = %q, want %q; unset means the pod's own "+
 			"namespace, which is not where two colliding releases meet",
 			opts.LeaderElectionNamespace, testTargetNS)
+	}
+}
+
+// Metrics must still be servable when asked for, or the normalisation above
+// could be "fixed" by hardcoding the disabled value and nothing would notice.
+//
+// The port is one that appears nowhere else in this package: passing through
+// HealthProbeBindAddress by mistake would otherwise satisfy an assertion that
+// only checked the value was not "0".
+func TestMetricsBindAddressIsPassedThroughWhenSet(t *testing.T) {
+	scheme, err := newScheme()
+	if err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+	opts := managerOptions(testConfig(), ControllerOptions{
+		Interval:               time.Minute,
+		HealthProbeBindAddress: ":8081",
+		MetricsBindAddress:     ":9090",
+	}, scheme)
+
+	if opts.Metrics.BindAddress != ":9090" {
+		t.Errorf("metrics BindAddress = %q, want :9090; the option does not reach the manager",
+			opts.Metrics.BindAddress)
 	}
 }

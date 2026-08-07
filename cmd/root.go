@@ -41,6 +41,7 @@ var (
 	leaderElect            bool
 	leaderElectionID       string
 	healthProbeBindAddress string
+	metricsBindAddress     string
 )
 
 // resolveProviders turns the flags into the provider list, honouring the
@@ -153,6 +154,7 @@ func buildOptions(cmd *cobra.Command) (options, error) {
 			LeaderElection:         elect,
 			LeaderElectionID:       leaderElectionID,
 			HealthProbeBindAddress: healthProbeBindAddress,
+			MetricsBindAddress:     metricsBindAddress,
 		},
 		warnings: warnings,
 	}, nil
@@ -285,4 +287,9 @@ func registerFlags(f *pflag.FlagSet) {
 		"name of the Lease used for leader election, within --target-namespace")
 	f.StringVar(&healthProbeBindAddress, "health-probe-bind-address", ":8081",
 		"address serving /healthz and /readyz; empty disables it")
+	// "0", not "": controller-runtime reads an empty metrics address as ":8080"
+	// rather than as "off", so defaulting to empty here would open an
+	// unauthenticated port on every install that never asked for one.
+	f.StringVar(&metricsBindAddress, "metrics-bind-address", "0",
+		`address serving Prometheus metrics; "0" disables it, which is the default`)
 }

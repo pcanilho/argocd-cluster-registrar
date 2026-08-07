@@ -33,6 +33,10 @@ const (
 	// testServer is a placeholder endpoint for cases where the address itself is
 	// not what is being asserted.
 	testServer = "https://x"
+	// resourceSecrets names the resource in fake-clientset reactors.
+	resourceSecrets = "secrets"
+	// testHour spaces fixture namespaces apart when age decides a contested name.
+	testHour = time.Hour
 
 	// Kamaji's two kubeconfig keys. Named because the multi-key tests repeat them
 	// and because which of the two wins is itself the assertion.
@@ -159,7 +163,7 @@ func TestTransientSecretListErrorDoesNotDeregisterAnything(t *testing.T) {
 		managedNS(testNS, "a"), kubeconfigSecret(testNS, "k3k-a-kubeconfig"), registeredSecret("a", testNS),
 		managedNS("k3k-b", "b"), kubeconfigSecret("k3k-b", "k3k-b-kubeconfig"), registeredSecret("b", "k3k-b"),
 	)
-	c.PrependReactor("list", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+	c.PrependReactor("list", resourceSecrets, func(action k8stesting.Action) (bool, runtime.Object, error) {
 		if action.GetNamespace() != testTargetNS {
 			return true, nil, apiErrors.NewInternalError(io.ErrUnexpectedEOF)
 		}
@@ -225,9 +229,9 @@ func TestCollectNeverTouchesUnlabelledSecrets(t *testing.T) {
 // One undeletable Secret must not stall GC for every other cluster.
 func TestCollectContinuesPastDeleteErrors(t *testing.T) {
 	r, c := newTestRegistrar(registeredSecret("a", testNS), registeredSecret("b", "k3k-b"))
-	c.PrependReactor("delete", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+	c.PrependReactor("delete", resourceSecrets, func(action k8stesting.Action) (bool, runtime.Object, error) {
 		if action.(k8stesting.DeleteAction).GetName() == "cluster-a" {
-			return true, nil, apiErrors.NewForbidden(schema.GroupResource{Resource: "secrets"}, "cluster-a", io.ErrUnexpectedEOF)
+			return true, nil, apiErrors.NewForbidden(schema.GroupResource{Resource: resourceSecrets}, "cluster-a", io.ErrUnexpectedEOF)
 		}
 		return false, nil, nil
 	})
@@ -667,9 +671,9 @@ func TestConflictedLoserDoesNotStrandTheWinnersSecret(t *testing.T) {
 // worker reconciles at a time.
 func TestCreateRaceReturnsConflict(t *testing.T) {
 	r, c := newTestRegistrar(managedNS(testSourceNS, "a"), kubeconfigSecret(testSourceNS, "k3k-a-kubeconfig"))
-	c.PrependReactor("create", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+	c.PrependReactor("create", resourceSecrets, func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, apiErrors.NewAlreadyExists(
-			schema.GroupResource{Resource: "secrets"}, "cluster-a")
+			schema.GroupResource{Resource: resourceSecrets}, "cluster-a")
 	})
 
 	err := r.apply(context.Background(), child{
@@ -721,9 +725,9 @@ func TestReconcileReturnsNilOnConflictButErrorsOnRealFailure(t *testing.T) {
 	}
 
 	r, c := newFixture()
-	c.PrependReactor("create", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+	c.PrependReactor("create", resourceSecrets, func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, apiErrors.NewForbidden(
-			schema.GroupResource{Resource: "secrets"}, "cluster-b", io.ErrUnexpectedEOF)
+			schema.GroupResource{Resource: resourceSecrets}, "cluster-b", io.ErrUnexpectedEOF)
 	})
 	if err := r.Reconcile(context.Background()); err == nil {
 		t.Error("a forbidden write was not reported")
@@ -855,7 +859,7 @@ func TestDemotionIsNotRepeated(t *testing.T) {
 	}
 	first := getSecret(t, c, "cluster-a").Labels[StaleSinceLabel(testPrefix)]
 
-	c.PrependReactor("update", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+	c.PrependReactor("update", resourceSecrets, func(action k8stesting.Action) (bool, runtime.Object, error) {
 		if action.(k8stesting.UpdateAction).GetObject().(*coreV1.Secret).Name == "cluster-a" {
 			t.Error("cluster-a was demoted a second time")
 		}
@@ -956,7 +960,7 @@ func TestOrphanDeleteIsPreconditionedOnTheSecretUID(t *testing.T) {
 	r, c := newTestRegistrar(orphan)
 	var gotUID types.UID
 	var sawDelete bool
-	c.PrependReactor("delete", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+	c.PrependReactor("delete", resourceSecrets, func(action k8stesting.Action) (bool, runtime.Object, error) {
 		sawDelete = true
 		if pre := action.(k8stesting.DeleteActionImpl).DeleteOptions.Preconditions; pre != nil && pre.UID != nil {
 			gotUID = *pre.UID
@@ -1354,9 +1358,9 @@ func TestEveryRefusalCarriesItsOwnReason(t *testing.T) {
 			want: conflictCreateRace,
 			build: func(*testing.T) (*Registrar, child) {
 				r, c := newTestRegistrar(managedNS(testSourceNS, "a"))
-				c.PrependReactor("create", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+				c.PrependReactor("create", resourceSecrets, func(k8stesting.Action) (bool, runtime.Object, error) {
 					return true, nil, apiErrors.NewAlreadyExists(
-						schema.GroupResource{Resource: "secrets"}, "cluster-a")
+						schema.GroupResource{Resource: resourceSecrets}, "cluster-a")
 				})
 				return r, child{cluster: "a", namespace: testSourceNS, server: testServer, config: "{}"}
 			},

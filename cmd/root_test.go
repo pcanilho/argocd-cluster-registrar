@@ -213,6 +213,8 @@ func TestEveryFlagReachesTheOptionItConfigures(t *testing.T) {
 			func(o options) string { return o.ctrl.Interval.String() }},
 		{"--health-probe-bind-address=:9", ":9",
 			func(o options) string { return o.ctrl.HealthProbeBindAddress }},
+		{"--metrics-bind-address=:9090", ":9090",
+			func(o options) string { return o.ctrl.MetricsBindAddress }},
 		{"--leader-election-id=some-other-lease", "some-other-lease",
 			func(o options) string { return o.ctrl.LeaderElectionID }},
 		{"--leader-elect", "true",
@@ -275,5 +277,23 @@ func TestANonPositiveIntervalIsRejected(t *testing.T) {
 			t.Errorf("%s was accepted; every registration would be reconciled once "+
 				"and then never refreshed", arg)
 		}
+	}
+}
+
+// Metrics stay off unless asked for, and "off" is the string "0".
+//
+// Not the empty string: controller-runtime reads an empty bind address as
+// ":8080" rather than as "off", so defaulting to empty here would open an
+// unauthenticated port on every install that never mentioned metrics. The
+// manager normalises empty to "0" as well; both are wanted, because either
+// alone can be undone by a plausible edit to the other.
+func TestMetricsAreOffUnlessAskedFor(t *testing.T) {
+	opts, err := buildOptions(parseFlags(t))
+	if err != nil {
+		t.Fatalf("buildOptions: %v", err)
+	}
+	if opts.ctrl.MetricsBindAddress != "0" {
+		t.Errorf("default metrics bind address = %q, want \"0\"; an empty value "+
+			"serves :8080 unauthenticated", opts.ctrl.MetricsBindAddress)
 	}
 }
