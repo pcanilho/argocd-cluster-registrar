@@ -2,6 +2,8 @@ package registrar
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -173,10 +175,19 @@ type Provider struct {
 	// there instead.
 	SecretNamePattern string
 
-	// SecretKeys are the keys that may hold the kubeconfig, tried in order. A
-	// list rather than a single key because one provisioner can legitimately use
-	// either: Kamaji writes `admin.conf`, or `admin.svc` when its control plane
-	// advertises a service address.
+	// SecretKeys are the keys that may hold the kubeconfig. A list rather than a
+	// single key because one provisioner can legitimately use either: Kamaji
+	// writes `admin.conf`, or `admin.svc` when its control plane advertises a
+	// service address.
+	//
+	// Tried in order, and "tried" means parsed: every key present becomes its own
+	// candidate, so a first key that is half-written or carries a credential we
+	// cannot copy falls through to the next rather than failing the namespace.
+	// The first key that yields a USABLE kubeconfig wins, so where several parse
+	// -- which is the normal Kamaji case, both of its keys being well-formed --
+	// the order declared here is the order that decides.
+	//
+	// Duplicates are rejected by Validate rather than ignored here.
 	SecretKeys []string
 }
 
@@ -203,9 +214,13 @@ var presets = map[string]Provider{
 		SecretNamePattern: "vc-*",
 		SecretKeys:        []string{"config"},
 	},
-	// Kamaji's standalone shape. Note that driving Kamaji through its Cluster API
-	// control-plane provider ALSO produces a second, CAPI-shaped Secret for the
-	// same physical cluster -- see the note on candidate ordering in discover.
+	// Kamaji's standalone shape. Both keys are normally present and both normally
+	// parse, so `admin.conf` wins on order; `admin.svc` is reached when the first
+	// is unusable, or by declaring it first in a custom entry.
+	//
+	// Note that driving Kamaji through its Cluster API control-plane provider ALSO
+	// produces a second, CAPI-shaped Secret for the same physical cluster -- see
+	// the note on candidate ordering in discover.
 	"kamaji": { // #nosec G101 -- see above
 		Name:              "kamaji",
 		SecretNamePattern: "*-admin-kubeconfig",
@@ -225,6 +240,27 @@ var presets = map[string]Provider{
 		SecretNamePattern: "*-kubeconfig",
 		SecretKeys:        []string{"value"},
 	},
+}
+
+// LeaderElectionID derives the lease name from the two values that decide whether
+// two instances collide at all.
+//
+// NOT the release name, and not either value alone. Ownership is established
+// purely by label-prefix and managed-by, so two deployments differing only in
+// name contend for the same cluster Secrets and must contend for the same lease;
+// managed-by alone would over-serialise two installs that never meet.
+//
+// Hashed because labelPrefix contains a "/", which is illegal in an object name,
+// and managedBy is a label value, which permits characters a name does not.
+//
+// The chart computes the same thing in _helpers.tpl. The two must agree, or an
+// instance deployed from a plain manifest takes a different lease from a
+// chart-deployed one with identical configuration and both reconcile, which is
+// the state leader election exists to prevent. TestLeaderElectionIDMatchesTheChart
+// pins them together.
+func LeaderElectionID(labelPrefix, managedBy string) string {
+	sum := sha256.Sum256([]byte(labelPrefix + "|" + managedBy))
+	return "acr-" + hex.EncodeToString(sum[:])[:16]
 }
 
 // Preset returns a built-in provider by name.
@@ -304,6 +340,13 @@ type Config struct {
 
 	// DryRun logs what would change without writing anything.
 	DryRun bool
+
+	// DemotedTTL is how long a demoted registration is kept before it is deleted
+	// outright. Zero, the default, keeps them indefinitely.
+	//
+	// Bounds how far rename debris accumulates, at the price of bounding how long
+	// a mistaken rename can still be reverted. Hence opt-in.
+	DemotedTTL time.Duration
 }
 
 // Registrar reconciles child-cluster kubeconfigs into ArgoCD cluster Secrets.
@@ -400,10 +443,19 @@ func (c Config) Validate() error {
 		if len(p.SecretKeys) == 0 {
 			return fmt.Errorf("provider %q: at least one secret key must be set", p.Name)
 		}
+		seenKey := make(map[string]bool, len(p.SecretKeys))
 		for _, k := range p.SecretKeys {
 			if k == "" {
 				return fmt.Errorf("provider %q: secret key must not be empty", p.Name)
 			}
+			// Rejected rather than quietly ignored, matching the duplicate-name rule
+			// above. Every present key now becomes its own candidate, so a repeated
+			// key would parse the same bytes twice and report the same failure twice
+			// -- and the operator would never learn their values file has a typo.
+			if seenKey[k] {
+				return fmt.Errorf("provider %q: duplicate secret key %q", p.Name, k)
+			}
+			seenKey[k] = true
 		}
 		// A malformed glob is a permanent fault. It used to surface once per
 		// namespace per pass, disguised as "no kubeconfig secret yet".
@@ -411,6 +463,29 @@ func (c Config) Validate() error {
 			return fmt.Errorf("provider %q: secret name pattern %q is not a valid glob: %w",
 				p.Name, p.SecretNamePattern, err)
 		}
+	}
+	// A prefix that ArgoCD's own key falls under would let a source namespace
+	// propagate `argocd.argoproj.io/secret-type` -- it is not a reserved suffix,
+	// so nothing withholds it -- and the propagated labels are copied last, so it
+	// would override the key this tool sets. Absurd to configure on purpose, but
+	// the trust boundary should not depend on that.
+	if c.LabelPrefix != "" && strings.HasPrefix(argoSecretTypeLabel, c.LabelPrefix) {
+		return fmt.Errorf("--label-prefix %q would let a source namespace override %q",
+			c.LabelPrefix, argoSecretTypeLabel)
+	}
+	// Negative is a typo, not "disabled", and would expire everything on sight.
+	if c.DemotedTTL < 0 {
+		return fmt.Errorf("--demoted-ttl must not be negative, got %s", c.DemotedTTL)
+	}
+	// Empty is not "use the default" here. With no prefix, propagatedLabels
+	// matches EVERY label on the source namespace and the reserved list computes
+	// as bare names that match nothing actually written, so a tenant could
+	// propagate argocd.argoproj.io/secret-type off its own namespace. The
+	// constructor happens to repair it, but a caller that validates without going
+	// through the constructor would get a silently different trust boundary.
+	if c.LabelPrefix == "" {
+		return fmt.Errorf("--label-prefix must not be empty; it is what keeps a source " +
+			"namespace from propagating labels this tool reserves")
 	}
 	if p := c.LabelPrefix; p != "" && !strings.HasSuffix(p, "/") {
 		// Without the slash the keys become nonsense like "example.commanaged-by"
@@ -547,8 +622,18 @@ func (r *Registrar) ReconcileOne(ctx context.Context, nsName string) (bool, erro
 			//
 			// Skip collection: a refused claimant vouches for nothing, and its own
 			// earlier registrations must not be read as superseded.
+			//
+			// The reason is logged under "conflict", NOT "reason": that key is
+			// already taken by the error itself, and a TextHandler emits both
+			// rather than choosing, which would break anything already grepping
+			// the existing field.
+			// The one place every refusal passes through, whichever check produced
+			// it, which is why the counter lives here rather than at the five sites
+			// that construct the error.
+			conflictsTotal.WithLabelValues(conflict.reason).Inc()
 			r.log.Error("refused to register cluster", slog.String("cluster", c.cluster),
-				slog.String("namespace", c.namespace), slog.Any("reason", err))
+				slog.String("namespace", c.namespace),
+				slog.String("conflict", conflict.reason), slog.Any("reason", err))
 			return false, nil
 		}
 		r.log.Error("failed to register cluster",
@@ -577,15 +662,28 @@ func (r *Registrar) AuditUnrouted(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list cluster secrets (%s): %w", selector, err)
 	}
+	// Counted while we are here. This LIST is the only place anything sees the
+	// whole owned population at once, so the gauges are free; taking them anywhere
+	// else would mean listing the ArgoCD namespace again for no other reason.
+	var active, demoted, unrouted int
 	for i := range secrets.Items {
 		s := &secrets.Items[i]
+		if s.Labels[r.orphanedSecretTypeLabel()] != "" {
+			demoted++
+		} else {
+			active++
+		}
 		if s.Labels[r.sourceNamespaceLabel()] != "" {
 			continue
 		}
+		unrouted++
 		r.log.Warn("owned cluster secret records no source namespace; it can never be collected",
 			slog.String("secret", s.Name), slog.String("label", r.sourceNamespaceLabel()),
 			slog.String("fix", "restore the label, or delete the secret if the cluster is gone"))
 	}
+	registrations.WithLabelValues(stateActive).Set(float64(active))
+	registrations.WithLabelValues(stateDemoted).Set(float64(demoted))
+	unroutedSecrets.Set(float64(unrouted))
 	return nil
 }
 
@@ -684,16 +782,47 @@ func (e *apiFailure) Unwrap() error { return e.err }
 //
 // Reconcile must not count it toward the pass's error return. A contested name is
 // a configuration mistake that persists until a human fixes it, so treating it as
-// an error would fail every pass forever and, once there is a metric, pump it
-// forever too. It is still logged at Error, because a silently resolved conflict
-// over a credential-bearing Secret is the actual hazard.
-type conflictError struct{ err error }
+// an error would fail every pass forever and pump the conflict metric forever too.
+// It is still logged at Error, because a silently resolved conflict over a
+// credential-bearing Secret is the actual hazard.
+//
+// The reason travels on the error rather than being re-derived from its text: it
+// is the metric's only label, and matching on message wording would make a
+// reworded sentence a silent monitoring regression.
+type conflictError struct {
+	reason string
+	err    error
+}
 
 func (e *conflictError) Error() string { return e.err.Error() }
 func (e *conflictError) Unwrap() error { return e.err }
 
-func conflictf(format string, a ...any) error {
-	return &conflictError{fmt.Errorf(format, a...)}
+// The closed set of reasons a claim can be refused. Every value is a constant
+// because these are metric label values: anything derived from a namespace or a
+// cluster name would be attacker-chosen cardinality on the one path that is
+// explicitly adversarial.
+const (
+	// conflictNotManaged is a Secret this registrar does not own at all: hand
+	// written, or another instance's.
+	conflictNotManaged = "not_managed"
+	// conflictOrphanClusterMismatch is an owned Secret recording no source
+	// namespace whose cluster label names a different cluster, so adopting it
+	// would repoint someone else's registration.
+	conflictOrphanClusterMismatch = "orphan_cluster_mismatch"
+	// conflictIncumbent is the ordinary case: the name is held by another live
+	// namespace and the holder keeps it.
+	conflictIncumbent = "incumbent"
+	// conflictContestedName is an unclaimed name several namespaces want, awarded
+	// to the oldest.
+	conflictContestedName = "contested_name"
+	// conflictCreateRace is benign and self-resolving: two workers created the
+	// same Secret at once. Expected during a leader-election handover, so it is
+	// counted separately rather than alerted on.
+	conflictCreateRace = "create_race"
+)
+
+func conflictf(reason, format string, a ...any) error {
+	return &conflictError{reason: reason, err: fmt.Errorf(format, a...)}
 }
 
 // discoverOne evaluates a single managed namespace. The bool reports whether a
@@ -754,6 +883,9 @@ func (r *Registrar) discoverOne(ctx context.Context, ns *coreV1.Namespace) (chil
 	// Try candidates in order. A shape match is not a usable kubeconfig: it may
 	// be half-written, or carry an exec credential that cannot be copied into an
 	// ArgoCD Secret, and in both cases the next candidate may be fine.
+	//
+	// Two candidates may be the same Secret under different keys, which is why the
+	// parse errors below are labelled `name[key]` rather than by name alone.
 	var (
 		server, config string
 		provider       string
@@ -801,9 +933,10 @@ type candidate struct {
 	key      string
 }
 
-// findKubeconfigCandidates returns every Secret in ns that matches a configured
-// provider's glob AND carries one of that provider's keys, in the order they
-// should be tried: providers in configured precedence order, then Secret name.
+// findKubeconfigCandidates returns every (Secret, key) pair in ns where the
+// Secret matches a configured provider's glob AND carries that key, in the order
+// they should be tried: providers in configured precedence order, then Secret
+// name, then the order the provider declares its keys.
 //
 // Both conditions matter. A name-only match picks the wrong object whenever a
 // provisioner writes more than one Secret under the same prefix: vcluster's
@@ -813,12 +946,19 @@ type candidate struct {
 // the two happen to sort.
 //
 // A LIST rather than a single answer, because matching the shape is not the same
-// as being usable. Cluster API's contract is satisfied by managed-cloud
-// providers too, and CAPA's EKS path writes a second `<cluster>-user-kubeconfig`
-// -- same glob, same `value` key -- holding an `exec` credential that cannot be
-// copied into an ArgoCD Secret at all. Returning candidates lets the caller fall
-// through to the next one on a parse failure, instead of relying on `k` sorting
-// before `u`.
+// as being usable. That holds at both levels.
+//
+// Across Secrets: Cluster API's contract is satisfied by managed-cloud providers
+// too, and CAPA's EKS path writes a second `<cluster>-user-kubeconfig` -- same
+// glob, same `value` key -- holding an `exec` credential that cannot be copied
+// into an ArgoCD Secret at all. Returning candidates lets the caller fall through
+// to the next one on a parse failure, instead of relying on `k` sorting before
+// `u`.
+//
+// Within one Secret: Kamaji writes `admin.conf` and `admin.svc` side by side, so
+// emitting only the first present key made the second unreachable however broken
+// the first was. Both levels use the same mechanism, because a parse failure is
+// how an unusable candidate announces itself either way.
 func (r *Registrar) findKubeconfigCandidates(ctx context.Context, ns string) ([]candidate, error) {
 	secrets, err := r.client.CoreV1().Secrets(ns).List(ctx, metaV1.ListOptions{})
 	if err != nil {
@@ -860,21 +1000,32 @@ func (r *Registrar) findKubeconfigCandidates(ctx context.Context, ns string) ([]
 				continue
 			}
 
-			key := ""
+			// One candidate per key PRESENT, not merely the first one. Kamaji ships
+			// `admin.conf` and `admin.svc` together, so stopping at the first meant
+			// a half-written `admin.conf` put `admin.svc` out of reach and stranded
+			// the namespace -- while Provider.SecretKeys claimed its keys were
+			// "tried in order". They now are.
+			//
+			// Several candidates may therefore share one *coreV1.Secret pointer into
+			// secrets.Items. Read-only, and the caller tells them apart by key.
+			found := 0
 			for _, k := range p.SecretKeys {
-				if _, has := s.Data[k]; has {
-					key = k
-					break
+				if _, has := s.Data[k]; !has {
+					continue
 				}
+				found++
+				out = append(out, candidate{secret: s, provider: p.Name, key: k})
 			}
-			if key == "" {
+			if found == 0 {
 				namedButKeyless = append(namedButKeyless,
 					fmt.Sprintf("%s (provider %s)", s.Name, p.Name))
 				continue
 			}
 
+			// Claimed per SECRET, not per key, and that is what keeps one physical
+			// cluster registered once: a later provider must not re-offer this
+			// object under a key of its own.
 			claimed[s.Name] = true
-			out = append(out, candidate{secret: s, provider: p.Name, key: key})
 		}
 	}
 
@@ -940,7 +1091,7 @@ func secretName(cluster string) string { return "cluster-" + cluster }
 func (r *Registrar) checkOwnership(existing *coreV1.Secret, c child) error {
 	if existing.Labels[r.managedByLabel()] != r.cfg.ManagedByValue {
 		// Hand-registered, or another registrar's. Either way not ours to take.
-		return conflictf(
+		return conflictf(conflictNotManaged,
 			"secret %s/%s is not managed by this registrar (%s=%q); "+
 				"refusing to take it over for namespace %s. Rename the cluster, or delete "+
 				"the secret if it is genuinely stale",
@@ -967,12 +1118,16 @@ func (r *Registrar) checkOwnership(existing *coreV1.Secret, c child) error {
 		// wearing a different hat. Requiring the cluster label to match means an
 		// attacker gains nothing they did not already have.
 		if existing.Labels[r.clusterLabel()] != c.cluster {
-			return conflictf(
+			return conflictf(conflictOrphanClusterMismatch,
 				"secret %s/%s is owned but records no source namespace, and its %s label is %q "+
 					"rather than %q; refusing to adopt it for namespace %s",
 				r.cfg.TargetNamespace, existing.Name, r.clusterLabel(),
 				existing.Labels[r.clusterLabel()], c.cluster, c.namespace)
 		}
+		// Counted here rather than at the refusal choke point, because this branch
+		// is a SUCCESS: it returns nil and the registration proceeds. Look for it
+		// alongside the conflict counter and you will conclude it is missing.
+		adoptionsTotal.Inc()
 		r.log.Warn("adopting an owned cluster secret that records no source namespace",
 			slog.String("secret", existing.Name), slog.String("cluster", c.cluster),
 			slog.String("namespace", c.namespace),
@@ -984,7 +1139,7 @@ func (r *Registrar) checkOwnership(existing *coreV1.Secret, c child) error {
 		// under the same name is a legitimate claimant, and refusing it here
 		// would deadlock: collect() would see a live namespace of that name and
 		// refuse to delete the registration, so neither side could ever move.
-		return conflictf(
+		return conflictf(conflictIncumbent,
 			"cluster %q is registered from namespace %s; refusing to take it over for %s. "+
 				"Two namespaces must not claim one cluster name",
 			c.cluster, src, c.namespace)
@@ -1039,7 +1194,7 @@ func (r *Registrar) claimContestedName(ctx context.Context, c child) error {
 	if winner == "" || winner == c.namespace {
 		return nil
 	}
-	return conflictf(
+	return conflictf(conflictContestedName,
 		"cluster %q is also claimed by namespace %s, which is older; "+
 			"not registering it from %s", c.cluster, winner, c.namespace)
 }
@@ -1093,7 +1248,8 @@ func (r *Registrar) apply(ctx context.Context, c child) error {
 				// Someone wrote it between our Get and our Create. Benign, and
 				// resolved by incumbency on the next pass -- which is also what
 				// keeps this safe once more than one worker reconciles at a time.
-				return conflictf("cluster secret %s was created concurrently; retrying next pass",
+				return conflictf(conflictCreateRace,
+					"cluster secret %s was created concurrently; retrying next pass",
 					want.Name)
 			}
 			return fmt.Errorf("create: %w", err)
@@ -1140,7 +1296,16 @@ func (r *Registrar) apply(ctx context.Context, c child) error {
 	maps.Copy(updated.Labels, want.Labels)
 	// Drop prefixed labels that no longer exist upstream, so a cluster can be
 	// opted back OUT of a selector (e.g. flux=true) once it was opted in.
+	//
+	// Except the prune opt-out, which is set on the cluster Secret by whoever owns
+	// the ArgoCD namespace and has no upstream to be absent from. Sweeping it was
+	// how pinning a LIVE registration silently undid itself one reconcile later:
+	// exactly the case the feature is documented for. The demotion labels are
+	// deliberately still swept, because that is the self-heal on a reverted rename.
 	for k := range updated.Labels {
+		if k == r.pruneLabel() {
+			continue
+		}
 		if strings.HasPrefix(k, r.cfg.LabelPrefix) {
 			if _, keep := want.Labels[k]; !keep {
 				delete(updated.Labels, k)
@@ -1226,8 +1391,13 @@ func changed(existing, want *coreV1.Secret, labelPrefix string) bool {
 		}
 	}
 	// A label removed from the source must disappear here too, or a cluster could
-	// never be opted OUT of Flux once opted in.
+	// never be opted OUT of Flux once opted in. The prune opt-out is exempt for
+	// the same reason apply does not sweep it: it is set here, not upstream, so
+	// reading it as drift makes every pinned registration write on every pass.
 	for k := range existing.Labels {
+		if k == PruneLabel(labelPrefix) {
+			continue
+		}
 		if strings.HasPrefix(k, labelPrefix) {
 			if _, ok := want.Labels[k]; !ok {
 				return true
@@ -1294,11 +1464,18 @@ func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, 
 		}
 
 		if !exists {
-			if err := r.deleteOrphan(ctx, s, nsName); err != nil {
+			removed, err := r.deleteOrphan(ctx, s, nsName)
+			if err != nil {
 				errs = append(errs, err.Error())
 				continue
 			}
-			remaining--
+			// Only when it is genuinely gone. A UID conflict leaves the Secret in
+			// place on purpose, and counting it as removed retires the key: the
+			// source namespace no longer exists, so nothing can ever enqueue it
+			// again and the registration outlives its cluster until a restart.
+			if removed {
+				remaining--
+			}
 			continue
 		}
 
@@ -1321,10 +1498,21 @@ func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, 
 		}
 
 		if s.Labels[r.orphanedSecretTypeLabel()] != "" {
-			// Already demoted on an earlier pass. Nothing to do, and nothing
-			// worth repeating every reconcile.
-			r.log.Debug("superseded registration is already demoted",
-				slog.String("secret", s.Name), slog.String("supersededBy", applied))
+			// Demoted on an earlier pass. Kept until it outlives the TTL, if one is
+			// set. Below the applied == "" guard on purpose: a terminating namespace
+			// can still come back, which a demotion survives and a delete does not.
+			// No error return: every uncertain answer is "keep it", so there is
+			// nothing a caller could do differently.
+			if !r.demotedTTLExpired(s) {
+				r.log.Debug("superseded registration is already demoted",
+					slog.String("secret", s.Name), slog.String("supersededBy", applied))
+				continue
+			}
+			if err := r.deleteExpired(ctx, s); err != nil {
+				errs = append(errs, err.Error())
+				continue
+			}
+			remaining--
 			continue
 		}
 
@@ -1345,6 +1533,72 @@ func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, 
 		return remaining, fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
 	return remaining, nil
+}
+
+// demotedTTLExpired reports whether a demoted registration has outlived
+// Config.DemotedTTL.
+//
+// Every uncertain answer is "no", as with collectStaleUID's missing UID. Note
+// time.Parse returns the ZERO time on failure, so an ignored error here would
+// age every demoted registration by two millennia and delete the fleet.
+func (r *Registrar) demotedTTLExpired(s *coreV1.Secret) bool {
+	if r.cfg.DemotedTTL <= 0 {
+		return false
+	}
+	stamp := s.Labels[r.staleSinceLabel()]
+	if stamp == "" {
+		// Demoted before the label existed, or by hand.
+		r.log.Debug("demoted registration carries no stale-since stamp; it will not expire",
+			slog.String("secret", s.Name), slog.String("label", r.staleSinceLabel()))
+		return false
+	}
+	since, err := time.Parse(staleSinceFormat, stamp)
+	if err != nil {
+		// Warn: keeping it is safe, but indistinguishable from a broken TTL.
+		r.log.Warn("demoted registration has an unreadable stale-since stamp; it will not expire",
+			slog.String("secret", s.Name), slog.String("staleSince", stamp),
+			slog.Any("error", err))
+		return false
+	}
+	// A future stamp gives a negative age, so clock skew needs no special case.
+	return time.Since(since) > r.cfg.DemotedTTL
+}
+
+// deleteExpired removes a demoted registration that has outlived its TTL.
+//
+// Not deleteOrphan: different proof, so a different message, and stricter
+// preconditions. UID *and* resourceVersion, because the race here is a REVERTED
+// rename, and a revert goes through apply's read-modify-write, which preserves
+// the UID. Only the resourceVersion moves.
+func (r *Registrar) deleteExpired(ctx context.Context, s *coreV1.Secret) error {
+	if r.cfg.DryRun {
+		r.log.Info("[dry-run] would delete expired demoted cluster secret",
+			slog.String("secret", s.Name), slog.String("staleSince", s.Labels[r.staleSinceLabel()]))
+		return nil
+	}
+	rv := s.ResourceVersion
+	err := r.client.CoreV1().Secrets(r.cfg.TargetNamespace).Delete(ctx, s.Name, metaV1.DeleteOptions{
+		Preconditions: &metaV1.Preconditions{UID: &s.UID, ResourceVersion: &rv},
+	})
+	switch {
+	case err == nil:
+		r.log.Info("deleted a demoted registration that outlived its TTL",
+			slog.String("secret", s.Name), slog.String("cluster", s.Labels[r.clusterLabel()]),
+			slog.String("staleSince", s.Labels[r.staleSinceLabel()]),
+			slog.Duration("ttl", r.cfg.DemotedTTL))
+		return nil
+	case apiErrors.IsNotFound(err):
+		return nil
+	case apiErrors.IsConflict(err):
+		// Written between the read and the delete, most likely a reverted rename
+		// restoring it. Leave it; the next pass reads the new state and decides
+		// again.
+		r.log.Info("demoted registration changed before its TTL delete; leaving it",
+			slog.String("secret", s.Name))
+		return nil
+	default:
+		return fmt.Errorf("delete expired %s: %w", s.Name, err)
+	}
 }
 
 // collectStaleUID removes registrations whose recorded source namespace has been
@@ -1391,7 +1645,9 @@ func (r *Registrar) collectStaleUID(ctx context.Context, nsName string, uid type
 		r.log.Info("source namespace was replaced by a different one of the same name",
 			slog.String("secret", s.Name), slog.String("namespace", nsName),
 			slog.String("recordedUID", recorded), slog.String("currentUID", string(uid)))
-		if err := r.deleteOrphan(ctx, s, nsName); err != nil {
+		// The bool is genuinely unused here: collectStaleUID reports only errors,
+		// and nothing downstream counts what it removed.
+		if _, err := r.deleteOrphan(ctx, s, nsName); err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
@@ -1403,11 +1659,14 @@ func (r *Registrar) collectStaleUID(ctx context.Context, nsName string, uid type
 }
 
 // deleteOrphan removes a registration whose source namespace is provably gone.
-func (r *Registrar) deleteOrphan(ctx context.Context, s *coreV1.Secret, nsName string) error {
+// The bool reports whether the object is gone, which is NOT the same as "no error
+// occurred": a UID conflict is reported as success because it needs no retry, and
+// the caller must not count it as one fewer registration.
+func (r *Registrar) deleteOrphan(ctx context.Context, s *coreV1.Secret, nsName string) (bool, error) {
 	if r.cfg.DryRun {
 		r.log.Info("[dry-run] would delete orphaned cluster secret",
 			slog.String("secret", s.Name), slog.String("namespace", nsName))
-		return nil
+		return false, nil
 	}
 	// Preconditioned on the Secret's own UID. Under the poll loop the gap between
 	// the existence proof and this call was microseconds and single-threaded; under
@@ -1421,19 +1680,20 @@ func (r *Registrar) deleteOrphan(ctx context.Context, s *coreV1.Secret, nsName s
 	case err == nil:
 		r.log.Info("deregistered cluster (source namespace gone)",
 			slog.String("secret", s.Name), slog.String("namespace", nsName))
-		return nil
+		return true, nil
 	case apiErrors.IsNotFound(err):
-		return nil
+		// Already gone, by whatever hand.
+		return true, nil
 	case apiErrors.IsConflict(err):
 		// The Secret was replaced between the read and the delete, so it is no
 		// longer the object the proof was about. Leave it; the next reconcile sees
 		// the new one and decides again.
 		r.log.Info("cluster secret changed identity before deletion; leaving it",
 			slog.String("secret", s.Name), slog.String("namespace", nsName))
-		return nil
+		return false, nil
 	default:
 		// Keep going. One Secret held up by a finalizer or an admission webhook
 		// must not stall collection for the rest.
-		return fmt.Errorf("delete %s: %w", s.Name, err)
+		return false, fmt.Errorf("delete %s: %w", s.Name, err)
 	}
 }

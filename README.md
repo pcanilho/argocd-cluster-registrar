@@ -83,42 +83,34 @@ helm upgrade <release_name> --install \
 
 ### Values
 
+Everything is optional. A default install registers k3k clusters into `argocd`:
+
 ```yaml
-# Namespace ArgoCD reads cluster Secrets from. ArgoCD only looks in its own
-# namespace, so in practice this is always "argocd".
+# Provisioners to look for, in precedence order. Presets: k3k, vcluster, kamaji,
+# capi. Unset means k3k. See "Providers" below.
+providers:
+  - k3k
+  - capi
+
+# Namespace ArgoCD reads cluster Secrets from.
 targetNamespace: argocd
 
-# Prefix for the labels read off the source namespace and copied onto the cluster
-# Secret. Change it to match an existing labelling convention.
-labelPrefix: argocd-cluster-registrar/
-
-# Value of the `<labelPrefix>managed-by` label. It picks which namespaces to
-# watch, and which cluster Secrets this release owns. Give each instance its own.
+# Picks which namespaces to watch and which cluster Secrets this release owns.
+# Give each instance its own.
 managedBy: cluster-registrar
-
-# Provisioners to look for, in precedence order. Presets: k3k, vcluster, kamaji,
-# capi. Empty means the binary's own default, which is k3k. See "Providers" below.
-providers: []
-
-# How long before a settled cluster is looked at again. NOT how quickly a new one
-# is registered: that follows the namespace event. This bounds credential
-# freshness after a certificate rotation.
-interval: 60s
-
-# Log what would change without writing anything. Useful the first time you point
-# this at an existing cluster, to check the GC selector matches only what you expect.
-dryRun: false
-
-# Verbose logging.
-debug: false
 ```
 
-The binary also falls back to your own kubeconfig when it is not running in a
-cluster, so you can try it before installing anything:
+Every key is documented in the chart itself, which is the copy that cannot drift
+from the code:
 
 ```bash
-argocd-cluster-registrar --once --dry-run --debug
+helm show values oci://ghcr.io/pcanilho/charts/argocd-cluster-registrar
 ```
+
+The ones worth knowing about are `interval`, `demotedTTL`, `leaderElection`,
+`probes` and `metrics`; see [Operating](#operating). You can also try it against
+a live cluster before installing anything, with
+[`--once`](#running-it-without-installing-anything).
 
 ### Providers
 
@@ -164,16 +156,20 @@ The matched provider is recorded on the cluster `Secret` as
 
 #### Per-provider notes
 
-**Order matters.** The globs overlap on purpose: `capi`'s `*-kubeconfig` also
-matches k3k's `k3k-<cluster>-kubeconfig`. Correctness comes from the key, not the
-name, and where two providers could both claim a `Secret` the one declared first
-wins. Put the more specific provider first. `capi` is the loosest shipped.
+**Order matters,** for providers and for keys. The globs overlap on purpose:
+`capi`'s `*-kubeconfig` also matches k3k's `k3k-<cluster>-kubeconfig`. Correctness
+comes from the key, not the name, and where two providers could both claim a
+`Secret` the one declared first wins. Put the more specific provider first. `capi`
+is the loosest shipped. Within one `Secret`, every declared key that is present is
+tried in turn and the first that parses wins, so an unusable key falls through to
+the next instead of stranding the namespace.
 
-**Kamaji** normally writes both `admin.conf` and `admin.svc`. Only the first key
-present is tried, so `admin.conf` wins; reorder them in a custom entry if you need
-the other. Running Kamaji through its Cluster API control-plane provider produces
-a second, CAPI-shaped `Secret` for the same cluster, so with both presets enabled
-the one declared first decides which is used.
+**Kamaji** normally writes both `admin.conf` and `admin.svc`, and both normally
+parse, so `admin.conf` wins on order and `admin.svc` is reached only when the
+first is unusable. Declare `admin.svc` first in a custom entry to prefer the
+service address. Running Kamaji through its Cluster API control-plane provider
+produces a second, CAPI-shaped `Secret` for the same cluster, so with both presets
+enabled the one declared first decides which is used.
 
 **`capi`** is the mandatory control-plane contract, so it covers any CAPI cluster
 whatever the infrastructure provider, plus standalone k0smotron. It does **not**
@@ -292,6 +288,7 @@ stateDiagram-v2
     Pinned --> Registered: label removed
     Registered --> [*]: source namespace deleted<br/>cluster Secret removed
     Demoted --> [*]: source namespace deleted
+    Demoted --> [*]: demotedTTL elapsed (opt-in)
 ```
 
 Cluster `Secret`s that carry the ownership label but whose source namespace has
@@ -309,14 +306,21 @@ so a mistaken rename costs nothing. It also keeps the old cluster name reserved,
 which is what makes that revert possible; delete it if a different namespace
 should take that name.
 
+Demoted registrations otherwise accumulate until their namespace is deleted. Set
+`demotedTTL` to expire them, which also frees the name they hold. It is `0s`
+(never) by default, since the TTL is equally a deadline on reverting a rename.
+Expiry only reaches a namespace that is alive and registered under another name,
+never one that is terminating or undiscoverable, and never sooner than
+`interval`. `prune: disabled` exempts a registration from this too.
+
 RBAC is split by scope. Reads are cluster-wide (`namespaces` get/list/watch,
 `secrets` **list only**) because discovery is label-driven and the sources sit in
 one namespace per child. Every **write** is a namespaced `Role` bound to
 `targetNamespace` alone, since that is the only place this ever creates, updates
 or deletes anything. Granting `secrets` write across the whole cluster would be a
 privilege-escalation path in exchange for nothing. Note `watch` is granted on
-namespaces only: see Architecture below for why the kubeconfig `Secret`s are read
-rather than watched.
+namespaces only; [docs/architecture.md](docs/architecture.md) covers why the
+kubeconfig `Secret`s are read rather than watched.
 
 ## Operating
 
@@ -326,9 +330,25 @@ A controller, so: `/healthz` and `/readyz` on `:8081` by default, tunable under
 `probes`. Readiness means the manager is running, not that this replica holds the
 lease, so a standby stays Ready.
 
-Metrics are **not** served. Enabling them would mean either an unauthenticated
-port or pulling in the API server authn/authz stack, and there is nothing here
-worth either yet.
+Metrics are off by default, under `metrics`, and **unauthenticated** when on, so
+put a NetworkPolicy in front of the port. Four series, all counts of this
+instance's own decisions:
+
+| Metric | |
+|---|---|
+| `..._conflicts_total{reason}` | registrations refused, and why |
+| `..._adoptions_total` | orphaned `Secret`s adopted by a matching namespace |
+| `..._registrations{state}` | registrations owned, `active` or `demoted` |
+| `..._unrouted_secrets` | owned `Secret`s no reconcile key can reach |
+
+Aggregate the two gauges across replicas (`sum by`, `max by`). They are set only
+by the reconcile that audits, so a leader-election standby serves them as zero for
+as long as it stands by, and a bare threshold or an `avg` quietly stops firing.
+
+`conflicts_total{reason="incumbent"}` is the one worth alerting on: a contested
+name stays contested until someone resolves it. *Which* cluster is in the log
+line, not the labels, so a tenant cannot mint series by naming a namespace.
+`metrics.service.enabled` adds a `Service`; no `ServiceMonitor` ships.
 
 `leaderElection` is off by default and needs `leases` and `events` in
 `targetNamespace`. The lease is named for `labelPrefix` and `managedBy`, not for
@@ -354,28 +374,6 @@ anything. It is the quickest way to see what this would do to an existing
 cluster, and the easiest way to reproduce a decision the running controller made
 without disturbing it. `--dry-run` also disables leader election, so a pre-flight
 check can never take the running instance offline.
-
-### Architecture
-
-Two decisions here are deliberate and look like oversights.
-
-**Only namespaces are watched.** Not the provisioner-written kubeconfig
-`Secret`s, even though watching them would spot a credential rotation sooner.
-k3k regenerates the child's keypair on *every one of its own reconciles*, so
-that `Secret` changes far more often than the credential meaningfully does. The
-interval is what keeps that from becoming a write per k3k reconcile against a
-credential-bearing `Secret` in the ArgoCD namespace, each of which invalidates
-ArgoCD's own cluster cache. Such a watch could not be narrowed either: the
-provisioner owns that `Secret`, so it carries none of our labels, which is the
-same reason discovery is driven by the namespace in the first place.
-
-**Nothing is read through the controller's cache.** Every read goes direct. The
-namespace existence proof in particular must not be cached, because a
-label-filtered cache reports an object that stops matching the selector as a
-deletion -- so a cached `NotFound` cannot tell a deleted namespace from one that
-merely lost a label, and deregistering on the second would be catastrophic. The
-cache is configured to error rather than silently start an informer for anything
-unexpected, and no `Secret` is ever held in it.
 
 ### Who is allowed to set these labels
 

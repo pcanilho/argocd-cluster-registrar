@@ -25,6 +25,12 @@ managedBy: cluster-registrar
 # patterns legitimately overlap: `capi` matches `*-kubeconfig`, which includes
 # k3k's Secret. Correctness comes from the key, not the name.
 #
+# `secretKeys` is ordered too. Every declared key present on a Secret is tried in
+# turn and the first that parses wins, so a half-written or otherwise unusable key
+# falls through to the next rather than stranding the namespace. Put the key you
+# prefer first: Kamaji's `admin.conf` and `admin.svc` both normally parse, so the
+# declared order is what decides between them.
+#
 # Built-in presets: k3k, vcluster, kamaji, capi. A custom shape can be spelled
 # out in full instead:
 #
@@ -69,6 +75,16 @@ secretKey: ""
 # ArgoCD is holding the old one. Lowering it no longer speeds anything else up.
 interval: 60s
 
+# Delete a demoted registration once it has been superseded this long. 0 keeps
+# it indefinitely, which is the behaviour before 0.5.0.
+#
+# A rename hides the old registration from ArgoCD rather than deleting it, so
+# reverting the rename restores it. The debris accumulates until its namespace
+# is deleted; this bounds that, at the cost of bounding how long a revert works.
+# Expiry only happens while the source namespace is alive and registered under
+# another name, and no sooner than `interval`.
+demotedTTL: 0s
+
 # Log intended changes without writing. Worth using when first pointing this at
 # an existing cluster, to confirm the GC selector matches only what you expect.
 dryRun: false
@@ -89,6 +105,8 @@ leaderElection:
 # replica is the leader, so a standby stays Ready.
 probes:
   enabled: true
+  # ":PORT" only. The container port is derived from this by stripping the colon,
+  # so "0.0.0.0:8081" would render containerPort 0. The chart rejects anything else.
   bindAddress: ":8081"
   liveness:
     initialDelaySeconds: 15
@@ -96,6 +114,30 @@ probes:
   readiness:
     initialDelaySeconds: 5
     periodSeconds: 10
+
+# Prometheus metrics. Four series, all counts of this instance's own decisions:
+# registrations refused and why, orphans adopted, registrations owned by state,
+# and owned Secrets that no reconcile key can reach.
+#
+# OFF by default, and served UNAUTHENTICATED when on. Protecting the endpoint
+# means controller-runtime's authn/authz filter, which pulls in k8s.io/apiserver
+# and needs `tokenreviews`/`subjectaccessreviews` RBAC. Nothing published here
+# carries a cluster name, a namespace or any credential, so a NetworkPolicy is
+# the proportionate control. Which cluster is contested stays in the logs, where
+# it does not become unbounded monitoring cardinality anyone able to label a
+# namespace could mint.
+#
+# No ServiceMonitor ships. It needs a CRD that `helm template` cannot check for,
+# so it could not be proven correct in CI. Point your scrape config at the
+# Service, or add a ServiceMonitor of your own.
+metrics:
+  enabled: false
+  # ":PORT" only, as with probes.bindAddress above.
+  bindAddress: ":8080"
+  service:
+    enabled: false
+    port: 8080
+    annotations: {}
 
 # One is the right number. There is no work to parallelise and no HA requirement;
 # a brief outage of this controller costs nothing, since it converges on restart.

@@ -30,6 +30,18 @@ const (
 	testSourceNS = "k3k-src"
 	// keyConfig is the ArgoCD cluster Secret's credential key.
 	keyConfig = "config"
+	// testServer is a placeholder endpoint for cases where the address itself is
+	// not what is being asserted.
+	testServer = "https://x"
+	// resourceSecrets names the resource in fake-clientset reactors.
+	resourceSecrets = "secrets"
+	// testHour spaces fixture namespaces apart when age decides a contested name.
+	testHour = time.Hour
+
+	// Kamaji's two kubeconfig keys. Named because the multi-key tests repeat them
+	// and because which of the two wins is itself the assertion.
+	keyAdminConf = "admin.conf"
+	keyAdminSvc  = "admin.svc"
 	// testNS is the source namespace most fixtures use.
 	testNS = "k3k-a"
 	// k3kServer is the endpoint inside the k3k kubeconfig fixture.
@@ -108,7 +120,7 @@ func registeredSecret(cluster, srcNS string) *coreV1.Secret {
 				SourceNamespaceLabel(testPrefix): srcNS,
 			},
 		},
-		Data: map[string][]byte{"name": []byte(cluster), "server": []byte("https://x"), "config": []byte("{}")},
+		Data: map[string][]byte{"name": []byte(cluster), "server": []byte(testServer), "config": []byte("{}")},
 	}
 }
 
@@ -151,7 +163,7 @@ func TestTransientSecretListErrorDoesNotDeregisterAnything(t *testing.T) {
 		managedNS(testNS, "a"), kubeconfigSecret(testNS, "k3k-a-kubeconfig"), registeredSecret("a", testNS),
 		managedNS("k3k-b", "b"), kubeconfigSecret("k3k-b", "k3k-b-kubeconfig"), registeredSecret("b", "k3k-b"),
 	)
-	c.PrependReactor("list", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+	c.PrependReactor("list", resourceSecrets, func(action k8stesting.Action) (bool, runtime.Object, error) {
 		if action.GetNamespace() != testTargetNS {
 			return true, nil, apiErrors.NewInternalError(io.ErrUnexpectedEOF)
 		}
@@ -217,9 +229,9 @@ func TestCollectNeverTouchesUnlabelledSecrets(t *testing.T) {
 // One undeletable Secret must not stall GC for every other cluster.
 func TestCollectContinuesPastDeleteErrors(t *testing.T) {
 	r, c := newTestRegistrar(registeredSecret("a", testNS), registeredSecret("b", "k3k-b"))
-	c.PrependReactor("delete", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+	c.PrependReactor("delete", resourceSecrets, func(action k8stesting.Action) (bool, runtime.Object, error) {
 		if action.(k8stesting.DeleteAction).GetName() == "cluster-a" {
-			return true, nil, apiErrors.NewForbidden(schema.GroupResource{Resource: "secrets"}, "cluster-a", io.ErrUnexpectedEOF)
+			return true, nil, apiErrors.NewForbidden(schema.GroupResource{Resource: resourceSecrets}, "cluster-a", io.ErrUnexpectedEOF)
 		}
 		return false, nil, nil
 	})
@@ -310,7 +322,7 @@ func secretWith(ns, name, key, body string) *coreV1.Secret {
 func TestMultipleProvidersRegisterSideBySide(t *testing.T) {
 	r, c := newTestRegistrar(
 		managedNS(testNS, "a"), kubeconfigSecret(testNS, "k3k-a-kubeconfig"),
-		managedNS("tenant-b", "b"), secretWith("tenant-b", "b-admin-kubeconfig", "admin.conf", kamajiKubeconfig),
+		managedNS("tenant-b", "b"), secretWith("tenant-b", "b-admin-kubeconfig", keyAdminConf, kamajiKubeconfig),
 	)
 	r.cfg.Providers = mustPresets(t, "k3k", "kamaji")
 
@@ -355,10 +367,15 @@ func TestGarbageCollectionIsPerClusterAcrossProviders(t *testing.T) {
 // Secrets for one physical cluster: Kamaji's own `<tcp>-admin-kubeconfig`, and a
 // CAPI-shaped `<cluster>-kubeconfig` copied from it. With both presets enabled
 // they both match, and registering each would put one cluster into ArgoCD twice.
+//
+// What this pins is PROVIDER PRECEDENCE. Read it as a guard on the candidate
+// count and you will overrate it: capi's `value` key is absent from the Kamaji
+// Secret, so no change to how keys become candidates can make it fail. The
+// per-Secret `claimed` rule is what it actually holds in place.
 func TestKamajiViaCAPIRegistersOnce(t *testing.T) {
 	r, c := newTestRegistrar(
 		managedNS("tenant-b", "b"),
-		secretWith("tenant-b", "b-admin-kubeconfig", "admin.conf", kamajiKubeconfig),
+		secretWith("tenant-b", "b-admin-kubeconfig", keyAdminConf, kamajiKubeconfig),
 		secretWith("tenant-b", "b-kubeconfig", "value", capiKubeconfig),
 	)
 	r.cfg.Providers = mustPresets(t, "kamaji", "capi")
@@ -529,7 +546,7 @@ func TestApplyAdoptsSecretWithMatchingClusterLabel(t *testing.T) {
 
 	if err := r.apply(context.Background(), child{
 		cluster: "a", namespace: testSourceNS, namespaceUID: "uid-k3k-a",
-		server: "https://x", config: "{}",
+		server: testServer, config: "{}",
 	}); err != nil {
 		t.Fatalf("apply refused to adopt its own registration: %v", err)
 	}
@@ -654,14 +671,14 @@ func TestConflictedLoserDoesNotStrandTheWinnersSecret(t *testing.T) {
 // worker reconciles at a time.
 func TestCreateRaceReturnsConflict(t *testing.T) {
 	r, c := newTestRegistrar(managedNS(testSourceNS, "a"), kubeconfigSecret(testSourceNS, "k3k-a-kubeconfig"))
-	c.PrependReactor("create", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+	c.PrependReactor("create", resourceSecrets, func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, apiErrors.NewAlreadyExists(
-			schema.GroupResource{Resource: "secrets"}, "cluster-a")
+			schema.GroupResource{Resource: resourceSecrets}, "cluster-a")
 	})
 
 	err := r.apply(context.Background(), child{
 		cluster: "a", namespace: testSourceNS, namespaceUID: "uid-k3k-a",
-		server: "https://x", config: "{}",
+		server: testServer, config: "{}",
 	})
 	var conflict *conflictError
 	if !errors.As(err, &conflict) {
@@ -708,9 +725,9 @@ func TestReconcileReturnsNilOnConflictButErrorsOnRealFailure(t *testing.T) {
 	}
 
 	r, c := newFixture()
-	c.PrependReactor("create", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+	c.PrependReactor("create", resourceSecrets, func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, apiErrors.NewForbidden(
-			schema.GroupResource{Resource: "secrets"}, "cluster-b", io.ErrUnexpectedEOF)
+			schema.GroupResource{Resource: resourceSecrets}, "cluster-b", io.ErrUnexpectedEOF)
 	})
 	if err := r.Reconcile(context.Background()); err == nil {
 		t.Error("a forbidden write was not reported")
@@ -842,7 +859,7 @@ func TestDemotionIsNotRepeated(t *testing.T) {
 	}
 	first := getSecret(t, c, "cluster-a").Labels[StaleSinceLabel(testPrefix)]
 
-	c.PrependReactor("update", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+	c.PrependReactor("update", resourceSecrets, func(action k8stesting.Action) (bool, runtime.Object, error) {
 		if action.(k8stesting.UpdateAction).GetObject().(*coreV1.Secret).Name == "cluster-a" {
 			t.Error("cluster-a was demoted a second time")
 		}
@@ -943,7 +960,7 @@ func TestOrphanDeleteIsPreconditionedOnTheSecretUID(t *testing.T) {
 	r, c := newTestRegistrar(orphan)
 	var gotUID types.UID
 	var sawDelete bool
-	c.PrependReactor("delete", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+	c.PrependReactor("delete", resourceSecrets, func(action k8stesting.Action) (bool, runtime.Object, error) {
 		sawDelete = true
 		if pre := action.(k8stesting.DeleteActionImpl).DeleteOptions.Preconditions; pre != nil && pre.UID != nil {
 			gotUID = *pre.UID
@@ -1126,6 +1143,18 @@ func TestConfigValidate(t *testing.T) {
 			c.Providers[0].Name = strings.Repeat("a", 64)
 		},
 		"prefix without slash": func(c *Config) { c.LabelPrefix = "example.com" },
+		// Under this prefix a source namespace could propagate
+		// argocd.argoproj.io/secret-type, which is not a reserved suffix, and the
+		// propagated labels are copied last so it would win.
+		// Not "use the default": with no prefix, propagatedLabels matches every
+		// label and the reserved list matches none of the keys actually written.
+		"empty prefix": func(c *Config) { c.LabelPrefix = "" },
+		"prefix that ArgoCD's own key falls under": func(c *Config) {
+			c.LabelPrefix = "argocd.argoproj.io/"
+		},
+		// Negative would expire every demoted registration on sight, since
+		// time.Since is always greater than a negative duration.
+		"negative demoted TTL": func(c *Config) { c.DemotedTTL = -time.Second },
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := testConfig()
@@ -1149,5 +1178,250 @@ func TestDiscoverSkipsInvalidClusterNames(t *testing.T) {
 	)
 	if _, ok := discoverNS(t, r, "k3k-bad"); ok {
 		t.Error("expected the invalid cluster name to be skipped")
+	}
+}
+
+// secretWithKeys builds a Secret carrying several keys at once, which is the
+// shape Kamaji actually writes and which no fixture covered before.
+func secretWithKeys(ns, name string, kv map[string]string) *coreV1.Secret {
+	data := make(map[string][]byte, len(kv))
+	for k, v := range kv {
+		data[k] = []byte(v)
+	}
+	return &coreV1.Secret{
+		ObjectMeta: metaV1.ObjectMeta{Name: name, Namespace: ns},
+		Data:       data,
+	}
+}
+
+// Every key a provider declares that is actually present becomes its own
+// candidate, in declared order.
+//
+// Stopping at the first present key made Provider.SecretKeys' "tried in order"
+// a claim the code did not honour: with both Kamaji keys present there was only
+// ever one candidate, so the second could not be reached however broken the
+// first was.
+func TestOneSecretYieldsOneCandidatePerPresentKey(t *testing.T) {
+	r, _ := newTestRegistrar(
+		managedNS("tenant-c", "c"),
+		secretWithKeys("tenant-c", "c-admin-kubeconfig", map[string]string{
+			keyAdminConf: kamajiKubeconfig,
+			keyAdminSvc:  kamajiSvcKubeconfig,
+		}),
+	)
+	r.cfg.Providers = mustPresets(t, "kamaji")
+
+	got, err := r.findKubeconfigCandidates(context.Background(), "tenant-c")
+	if err != nil {
+		t.Fatalf("find candidates: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d candidates, want one per present key", len(got))
+	}
+	// Declared order, not map order: Secret.Data is a map, so iterating it rather
+	// than SecretKeys would pass or fail at random.
+	if got[0].key != keyAdminConf || got[1].key != keyAdminSvc {
+		t.Errorf("keys = %q then %q, want admin.conf then admin.svc (the declared order)",
+			got[0].key, got[1].key)
+	}
+	if got[0].secret != got[1].secret {
+		t.Error("the two candidates should share one Secret, not copy it")
+	}
+}
+
+// An unusable first key must fall through to the next, exactly as an unusable
+// first Secret already does.
+//
+// This is the bug B1 names: Kamaji writes admin.conf and admin.svc together, so
+// a half-written admin.conf left the namespace unregistered indefinitely even
+// though a perfectly good kubeconfig sat beside it.
+func TestEveryPresentKeyOnOneSecretIsTriedInOrder(t *testing.T) {
+	r, _ := newTestRegistrar(
+		managedNS("tenant-d", "d"),
+		secretWithKeys("tenant-d", "d-admin-kubeconfig", map[string]string{
+			keyAdminConf: "<html>not a kubeconfig</html>",
+			keyAdminSvc:  kamajiSvcKubeconfig,
+		}),
+	)
+	r.cfg.Providers = mustPresets(t, "kamaji")
+
+	ch, ok := discoverNS(t, r, "tenant-d")
+	if !ok {
+		t.Fatal("a usable admin.svc beside a broken admin.conf produced no registration")
+	}
+	// The exact address, not merely "no error": asserting the fallthrough reached
+	// the SECOND key is the whole point, and the two fixtures differ only here.
+	if ch.server != "https://tenant-00.kamaji.svc:6443" {
+		t.Errorf("server = %q, want admin.svc's address", ch.server)
+	}
+}
+
+// Several candidates, still one registration.
+//
+// Candidate count and registration count are different things: discoverOne stops
+// at the first candidate that parses. Both keys are valid here and point at
+// DIFFERENT servers, so a bug that kept going would be visible as the wrong
+// address rather than as a second Secret.
+func TestTwoKeysOnOneSecretStillRegisterOneCluster(t *testing.T) {
+	r, c := newTestRegistrar(
+		managedNS("tenant-e", "e"),
+		secretWithKeys("tenant-e", "e-admin-kubeconfig", map[string]string{
+			keyAdminConf: kamajiKubeconfig,
+			keyAdminSvc:  kamajiSvcKubeconfig,
+		}),
+	)
+	r.cfg.Providers = mustPresets(t, "kamaji")
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	list, err := c.CoreV1().Secrets(testTargetNS).List(context.Background(), metaV1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list.Items) != 1 {
+		t.Fatalf("two keys on one Secret produced %d registrations, want 1", len(list.Items))
+	}
+	// secretValue, not Data: the fake does not merge StringData the way a real
+	// apiserver does, so a freshly CREATED Secret reads empty out of Data alone.
+	if got := secretValue(&list.Items[0], "server"); got != "https://192.168.1.195:6443" {
+		t.Errorf("server = %q, want admin.conf's address; the first key that parses wins", got)
+	}
+}
+
+// A repeated key is a typo in a values file. Every present key is now its own
+// candidate, so a duplicate would parse the same bytes twice and report the same
+// failure twice while the operator learned nothing.
+func TestDuplicateSecretKeysInOneProviderAreRejected(t *testing.T) {
+	cfg := testConfig()
+	cfg.Providers = []Provider{{
+		Name:              "mytool",
+		SecretNamePattern: "mytool-*",
+		SecretKeys:        []string{keyAdminConf, keyAdminSvc, keyAdminConf},
+	}}
+	if err := cfg.Validate(); err == nil {
+		t.Error("a duplicated secret key was accepted")
+	}
+}
+
+// Every way a claim can be refused carries its own reason.
+//
+// The reason is the conflict metric's only label, so a site tagged with the wrong
+// constant is a monitoring bug that no other test can see: the refusal still
+// happens, the Secret is still protected, and only the counter lies. Deriving it
+// from the message text instead would make a reworded sentence a silent
+// regression, which is why it travels on the error.
+func TestEveryRefusalCarriesItsOwnReason(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		want  string
+		build func(t *testing.T) (*Registrar, child)
+	}{
+		{
+			name: "a Secret we do not own at all",
+			want: conflictNotManaged,
+			build: func(*testing.T) (*Registrar, child) {
+				hand := &coreV1.Secret{ObjectMeta: metaV1.ObjectMeta{
+					Name:      "cluster-prod",
+					Namespace: testTargetNS,
+					Labels:    map[string]string{argoSecretTypeLabel: argoSecretTypeValue},
+				}}
+				r, _ := newTestRegistrar(hand)
+				return r, child{cluster: "prod", namespace: "tenant-evil", server: testServer, config: "{}"}
+			},
+		},
+		{
+			name: "an orphan naming a different cluster",
+			want: conflictOrphanClusterMismatch,
+			build: func(*testing.T) (*Registrar, child) {
+				existing := registeredSecret("a", testSourceNS)
+				delete(existing.Labels, SourceNamespaceLabel(testPrefix))
+				existing.Labels[ClusterLabel(testPrefix)] = "somethingelse"
+				r, _ := newTestRegistrar(existing)
+				return r, child{cluster: "a", namespace: testSourceNS, server: testServer, config: "{}"}
+			},
+		},
+		{
+			name: "a name another live namespace holds",
+			want: conflictIncumbent,
+			build: func(*testing.T) (*Registrar, child) {
+				r, _ := newTestRegistrar(registeredSecret("a", "k3k-incumbent"))
+				return r, child{cluster: "a", namespace: "k3k-challenger", server: testServer, config: "{}"}
+			},
+		},
+		{
+			name: "an unclaimed name an older namespace also wants",
+			want: conflictContestedName,
+			build: func(t *testing.T) (*Registrar, child) {
+				// No Secret exists, deliberately: with one present this would take
+				// the incumbency branch instead and pass under the wrong reason.
+				r, c := newTestRegistrar(
+					managedNSAt("k3k-older", "a", 2*time.Hour),
+					managedNSAt("k3k-younger", "a", time.Hour),
+				)
+				if secretExists(t, c, "cluster-a") {
+					t.Fatal("this case must reach the create path, not the incumbency check")
+				}
+				return r, child{cluster: "a", namespace: "k3k-younger", server: testServer, config: "{}"}
+			},
+		},
+		{
+			name: "two workers creating the same Secret at once",
+			want: conflictCreateRace,
+			build: func(*testing.T) (*Registrar, child) {
+				r, c := newTestRegistrar(managedNS(testSourceNS, "a"))
+				c.PrependReactor("create", resourceSecrets, func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apiErrors.NewAlreadyExists(
+						schema.GroupResource{Resource: resourceSecrets}, "cluster-a")
+				})
+				return r, child{cluster: "a", namespace: testSourceNS, server: testServer, config: "{}"}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, c := tc.build(t)
+			err := r.apply(context.Background(), c)
+			var conflict *conflictError
+			if !errors.As(err, &conflict) {
+				t.Fatalf("apply returned %v, want a conflictError", err)
+			}
+			if conflict.reason != tc.want {
+				t.Errorf("reason = %q, want %q; the conflict metric would count this "+
+					"refusal under the wrong label", conflict.reason, tc.want)
+			}
+		})
+	}
+}
+
+// The binary and the chart must derive the same lease name.
+//
+// The chart computes it in _helpers.tpl. If they disagree, an instance deployed
+// from a plain manifest and one deployed by Helm with identical labelPrefix and
+// managedBy contend for the same cluster Secrets while holding different leases,
+// and both reconcile: exactly what leader election is for. The literal below is
+// what `helm template --set leaderElection.enabled=true` renders for the chart's
+// default values, so changing either side alone fails here.
+func TestLeaderElectionIDMatchesTheChart(t *testing.T) {
+	const fromChart = "acr-991221237547448b"
+	if got := LeaderElectionID(DefaultLabelPrefix, "cluster-registrar"); got != fromChart {
+		t.Errorf("LeaderElectionID = %q, chart renders %q", got, fromChart)
+	}
+}
+
+// Two installs that would contend for the same Secrets must contend for the same
+// lease, and two that never meet must not.
+func TestLeaderElectionIDSerialisesExactlyTheCollidingInstalls(t *testing.T) {
+	base := LeaderElectionID(DefaultLabelPrefix, "cluster-registrar")
+	if got := LeaderElectionID(DefaultLabelPrefix, "cluster-registrar"); got != base {
+		t.Error("identical configuration produced different leases")
+	}
+	if got := LeaderElectionID(DefaultLabelPrefix, "other"); got == base {
+		t.Error("a different managed-by shares a lease; installs that never meet are serialised")
+	}
+	if got := LeaderElectionID("example.com/", "cluster-registrar"); got == base {
+		t.Error("a different label-prefix shares a lease")
+	}
+	if errs := validation.IsDNS1123Subdomain(base); len(errs) > 0 {
+		t.Errorf("%q is not a valid object name: %s", base, strings.Join(errs, "; "))
 	}
 }

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -178,5 +179,156 @@ func TestResolvedProvidersPassValidation(t *testing.T) {
 		if err := cfg.Validate(); err != nil {
 			t.Errorf("%v produced a config that fails validation: %v", args, err)
 		}
+	}
+}
+
+// Every flag must reach the option it configures.
+//
+// The two struct literals in buildOptions are hand-written, so a field left off
+// leaves the option at its zero value and nothing complains. That is not a
+// theoretical worry: leaving LeaderElection unset merely disables a feature,
+// while leaving a bind address unset hands controller-runtime an empty string,
+// which it reads as "serve on the default port" rather than as "off".
+//
+// Each flag is parsed ALONE. Setting several at once would hide the one
+// interaction that exists (--dry-run de-escalating --leader-elect), and a case
+// asserting `LeaderElection == true` would then fail for a reason that has
+// nothing to do with wiring.
+//
+// The `want != base` assertion is what stops this passing vacuously: with
+// --target-namespace=argocd, a field that is never assigned still reads "argocd"
+// and the test would prove nothing.
+func TestEveryFlagReachesTheOptionItConfigures(t *testing.T) {
+	base, err := buildOptions(parseFlags(t))
+	if err != nil {
+		t.Fatalf("defaults do not build: %v", err)
+	}
+
+	for _, tc := range []struct {
+		arg  string
+		want string
+		got  func(options) string
+	}{
+		{"--interval=90s", "1m30s",
+			func(o options) string { return o.ctrl.Interval.String() }},
+		{"--health-probe-bind-address=:9", ":9",
+			func(o options) string { return o.ctrl.HealthProbeBindAddress }},
+		{"--metrics-bind-address=:9090", ":9090",
+			func(o options) string { return o.ctrl.MetricsBindAddress }},
+		{"--leader-election-id=some-other-lease", "some-other-lease",
+			func(o options) string { return o.ctrl.LeaderElectionID }},
+		{"--leader-elect", "true",
+			func(o options) string { return fmt.Sprint(o.ctrl.LeaderElection) }},
+		{"--target-namespace=somewhere-else", "somewhere-else",
+			func(o options) string { return o.cfg.TargetNamespace }},
+		{"--managed-by=some-other-value", "some-other-value",
+			func(o options) string { return o.cfg.ManagedByValue }},
+		{"--label-prefix=example.com/", "example.com/",
+			func(o options) string { return o.cfg.LabelPrefix }},
+		{"--dry-run", "true",
+			func(o options) string { return fmt.Sprint(o.cfg.DryRun) }},
+	} {
+		t.Run(tc.arg, func(t *testing.T) {
+			if d := tc.got(base); d == tc.want {
+				t.Fatalf("the test value %q equals the flag's default, so this case "+
+					"would pass even if the field were never assigned", tc.want)
+			}
+			opts, err := buildOptions(parseFlags(t, tc.arg))
+			if err != nil {
+				t.Fatalf("buildOptions: %v", err)
+			}
+			if got := tc.got(opts); got != tc.want {
+				t.Errorf("%s produced %q, want %q; the flag does not reach its option",
+					tc.arg, got, tc.want)
+			}
+		})
+	}
+}
+
+// --dry-run must stand a --leader-elect down, and must not write that decision
+// back into the flag variable.
+//
+// The flags bind to package-level variables. Assigning to one from inside the
+// run path used to leave it mutated for the rest of the process, which in a test
+// binary means every later case inherits it.
+func TestDryRunDeEscalatesLeaderElectionWithoutMutatingTheFlag(t *testing.T) {
+	opts, err := buildOptions(parseFlags(t, "--dry-run", "--leader-elect"))
+	if err != nil {
+		t.Fatalf("buildOptions: %v", err)
+	}
+	if opts.ctrl.LeaderElection {
+		t.Error("a --dry-run process would hold the lease while the real registrar waited")
+	}
+	if !leaderElect {
+		t.Error("the --leader-elect flag variable was mutated; that state leaks into " +
+			"every later caller in the process")
+	}
+	if len(opts.warnings) != 1 || !strings.Contains(opts.warnings[0], "leader election") {
+		t.Errorf("warnings = %q, want one mentioning leader election", opts.warnings)
+	}
+}
+
+// A zero or negative interval means RequeueAfter: 0, which controller-runtime
+// reads as "never come back". Rejecting it is the difference between a loud
+// startup failure and registrations that silently stop refreshing.
+func TestANonPositiveIntervalIsRejected(t *testing.T) {
+	for _, arg := range []string{"--interval=0s", "--interval=-1s"} {
+		if _, err := buildOptions(parseFlags(t, arg)); err == nil {
+			t.Errorf("%s was accepted; every registration would be reconciled once "+
+				"and then never refreshed", arg)
+		}
+	}
+}
+
+// Metrics stay off unless asked for, and "off" is the string "0".
+//
+// Not the empty string: controller-runtime reads an empty bind address as
+// ":8080" rather than as "off", so defaulting to empty here would open an
+// unauthenticated port on every install that never mentioned metrics. The
+// manager normalises empty to "0" as well; both are wanted, because either
+// alone can be undone by a plausible edit to the other.
+func TestMetricsAreOffUnlessAskedFor(t *testing.T) {
+	opts, err := buildOptions(parseFlags(t))
+	if err != nil {
+		t.Fatalf("buildOptions: %v", err)
+	}
+	if opts.ctrl.MetricsBindAddress != "0" {
+		t.Errorf("default metrics bind address = %q, want \"0\"; an empty value "+
+			"serves :8080 unauthenticated", opts.ctrl.MetricsBindAddress)
+	}
+}
+
+// An unset --leader-election-id must derive the same lease the chart does.
+//
+// The binary used to default it to a constant while the chart derived it from
+// labelPrefix and managedBy. So an instance deployed from a plain manifest and a
+// chart-deployed one with identical configuration, contending for the same
+// cluster Secrets, held different leases and both reconciled: precisely the state
+// leader election exists to prevent, reached by not using the chart.
+func TestAnUnsetLeaseNameIsDerivedNotConstant(t *testing.T) {
+	opts, err := buildOptions(parseFlags(t))
+	if err != nil {
+		t.Fatalf("buildOptions: %v", err)
+	}
+	want := registrar.LeaderElectionID(registrar.DefaultLabelPrefix, "cluster-registrar")
+	if opts.ctrl.LeaderElectionID != want {
+		t.Errorf("lease = %q, want %q", opts.ctrl.LeaderElectionID, want)
+	}
+
+	// ...and it must follow the values it is derived from, or two installs that
+	// never meet are serialised against each other.
+	other, err := buildOptions(parseFlags(t, "--managed-by=something-else"))
+	if err != nil {
+		t.Fatalf("buildOptions: %v", err)
+	}
+	if other.ctrl.LeaderElectionID == opts.ctrl.LeaderElectionID {
+		t.Error("changing --managed-by did not change the derived lease")
+	}
+}
+
+// An explicit empty value is a mistake, not a request to derive.
+func TestAnExplicitlyEmptyLeaseNameIsRejected(t *testing.T) {
+	if _, err := buildOptions(parseFlags(t, "--leader-election-id=")); err == nil {
+		t.Error("an empty lease name was accepted; the manager would fail to start")
 	}
 }

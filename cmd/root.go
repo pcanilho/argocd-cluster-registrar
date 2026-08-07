@@ -37,10 +37,12 @@ var (
 	secretNamePattern string
 	secretKey         string
 	labelPrefix       string
+	demotedTTL        time.Duration
 
 	leaderElect            bool
 	leaderElectionID       string
 	healthProbeBindAddress string
+	metricsBindAddress     string
 )
 
 // resolveProviders turns the flags into the provider list, honouring the
@@ -85,6 +87,104 @@ func resolveProviders(cmd *cobra.Command) ([]registrar.Provider, error) {
 	return []registrar.Provider{p}, nil
 }
 
+// options is everything the flags decide, separated from the act of using them.
+//
+// Extracted because the two struct literals below are hand-written: a field left
+// off leaves the option at its zero value, and not every zero value is harmless.
+// Assembling them in a pure function is what makes "every flag reaches the option
+// it configures" a thing a test can assert without a cluster.
+//
+// Warnings are returned as DATA rather than logged in place. A function that logs
+// is a function whose warnings can only be tested by capturing a logger, which is
+// how a warning ends up silently never firing.
+type options struct {
+	cfg      registrar.Config
+	ctrl     registrar.ControllerOptions
+	warnings []string
+}
+
+// buildOptions maps the parsed flags onto the registrar's configuration.
+//
+// It talks to nothing. Everything below it in RunE -- building a client, taking a
+// lease, starting a manager -- needs a cluster and stays untestable; this is the
+// part that does not have to be.
+func buildOptions(cmd *cobra.Command) (options, error) {
+	if interval <= 0 {
+		// RequeueAfter: 0 means "do not requeue", so a Helm value of
+		// `interval: 0s` would leave every registration reconciled once and
+		// then never refreshed again -- silently, until a certificate
+		// rotation broke it days later.
+		return options{}, fmt.Errorf("--interval must be positive, got %s", interval)
+	}
+
+	providers, err := resolveProviders(cmd)
+	if err != nil {
+		return options{}, err
+	}
+
+	cfg := registrar.Config{
+		TargetNamespace: targetNamespace,
+		ManagedByValue:  managedByValue,
+		Providers:       providers,
+		LabelPrefix:     labelPrefix,
+		DryRun:          dryRun,
+		DemotedTTL:      demotedTTL,
+	}
+	if err := cfg.Validate(); err != nil {
+		return options{}, err
+	}
+
+	var warnings []string
+
+	// Derived unless it was set, so an instance deployed from a plain manifest
+	// takes the same lease as a chart-deployed one with identical configuration.
+	// The chart has always derived it; the binary defaulted to a constant, so the
+	// two would not contend and both would reconcile.
+	//
+	// Gated on Changed rather than emptiness, matching resolveProviders: an
+	// explicit empty value is a mistake worth reporting, not a request to derive.
+	lease := leaderElectionID
+	if !cmd.Flags().Changed("leader-election-id") {
+		lease = registrar.LeaderElectionID(labelPrefix, managedByValue)
+	} else if lease == "" {
+		return options{}, fmt.Errorf("--leader-election-id must not be empty; omit it to derive one")
+	}
+
+	// A local, deliberately NOT the package variable. Assigning to `leaderElect`
+	// here mutated global state from inside a request path: harmless in a process
+	// that runs this once, but in a test binary the value leaks into every case
+	// that runs afterwards.
+	elect := leaderElect
+	if elect && dryRun {
+		// Same hazard as a second live instance, slower: a --dry-run process
+		// holding the lease is a registrar that reports what it would do while
+		// the real one waits.
+		warnings = append(warnings, "--dry-run disables leader election")
+		elect = false
+	}
+
+	if demotedTTL > 0 && demotedTTL < interval {
+		// A demoted registration is only revisited when its namespace is
+		// requeued, so nothing can expire faster than the interval and a smaller
+		// TTL reads as a promise the loop cannot keep.
+		warnings = append(warnings, fmt.Sprintf(
+			"--demoted-ttl %s is shorter than --interval %s, so expiry cannot happen sooner than %s",
+			demotedTTL, interval, interval))
+	}
+
+	return options{
+		cfg: cfg,
+		ctrl: registrar.ControllerOptions{
+			Interval:               interval,
+			LeaderElection:         elect,
+			LeaderElectionID:       lease,
+			HealthProbeBindAddress: healthProbeBindAddress,
+			MetricsBindAddress:     metricsBindAddress,
+		},
+		warnings: warnings,
+	}, nil
+}
+
 var rootCmd = &cobra.Command{
 	Use: "argocd-cluster-registrar",
 	// A runtime failure is not a usage error. Without these, any error out of
@@ -127,31 +227,17 @@ unclaimed name contested by several namespaces goes to the oldest.`,
 			AddSource: debug,
 		}))
 
-		if interval <= 0 {
-			// RequeueAfter: 0 means "do not requeue", so a Helm value of
-			// `interval: 0s` would leave every registration reconciled once and
-			// then never refreshed again -- silently, until a certificate
-			// rotation broke it days later.
-			return fmt.Errorf("--interval must be positive, got %s", interval)
-		}
-
-		providers, err := resolveProviders(cmd)
+		opts, err := buildOptions(cmd)
 		if err != nil {
 			return err
 		}
-
-		cfg := registrar.Config{
-			TargetNamespace: targetNamespace,
-			ManagedByValue:  managedByValue,
-			Providers:       providers,
-			LabelPrefix:     labelPrefix,
-			DryRun:          dryRun,
-		}
-		if err := cfg.Validate(); err != nil {
-			return err
+		// Emitted before the --once return below, deliberately: these describe the
+		// configuration, not the manager, so a pre-flight run must report them too.
+		for _, w := range opts.warnings {
+			log.Warn(w)
 		}
 
-		r, err := registrar.New(log, cfg)
+		r, err := registrar.New(log, opts.cfg)
 		if err != nil {
 			return err
 		}
@@ -163,8 +249,8 @@ unclaimed name contested by several namespaces goes to the oldest.`,
 		// default. This line is the only startup evidence of what the process is
 		// looking for, and logging `secretNamePattern` meant it always announced
 		// `k3k-*-kubeconfig` no matter what --provider was set to.
-		names := make([]string, 0, len(providers))
-		for _, p := range providers {
+		names := make([]string, 0, len(opts.cfg.Providers))
+		for _, p := range opts.cfg.Providers {
 			names = append(names, p.Name)
 		}
 		log.Info("resolved providers", slog.String("providers", strings.Join(names, ",")))
@@ -176,19 +262,7 @@ unclaimed name contested by several namespaces goes to the oldest.`,
 			return r.Reconcile(ctx)
 		}
 
-		if leaderElect && dryRun {
-			// Same hazard, slower: a --dry-run process holding the lease is a
-			// registrar that reports what it would do while the real one waits.
-			log.Warn("--dry-run disables leader election")
-			leaderElect = false
-		}
-
-		return r.Start(ctx, registrar.ControllerOptions{
-			Interval:               interval,
-			LeaderElection:         leaderElect,
-			LeaderElectionID:       leaderElectionID,
-			HealthProbeBindAddress: healthProbeBindAddress,
-		})
+		return r.Start(ctx, opts.ctrl)
 	},
 }
 
@@ -234,8 +308,18 @@ func registerFlags(f *pflag.FlagSet) {
 	// collide, NOT from the release name: ownership is established purely by
 	// label-prefix and managed-by, so instances differing only in release name
 	// contend for the same Secrets and must contend for the same lease.
-	f.StringVar(&leaderElectionID, "leader-election-id", "argocd-cluster-registrar",
-		"name of the Lease used for leader election, within --target-namespace")
+	f.StringVar(&leaderElectionID, "leader-election-id", "",
+		"name of the Lease used for leader election, within --target-namespace; "+
+			"unset derives it from --label-prefix and --managed-by")
 	f.StringVar(&healthProbeBindAddress, "health-probe-bind-address", ":8081",
 		"address serving /healthz and /readyz; empty disables it")
+	// "0", not "": controller-runtime reads an empty metrics address as ":8080"
+	// rather than as "off", so defaulting to empty here would open an
+	// unauthenticated port on every install that never asked for one.
+	f.StringVar(&metricsBindAddress, "metrics-bind-address", "0",
+		`address serving Prometheus metrics; "0" disables it, which is the default`)
+	// Off by default. Demotion is the reversible half of removal, so putting a
+	// clock on it also puts a clock on how long a mistaken rename can be undone.
+	f.DurationVar(&demotedTTL, "demoted-ttl", 0,
+		"delete a demoted registration once it has been superseded this long; 0 keeps it indefinitely")
 }

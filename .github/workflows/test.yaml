@@ -65,10 +65,46 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
+      # envtest, so the tests that need a real apiserver are not silently skipped.
+      # Pinned to controller-runtime's release branch rather than @latest: the
+      # tool and the library move together.
+      - name: Set up envtest
+        run: |
+          set -euo pipefail
+          go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.23
+          echo "KUBEBUILDER_ASSETS=$(setup-envtest use -p path)" >> "$GITHUB_ENV"
+
       # There was no test step at all before, while the destructive paths
       # (garbage collection especially) carry the tests that matter most.
       - name: Test
         run: go test -race -cover ./...
+
+      # A test that skips is indistinguishable from a test that passes, and the
+      # envtest cases skip themselves when KUBEBUILDER_ASSETS is unset. So assert
+      # they RAN, rather than trusting the exit code of the step above.
+      - name: The envtest cases actually ran
+        run: |
+          set -euo pipefail
+          go test ./internal/registrar/ -run 'TestAStranded' -v -timeout 5m | tee /tmp/envtest.log
+          if ! grep -q -- '--- PASS: TestAStrandedRegistrationIsCollectedOnStartup' /tmp/envtest.log; then
+            echo "::error::the envtest case did not run; it was skipped or renamed"
+            grep -E -- '--- (PASS|SKIP|FAIL)' /tmp/envtest.log || true
+            exit 1
+          fi
+
+      # Metrics were deferred for a release because securing the endpoint pulls in
+      # k8s.io/apiserver and its cel-go/gRPC/OTel arm. One import of
+      # controller-runtime's pkg/metrics/filters brings all of it back, so assert
+      # the absence rather than trusting review. -deps excludes test-only imports,
+      # which is why an envtest dependency cannot trip this.
+      - name: The apiserver authn/authz arm stays out of the binary
+        run: |
+          set -euo pipefail
+          if go list -deps ./... | grep -q '^k8s.io/apiserver'; then
+            echo "::error::k8s.io/apiserver is linked; pkg/metrics/filters was probably imported"
+            go list -deps ./... | grep '^k8s.io/apiserver' | head -20
+            exit 1
+          fi
 
   chart:
     timeout-minutes: 5
@@ -113,6 +149,11 @@ jobs:
           helm lint "$chart" --set leaderElection.enabled=true
           helm lint "$chart" --set probes.enabled=false
           helm lint "$chart" --set replicaCount=2 --set leaderElection.enabled=true
+          # The 0.5.0 operational surface.
+          helm lint "$chart" --set metrics.enabled=true
+          helm lint "$chart" --set metrics.enabled=true --set metrics.service.enabled=true
+          helm lint "$chart" --set metrics.enabled=true --set probes.enabled=false
+          helm lint "$chart" --set demotedTTL=720h
 
       # Two active replicas do not corrupt each other, but they do the work twice
       # and rewrite each other's provider label when configured differently.
@@ -131,6 +172,46 @@ jobs:
       # The release workflow overrides it at package time so published charts were
       # fine, but `helm install` from a checkout pulled a stale image, and nothing
       # noticed because deploy-test overrides the tag explicitly.
+      # The chart derives the lease name in _helpers.tpl and the binary derives it
+      # in Go. If they drift, an instance deployed from a plain manifest and a
+      # chart-deployed one with identical configuration hold different leases while
+      # contending for the same cluster Secrets, and both reconcile. A Go test pins
+      # the same literal from the other side.
+      - name: The chart and the binary derive the same lease name
+        run: |
+          set -euo pipefail
+          chart=deploy/charts/argocd-cluster-registrar
+          got=$(helm template t "$chart" --set leaderElection.enabled=true \
+            | grep -o 'leader-election-id=[a-z0-9-]*' | head -1 | cut -d= -f2)
+          want=acr-991221237547448b
+          if [ "$got" != "$want" ]; then
+            echo "::error::chart renders lease ${got}, the binary derives ${want}"
+            exit 1
+          fi
+
+      # Both bind addresses become a containerPort by stripping the colon, so a
+      # host:port form renders containerPort 0 and a bare port hands the binary an
+      # address it cannot listen on. Neither should reach a cluster.
+      - name: A bind address that is not ":PORT" fails the render
+        run: |
+          set -euo pipefail
+          chart=deploy/charts/argocd-cluster-registrar
+          for v in "0.0.0.0:8081" "8081" ""; do
+            if helm template t "$chart" --set probes.bindAddress="$v" >/dev/null 2>&1; then
+              echo "::error::probes.bindAddress=${v} rendered instead of failing"
+              exit 1
+            fi
+          done
+          if helm template t "$chart" --set metrics.enabled=true \
+               --set metrics.bindAddress=0.0.0.0:8080 >/dev/null 2>&1; then
+            echo "::error::metrics.bindAddress=0.0.0.0:8080 rendered instead of failing"
+            exit 1
+          fi
+          # The supported form still works, for both.
+          helm template t "$chart" --set probes.bindAddress=":9" >/dev/null
+          helm template t "$chart" --set metrics.enabled=true \
+            --set metrics.bindAddress=":9090" >/dev/null
+
       - name: The in-tree chart version is not behind the latest tag
         run: |
           set -euo pipefail
@@ -199,6 +280,64 @@ jobs:
           if grep -qE -- '--provider=|--secret-name-pattern=|--secret-key=' <<<"$out"; then
             echo "::error::default install should defer to the binary's own default"
             grep -- '--' <<<"$out"; exit 1
+          fi
+
+      # `0s` is a truthy string in a Go template and `0` is a falsy int, so a
+      # conditional here renders opposite results for the same intent. The flag is
+      # emitted unconditionally; this pins that.
+      - name: demotedTTL renders the same disabled value however it is spelled
+        run: |
+          set -euo pipefail
+          chart=deploy/charts/argocd-cluster-registrar
+          for v in "" "--set demotedTTL=0" "--set demotedTTL=0s"; do
+            got=$(helm template t "$chart" $v | grep -o -- '--demoted-ttl=[^"]*')
+            if [ "$got" != "--demoted-ttl=0s" ]; then
+              echo "::error::demotedTTL ${v:-<default>} rendered ${got}, want --demoted-ttl=0s"
+              exit 1
+            fi
+          done
+          helm template t "$chart" --set demotedTTL=720h \
+            | grep -q -- '--demoted-ttl=720h' || {
+            echo "::error::a configured demotedTTL did not reach the pod"; exit 1; }
+
+      # An empty --metrics-bind-address means ":8080" to controller-runtime, not
+      # "off", so the default install must emit no such flag at all rather than an
+      # empty one. Nor a Service, which would put a stable name in front of an
+      # unauthenticated port nobody asked for.
+      - name: A default install serves no metrics
+        run: |
+          set -euo pipefail
+          chart=deploy/charts/argocd-cluster-registrar
+          out=$(helm template t "$chart")
+          if grep -q -- '--metrics-bind-address' <<<"$out"; then
+            echo "::error::the default install passes a metrics bind address"
+            grep -- '--' <<<"$out"; exit 1
+          fi
+          if grep -q '^kind: Service$' <<<"$out"; then
+            echo "::error::the default install renders a Service"
+            exit 1
+          fi
+
+      # And when asked for, all three parts must appear together: the flag, the
+      # container port the Service targets by name, and the Service itself.
+      - name: Enabling metrics renders the flag, the port and the Service
+        run: |
+          set -euo pipefail
+          chart=deploy/charts/argocd-cluster-registrar
+          out=$(helm template t "$chart" \
+            --set metrics.enabled=true --set metrics.service.enabled=true)
+          grep -q -- '--metrics-bind-address=:8080' <<<"$out" || {
+            echo "::error::metrics were enabled but no bind address was passed"; exit 1; }
+          grep -q 'name: metrics' <<<"$out" || {
+            echo "::error::no metrics container port"; exit 1; }
+          grep -q '^kind: Service$' <<<"$out" || {
+            echo "::error::no Service"; exit 1; }
+          # Rendering the ports key twice yields a manifest where the second one
+          # silently wins, which is what a naive second entry under the probes
+          # conditional would have produced.
+          if [ "$(grep -c '^          ports:$' <<<"$out")" != "1" ]; then
+            echo "::error::the container has more than one ports: key"
+            exit 1
           fi
 
   deploy-test:
@@ -299,6 +438,8 @@ jobs:
             --set 'providers[0]=k3k' \
             --set 'providers[1]=capi' \
             --set interval=5s \
+            --set metrics.enabled=true \
+            --set metrics.service.enabled=true \
             --wait --timeout 3m
 
       # Assertions are real: no `|| echo "Ignored..."`, so a regression fails CI.
@@ -431,10 +572,23 @@ jobs:
           done
           kubectl get secret cluster-audited -n argocd >/dev/null
 
-          # Delete the namespace FIRST. While it exists, its own reconcile reaches
-          # the orphan-adoption branch, restores source-namespace within seconds,
-          # and the Secret is routable again before the audit ever looks at it.
+          # Pin it BEFORE deleting the namespace. Deletion is event-driven, so the
+          # controller collects the registration within a second or two of the
+          # namespace going away, and it was racing the label command below: the
+          # step failed intermittently on a NotFound that had nothing to do with
+          # what it was testing. prune=disabled is checked ahead of every removal
+          # path, so this closes the window rather than widening it.
+          kubectl label secret cluster-audited -n argocd \
+            argocd-cluster-registrar/prune=disabled
+
+          # Delete the namespace before stripping source-namespace. While it
+          # exists, its own reconcile reaches the orphan-adoption branch, restores
+          # the label within seconds, and the Secret is routable again before the
+          # audit ever looks at it.
           kubectl delete namespace k3k-audit --wait=true
+          sleep 10
+          kubectl get secret cluster-audited -n argocd >/dev/null || {
+            echo "::error::a pinned registration was collected anyway"; exit 1; }
           kubectl label secret cluster-audited -n argocd \
             argocd-cluster-registrar/source-namespace-
           kubectl rollout restart deployment -n registrar registrar-argocd-cluster-registrar
@@ -560,6 +714,176 @@ jobs:
             exit 1
           fi
           kubectl delete namespace aaa-second --wait=true
+
+      # A namespace deleted while nothing was running produces no event to catch
+      # up on, so the startup seeder is the only thing that finds its
+      # registration. Proven under envtest too, but here with real RBAC: the
+      # seeder rebuilds its key set by LISTing owned Secrets, which the covering
+      # role must actually permit.
+      - name: A registration orphaned while the pod was down is collected on startup
+        run: |
+          set -euo pipefail
+          dep=deployment/registrar-argocd-cluster-registrar
+          kubectl create namespace k3k-downtime
+          kubectl label namespace k3k-downtime \
+            argocd-cluster-registrar/managed-by=cluster-registrar \
+            argocd-cluster-registrar/cluster=downtime
+          sed 's|https://192.0.2.10|https://192.0.2.51|' /tmp/kubeconfig.yaml > /tmp/downtime.yaml
+          kubectl create secret generic k3k-downtime-kubeconfig \
+            -n k3k-downtime --from-file=kubeconfig.yaml=/tmp/downtime.yaml
+          for i in $(seq 1 12); do
+            kubectl get secret cluster-downtime -n argocd >/dev/null 2>&1 && break
+            sleep 5
+          done
+          kubectl get secret cluster-downtime -n argocd >/dev/null
+
+          # Down, THEN delete: the whole point is that no watch event is delivered.
+          kubectl scale deployment -n registrar registrar-argocd-cluster-registrar --replicas=0
+          kubectl wait --for=delete pod -n registrar \
+            -l app.kubernetes.io/name=argocd-cluster-registrar --timeout=2m
+          kubectl delete namespace k3k-downtime --wait=true
+          kubectl get secret cluster-downtime -n argocd >/dev/null || {
+            echo "::error::the registration vanished while nothing was running"; exit 1; }
+
+          kubectl scale deployment -n registrar registrar-argocd-cluster-registrar --replicas=1
+          kubectl rollout status -n registrar "$dep" --timeout=2m
+          for i in $(seq 1 12); do
+            if ! kubectl get secret cluster-downtime -n argocd >/dev/null 2>&1; then
+              echo "collected after $((i*5))s"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::a registration orphaned during downtime was never collected"
+          kubectl logs -n registrar "$dep" --tail=50
+          exit 1
+
+      # Taking a namespace out of scope is not a deletion, and a label-filtered
+      # cache cannot tell the two apart: the apiserver reports an object that
+      # stops matching the selector as a synthetic Delete. This is the scenario
+      # where making the existence proof a cached read would deregister a live
+      # cluster fleet-wide, which is why that proof goes to the apiserver.
+      #
+      # A broad regression guard rather than a sharp one: it is here to fail if
+      # that read is ever switched to the cache, not to catch a one-line slip.
+      #
+      # Creates its own namespace. Borrowing capi-child does not work: the
+      # half-written-kubeconfig step deletes it to prove GC still runs, so by here
+      # both it and its registration are long gone.
+      - name: Removing the ownership label does not deregister anything
+        run: |
+          set -euo pipefail
+          dep=deployment/registrar-argocd-cluster-registrar
+          kubectl create namespace k3k-scope
+          kubectl label namespace k3k-scope \
+            argocd-cluster-registrar/managed-by=cluster-registrar \
+            argocd-cluster-registrar/cluster=scoped
+          sed 's|https://192.0.2.10|https://192.0.2.61|' /tmp/kubeconfig.yaml > /tmp/scope.yaml
+          kubectl create secret generic k3k-scope-kubeconfig \
+            -n k3k-scope --from-file=kubeconfig.yaml=/tmp/scope.yaml
+          for i in $(seq 1 12); do
+            kubectl get secret cluster-scoped -n argocd >/dev/null 2>&1 && break
+            sleep 5
+          done
+          kubectl get secret cluster-scoped -n argocd >/dev/null || {
+            echo "::error::the fixture never registered, so this proves nothing"; exit 1; }
+
+          kubectl label namespace k3k-scope argocd-cluster-registrar/managed-by-
+          # Longer than interval=5s, so several reconciles see it out of scope.
+          sleep 20
+          kubectl get secret cluster-scoped -n argocd >/dev/null || {
+            echo "::error::a registration was deleted when its namespace left scope"
+            kubectl logs -n registrar "$dep" --tail=50; exit 1; }
+          kubectl logs -n registrar "$dep" | grep -q 'no longer carries the ownership label' || {
+            echo "::error::the namespace left scope without the controller noticing"
+            kubectl logs -n registrar "$dep" --tail=50; exit 1; }
+
+          kubectl delete namespace k3k-scope --wait=true
+
+      # Proves a refusal is COUNTED, which is the half an operator can alert on.
+      # The contested-name step already proves refusals happen and keep happening,
+      # and that assertion stays: it is what pins RequeueAfter, and trading it for
+      # a metric would lose coverage rather than add it.
+      #
+      # Produces its own refusal rather than relying on that one. The downtime
+      # step above restarts the process, and a counter does not survive a restart.
+      #
+      # Scraped through port-forward rather than a curl pod: the image is
+      # distroless with no shell, and a second pod means another image pull.
+      - name: A refused claim is counted under its own reason
+        run: |
+          set -euo pipefail
+          dep=deployment/registrar-argocd-cluster-registrar
+
+          # The holder registers FIRST, so the second claimant is refused as an
+          # incumbency rather than as a contested name.
+          kubectl create namespace k3k-holder
+          kubectl label namespace k3k-holder \
+            argocd-cluster-registrar/managed-by=cluster-registrar \
+            argocd-cluster-registrar/cluster=metered
+          sed 's|https://192.0.2.10|https://192.0.2.71|' /tmp/kubeconfig.yaml > /tmp/holder.yaml
+          kubectl create secret generic k3k-holder-kubeconfig \
+            -n k3k-holder --from-file=kubeconfig.yaml=/tmp/holder.yaml
+          for i in $(seq 1 12); do
+            kubectl get secret cluster-metered -n argocd >/dev/null 2>&1 && break
+            sleep 5
+          done
+          kubectl get secret cluster-metered -n argocd >/dev/null || {
+            echo "::error::the holder never registered, so nothing would be refused"; exit 1; }
+
+          kubectl create namespace k3k-usurper
+          kubectl label namespace k3k-usurper \
+            argocd-cluster-registrar/managed-by=cluster-registrar \
+            argocd-cluster-registrar/cluster=metered
+          sed 's|https://192.0.2.10|https://192.0.2.72|' /tmp/kubeconfig.yaml > /tmp/usurper.yaml
+          kubectl create secret generic k3k-usurper-kubeconfig \
+            -n k3k-usurper --from-file=kubeconfig.yaml=/tmp/usurper.yaml
+          for i in $(seq 1 12); do
+            kubectl logs -n registrar "$dep" | grep -q 'conflict=incumbent' && break
+            sleep 5
+          done
+          kubectl logs -n registrar "$dep" | grep -q 'conflict=incumbent' || {
+            echo "::error::the second claimant was never refused as an incumbency"
+            kubectl logs -n registrar "$dep" --tail=50; exit 1; }
+
+          kubectl port-forward -n registrar svc/registrar-argocd-cluster-registrar-metrics 18080:8080 &
+          pf=$!
+          trap 'kill $pf 2>/dev/null || true' EXIT
+          for i in $(seq 1 12); do
+            curl -sf http://127.0.0.1:18080/metrics -o /tmp/metrics.txt && break
+            sleep 5
+          done
+          test -s /tmp/metrics.txt || { echo "::error::/metrics was never scrapeable"; exit 1; }
+
+          series='argocd_cluster_registrar_conflicts_total{reason="incumbent"}'
+          value=$(awk -v s="$series" '$0 ~ s {print $2}' /tmp/metrics.txt | tail -1)
+          echo "$series = ${value:-<absent>}"
+          if [ -z "${value:-}" ]; then
+            echo "::error::the conflict counter is absent; it must be published at zero from startup"
+            grep argocd_cluster_registrar /tmp/metrics.txt || true
+            exit 1
+          fi
+          if [ "$(printf '%.0f' "$value")" -lt 1 ]; then
+            echo "::error::a refusal was logged but never counted"
+            grep argocd_cluster_registrar /tmp/metrics.txt || true
+            exit 1
+          fi
+          # Every other reason must be untouched, or a single mislabelled
+          # increment site would go unnoticed.
+          for other in contested_name create_race not_managed orphan_cluster_mismatch; do
+            v=$(awk -v s="reason=\"$other\"" '$0 ~ s {print $2}' /tmp/metrics.txt | tail -1)
+            if [ "$(printf '%.0f' "${v:-0}")" -ne 0 ]; then
+              echo "::error::an incumbency refusal also counted under reason=${other}"
+              grep argocd_cluster_registrar /tmp/metrics.txt || true
+              exit 1
+            fi
+          done
+          # The gauges come from the audit key, a different code path.
+          grep -q 'argocd_cluster_registrar_registrations{state="active"}' /tmp/metrics.txt || {
+            echo "::error::the registrations gauge was never set"; exit 1; }
+
+          kubectl delete namespace k3k-usurper k3k-holder --wait=true
+
 
       # Renaming demotes the old registration rather than deleting it. Worth doing
       # live because a real apiserver validates label values, and the demotion

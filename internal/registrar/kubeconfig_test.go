@@ -83,6 +83,30 @@ contexts:
 current-context: kubernetes-admin@tenant-00
 `
 
+// Kamaji's OTHER key, `admin.svc`, written alongside admin.conf when the control
+// plane advertises an in-cluster Service address. Deliberately a different server
+// from kamajiKubeconfig: a fallthrough test whose two candidates resolve to the
+// same address passes whichever one was used, which proves nothing.
+const kamajiSvcKubeconfig = `apiVersion: v1
+kind: Config
+clusters:
+- name: tenant-00
+  cluster:
+    server: https://tenant-00.kamaji.svc:6443
+    certificate-authority-data: Y2FkYXRh
+users:
+- name: kubernetes-admin
+  user:
+    client-certificate-data: Y2VydGRhdGE=
+    client-key-data: a2V5ZGF0YQ==
+contexts:
+- name: kubernetes-admin@tenant-00
+  context:
+    cluster: tenant-00
+    user: kubernetes-admin
+current-context: kubernetes-admin@tenant-00
+`
+
 // The Cluster API contract shape: Secret `<cluster>-kubeconfig`, key `value`.
 // CAPI emits multiple entries with an explicit current-context, which is exactly
 // the case resolve() refuses to guess about.
