@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"maps"
 	"path"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -15,6 +14,7 @@ import (
 	coreV1 "k8s.io/api/core/v1"
 	apiErrors "k8s.io/apimachinery/pkg/api/errors"
 	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -39,8 +39,22 @@ const (
 
 	// SuffixSourceNamespace records, on the ArgoCD cluster Secret, which
 	// namespace a registration came from. Garbage collection needs it to confirm
-	// the source is genuinely gone rather than merely unseen this pass.
+	// the source is genuinely gone rather than merely unseen this pass. It is
+	// also what apply() checks to refuse taking over another namespace's
+	// registration, so it is the ownership record, not merely a breadcrumb.
 	SuffixSourceNamespace = "source-namespace"
+
+	// SuffixSourceNamespaceUID records that namespace's UID. Names are reusable
+	// and UIDs are not, so this is what tells "the same namespace" apart from "a
+	// new namespace wearing the old one's name".
+	//
+	// Written but not yet read. Two things want it: a delete precondition, so a
+	// garbage collection decided in one pass cannot land on a registration a
+	// later pass recreated; and the existence proof in collect(), which today
+	// looks the namespace up by name and so cannot tell a survivor from a
+	// replacement. Both are follow-ups; stamping it now means the data is
+	// already there when they land.
+	SuffixSourceNamespaceUID = "source-namespace-uid"
 
 	// SuffixProvider records which configured provider matched, so a fleet is
 	// introspectable and an ApplicationSet can select by provisioner.
@@ -62,6 +76,9 @@ func ClusterLabel(prefix string) string { return prefix + SuffixCluster }
 // SourceNamespaceLabel is the source-namespace label key for a given prefix.
 func SourceNamespaceLabel(prefix string) string { return prefix + SuffixSourceNamespace }
 
+// SourceNamespaceUIDLabel is the source-namespace-uid label key for a given prefix.
+func SourceNamespaceUIDLabel(prefix string) string { return prefix + SuffixSourceNamespaceUID }
+
 // ProviderLabel is the matched-provider label key for a given prefix.
 func ProviderLabel(prefix string) string { return prefix + SuffixProvider }
 
@@ -76,6 +93,7 @@ var reservedSuffixes = []string{
 	SuffixManagedBy,
 	SuffixCluster,
 	SuffixSourceNamespace,
+	SuffixSourceNamespaceUID,
 	SuffixProvider,
 }
 
@@ -335,6 +353,10 @@ func (r *Registrar) clusterLabel() string         { return ClusterLabel(r.cfg.La
 func (r *Registrar) sourceNamespaceLabel() string { return SourceNamespaceLabel(r.cfg.LabelPrefix) }
 func (r *Registrar) providerLabel() string        { return ProviderLabel(r.cfg.LabelPrefix) }
 
+func (r *Registrar) sourceNamespaceUIDLabel() string {
+	return SourceNamespaceUIDLabel(r.cfg.LabelPrefix)
+}
+
 // clientTimeout bounds every API call. Without it rest.Config.Timeout is 0, so a
 // hung request inside Reconcile blocks forever: the ticker never fires again and
 // the pod sits Running and Ready while doing nothing at all. Nothing else in the
@@ -371,26 +393,48 @@ func (r *Registrar) Reconcile(ctx context.Context) error {
 		return err
 	}
 
+	// Only the children that were actually written may vouch for their Secret.
+	// Passing `desired` here instead would let a REFUSED claimant keep the
+	// winner's registration marked live: once the winner's namespace was deleted,
+	// the loser would go on being refused, the Secret would go on looking claimed,
+	// and it would strand forever pointing at a dead cluster.
+	applied := make([]child, 0, len(desired))
 	var errs []string
 	for _, d := range desired {
-		if err := r.apply(ctx, d); err != nil {
+		err := r.apply(ctx, d)
+		var conflict *conflictError
+		switch {
+		case err == nil:
+			applied = append(applied, d)
+
+		case errors.As(err, &conflict):
+			// Not a failure, so it must not fail the pass: a contested name
+			// persists until a human fixes it, and counting it would mark every
+			// pass failed forever. Logged at Error all the same -- a silently
+			// resolved conflict over a credential-bearing Secret is the hazard.
+			r.log.Error("refused to register cluster", slog.String("cluster", d.cluster),
+				slog.String("namespace", d.namespace), slog.Any("reason", err))
+			unresolved[d.namespace] = true
+
+		default:
 			// One bad child must not stop the others, or a single broken cluster
 			// would stall registration for the whole fleet.
 			errs = append(errs, fmt.Sprintf("%s: %v", d.cluster, err))
 			r.log.Error("failed to register cluster", slog.String("cluster", d.cluster), slog.Any("error", err))
+			unresolved[d.namespace] = true
 		}
 	}
 
-	// `desired` is built by skipping namespaces that could not be evaluated, so a
-	// transient API error makes a live cluster look deleted. Rather than skipping
-	// GC entirely -- which let one stuck namespace keep every dead registration
-	// alive -- the unevaluable namespaces are passed down and excluded
-	// individually. Every other cluster is still collected normally.
+	// `applied` omits namespaces that could not be evaluated, could not be
+	// written, or were refused, so absence from it never means "deleted". Rather
+	// than skipping GC entirely -- which let one stuck namespace keep every dead
+	// registration alive -- those namespaces are passed down in `unresolved` and
+	// excluded individually. Every other cluster is still collected normally.
 	if len(unresolved) > 0 {
-		r.log.Warn("some managed namespaces could not be evaluated; their registrations are exempt from garbage collection this pass",
+		r.log.Warn("some managed namespaces produced no confirmed registration; theirs are exempt from garbage collection this pass",
 			slog.Int("count", len(unresolved)))
 	}
-	if err := r.collect(ctx, desired, unresolved); err != nil {
+	if err := r.collect(ctx, applied, unresolved); err != nil {
 		errs = append(errs, fmt.Sprintf("gc: %v", err))
 	}
 
@@ -402,12 +446,13 @@ func (r *Registrar) Reconcile(ctx context.Context) error {
 
 // child is one discovered cluster ready to be written out.
 type child struct {
-	cluster   string
-	namespace string
-	server    string
-	config    string
-	provider  string
-	labels    map[string]string
+	cluster      string
+	namespace    string
+	namespaceUID types.UID
+	server       string
+	config       string
+	provider     string
+	labels       map[string]string
 }
 
 // apiFailure marks an error as "the API call failed", as opposed to "the answer
@@ -417,8 +462,25 @@ type apiFailure struct{ err error }
 func (e *apiFailure) Error() string { return e.err.Error() }
 func (e *apiFailure) Unwrap() error { return e.err }
 
+// conflictError means the name is spoken for. It is deliberately distinct from a
+// failure: nothing went wrong, the answer is "not yours".
+//
+// Reconcile must not count it toward the pass's error return. A contested name is
+// a configuration mistake that persists until a human fixes it, so treating it as
+// an error would fail every pass forever and, once there is a metric, pump it
+// forever too. It is still logged at Error, because a silently resolved conflict
+// over a credential-bearing Secret is the actual hazard.
+type conflictError struct{ err error }
+
+func (e *conflictError) Error() string { return e.err.Error() }
+func (e *conflictError) Unwrap() error { return e.err }
+
+func conflictf(format string, a ...any) error {
+	return &conflictError{fmt.Errorf(format, a...)}
+}
+
 // discover returns the clusters that should be registered, and the set of
-// managed namespaces that could not be evaluated this pass.
+// managed namespaces whose registration state could not be established this pass.
 //
 // That set is load-bearing: callers must not treat "absent from the result" as
 // "deleted" for a namespace listed in it. A namespace that could not be read is
@@ -429,6 +491,11 @@ func (e *apiFailure) Unwrap() error { return e.err }
 // A cluster stuck without a kubeconfig -- which every k3k child is for its first
 // ninety seconds, and a permanently broken one is forever -- would silently keep
 // every other cluster's dead registration alive.
+//
+// Reconcile ADDS to the set afterwards, for namespaces whose apply failed or was
+// refused. Both are cases where this pass did not establish what the namespace
+// owns, which is the same thing the discovery-time entries mean, so garbage
+// collection must leave their registrations alone either way.
 func (r *Registrar) discover(ctx context.Context) ([]child, map[string]bool, error) {
 	selector := fmt.Sprintf("%s=%s", r.managedByLabel(), r.cfg.ManagedByValue)
 	namespaces, err := r.client.CoreV1().Namespaces().List(ctx, metaV1.ListOptions{LabelSelector: selector})
@@ -438,7 +505,6 @@ func (r *Registrar) discover(ctx context.Context) ([]child, map[string]bool, err
 
 	unresolved := map[string]bool{}
 	var out []child
-	seen := map[string]string{}
 	for i := range namespaces.Items {
 		ns := &namespaces.Items[i]
 
@@ -469,21 +535,15 @@ func (r *Registrar) discover(ctx context.Context) ([]child, map[string]bool, err
 			continue
 		}
 
-		// Two namespaces claiming one cluster name would map to a single Secret
-		// and flap between them forever. Skip both rather than pick a winner.
-		if other, dup := seen[name]; dup {
-			r.log.Error("duplicate cluster name across namespaces; skipping both",
-				slog.String("cluster", name), slog.String("namespace", ns.Name),
-				slog.String("conflictsWith", other))
-			// Both namespaces are now unresolved: the winner was withdrawn from
-			// `out` as well, so neither may be treated as deleted.
-			unresolved[ns.Name] = true
-			unresolved[other] = true
-			out = slices.DeleteFunc(out, func(c child) bool { return c.cluster == name })
-			continue
-		}
-		seen[name] = ns.Name
-
+		// Two namespaces may claim one cluster name. That is NOT resolved here any
+		// more: discovery is per-namespace, and deciding it here needed the whole
+		// namespace list at once, which the eventual per-namespace reconcile
+		// cannot have. apply() settles it instead -- see claimContestedName.
+		//
+		// Removing it also fixed a quieter bug. The name used to be claimed here,
+		// BEFORE the kubeconfig lookup below, so a namespace that never produced a
+		// usable kubeconfig still poisoned a healthy namespace claiming the same
+		// name, and neither ever registered.
 		candidates, err := r.findKubeconfigCandidates(ctx, ns.Name)
 		if err != nil {
 			var apiErr *apiFailure
@@ -539,17 +599,28 @@ func (r *Registrar) discover(ctx context.Context) ([]child, map[string]bool, err
 		}
 
 		out = append(out, child{
-			cluster:   name,
-			namespace: ns.Name,
-			server:    server,
-			config:    config,
-			provider:  provider,
-			labels:    propagatedLabels(ns.Labels, r.cfg.LabelPrefix),
+			cluster:      name,
+			namespace:    ns.Name,
+			namespaceUID: ns.UID,
+			server:       server,
+			config:       config,
+			provider:     provider,
+			labels:       propagatedLabels(ns.Labels, r.cfg.LabelPrefix),
 		})
 	}
 
-	// Stable ordering keeps logs diffable between passes.
-	sort.Slice(out, func(i, j int) bool { return out[i].cluster < out[j].cluster })
+	// Stable ordering keeps logs diffable between passes. Two children can now
+	// share a cluster name, and sort.Slice is not stable, so the namespace breaks
+	// the tie -- for READABILITY only. Nothing may depend on this order: which
+	// claimant wins a contested name is decided by claimContestedName, on the
+	// namespace's creation timestamp, precisely so that it does not vary with the
+	// order a driver happens to present namespaces in.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].cluster != out[j].cluster {
+			return out[i].cluster < out[j].cluster
+		}
+		return out[i].namespace < out[j].namespace
+	})
 	return out, unresolved, nil
 }
 
@@ -681,16 +752,140 @@ func propagatedLabels(in map[string]string, prefix string) map[string]string {
 // secretName is the ArgoCD cluster Secret name for a child.
 func secretName(cluster string) string { return "cluster-" + cluster }
 
+// checkOwnership decides whether c may write the cluster Secret that already
+// exists. It returns a conflictError when it may not.
+//
+// This is the tool's security boundary, and until 0.4.0 there was not one: apply
+// read the Secret, overwrote it and relabelled it as ours no matter who wrote it.
+// A tenant able to label their own namespace `<prefix>cluster: prod` could
+// therefore repoint ArgoCD's `prod` registration at their own API server with
+// their own credentials, and -- because the takeover also rewrote
+// `source-namespace` -- make it garbage-collectable on their own terms.
+//
+// The rule is incumbency. Whoever holds the registration keeps it, and a
+// challenger is refused rather than arbitrated against, which is what Kubernetes
+// itself does for name collisions (409 on create) and what every comparable
+// controller does for a derived object: cert-manager, external-dns, External
+// Secrets, Crossplane, and the ControllerRef rule that a controller may adopt an
+// orphan but never something another controller already owns.
+func (r *Registrar) checkOwnership(existing *coreV1.Secret, c child) error {
+	if existing.Labels[r.managedByLabel()] != r.cfg.ManagedByValue {
+		// Hand-registered, or another registrar's. Either way not ours to take.
+		return conflictf(
+			"secret %s/%s is not managed by this registrar (%s=%q); "+
+				"refusing to take it over for namespace %s. Rename the cluster, or delete "+
+				"the secret if it is genuinely stale",
+			r.cfg.TargetNamespace, existing.Name, r.managedByLabel(),
+			existing.Labels[r.managedByLabel()], c.namespace)
+	}
+
+	switch src := existing.Labels[r.sourceNamespaceLabel()]; src {
+	case c.namespace:
+		return nil
+
+	case "":
+		// No recorded owner. Adopt only if the Secret already names this exact
+		// cluster, which is the ControllerRef "adopt an orphan" rule.
+		//
+		// This is deliberately narrow, because the population it was originally
+		// written for turns out not to exist: v0.1.8 wrote an UNPREFIXED
+		// managed-by, v0.2.0 wrote every label including source-namespace, and
+		// the one commit in between was squashed into the v0.2.0 merge and is in
+		// no release. So a genuine pre-0.2.0 Secret fails the managed-by check
+		// above and never reaches here. What does reach here is a Secret whose
+		// source-namespace label was stripped by someone with write access to the
+		// ArgoCD namespace -- i.e. the takeover this function exists to prevent,
+		// wearing a different hat. Requiring the cluster label to match means an
+		// attacker gains nothing they did not already have.
+		if existing.Labels[r.clusterLabel()] != c.cluster {
+			return conflictf(
+				"secret %s/%s is owned but records no source namespace, and its %s label is %q "+
+					"rather than %q; refusing to adopt it for namespace %s",
+				r.cfg.TargetNamespace, existing.Name, r.clusterLabel(),
+				existing.Labels[r.clusterLabel()], c.cluster, c.namespace)
+		}
+		r.log.Warn("adopting an owned cluster secret that records no source namespace",
+			slog.String("secret", existing.Name), slog.String("cluster", c.cluster),
+			slog.String("namespace", c.namespace),
+			slog.String("label", r.sourceNamespaceLabel()))
+		return nil
+
+	default:
+		// Deliberately NOT compared by UID. A namespace deleted and recreated
+		// under the same name is a legitimate claimant, and refusing it here
+		// would deadlock: collect() would see a live namespace of that name and
+		// refuse to delete the registration, so neither side could ever move.
+		return conflictf(
+			"cluster %q is registered from namespace %s; refusing to take it over for %s. "+
+				"Two namespaces must not claim one cluster name",
+			c.cluster, src, c.namespace)
+	}
+}
+
+// claimContestedName decides whether c may CREATE the cluster Secret, when
+// several managed namespaces claim the same cluster name and none holds it yet.
+//
+// Incumbency settles the case where a registration already exists; this settles
+// the case where it does not. The oldest namespace wins, breaking an exact tie on
+// name.
+//
+// Oldest-wins is the ecosystem's answer -- Gateway API, ingress-nginx and
+// cert-manager all use creation timestamp then name -- and it is the right shape
+// here for a specific reason: it is monotonic in the defender's favour. A
+// namespace cannot become older, so an attacker who deletes and recreates one can
+// only ever lose the tie. The alphabetical fallback is reachable only on an exact
+// timestamp match and must never be relied on.
+//
+// Refusing BOTH claimants was considered and rejected. It is symmetric, so a
+// standing claim on a guessable name would permanently block that cluster from
+// ever registering, including after a legitimate rebuild -- trading a hijack risk
+// for an availability one. Upstream reserves refuse-both for conflicts inside a
+// single object with a single author, where it penalises only the author.
+func (r *Registrar) claimContestedName(ctx context.Context, c child) error {
+	selector := fmt.Sprintf("%s=%s,%s=%s",
+		r.managedByLabel(), r.cfg.ManagedByValue, r.clusterLabel(), c.cluster)
+	namespaces, err := r.client.CoreV1().Namespaces().List(ctx, metaV1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return fmt.Errorf("list claimants of cluster %q (%s): %w", c.cluster, selector, err)
+	}
+
+	winner := ""
+	var winnerAt metaV1.Time
+	for i := range namespaces.Items {
+		ns := &namespaces.Items[i]
+		// A namespace being torn down is not a claimant; discover skips these
+		// too, and letting one win would block the survivor for as long as the
+		// finalizers took.
+		if ns.DeletionTimestamp != nil {
+			continue
+		}
+		if winner == "" || ns.CreationTimestamp.Before(&winnerAt) ||
+			(ns.CreationTimestamp.Equal(&winnerAt) && ns.Name < winner) {
+			winner, winnerAt = ns.Name, ns.CreationTimestamp
+		}
+	}
+
+	// Either we are the only claimant, or the list is somehow empty (our own
+	// namespace was deleted mid-pass); both mean there is nobody to lose to.
+	if winner == "" || winner == c.namespace {
+		return nil
+	}
+	return conflictf(
+		"cluster %q is also claimed by namespace %s, which is older; "+
+			"not registering it from %s", c.cluster, winner, c.namespace)
+}
+
 func (r *Registrar) apply(ctx context.Context, c child) error {
 	// Order matters: the propagated labels are copied LAST, so anything they can
 	// reach wins over what was computed here. propagatedLabels already withholds
 	// every reserved suffix for exactly that reason -- see reservedSuffixes.
 	labels := map[string]string{
-		argoSecretTypeLabel:      argoSecretTypeValue,
-		r.managedByLabel():       r.cfg.ManagedByValue,
-		r.clusterLabel():         c.cluster,
-		r.sourceNamespaceLabel(): c.namespace,
-		r.providerLabel():        c.provider,
+		argoSecretTypeLabel:         argoSecretTypeValue,
+		r.managedByLabel():          r.cfg.ManagedByValue,
+		r.clusterLabel():            c.cluster,
+		r.sourceNamespaceLabel():    c.namespace,
+		r.sourceNamespaceUIDLabel(): string(c.namespaceUID),
+		r.providerLabel():           c.provider,
 	}
 	maps.Copy(labels, c.labels)
 
@@ -712,12 +907,26 @@ func (r *Registrar) apply(ctx context.Context, c child) error {
 	existing, err := api.Get(ctx, want.Name, metaV1.GetOptions{})
 	switch {
 	case apiErrors.IsNotFound(err):
+		// Nobody holds the name, so incumbency cannot settle it. Check for other
+		// claimants BEFORE the dry-run return, or a pre-flight run reports two
+		// namespaces each "would create" the same Secret and says nothing about
+		// the conflict -- the one thing it would be run to find.
+		if err := r.claimContestedName(ctx, c); err != nil {
+			return err
+		}
 		if r.cfg.DryRun {
 			r.log.Info("[dry-run] would create cluster secret",
 				slog.String("cluster", c.cluster), slog.String("server", c.server))
 			return nil
 		}
 		if _, err := api.Create(ctx, want, metaV1.CreateOptions{}); err != nil {
+			if apiErrors.IsAlreadyExists(err) {
+				// Someone wrote it between our Get and our Create. Benign, and
+				// resolved by incumbency on the next pass -- which is also what
+				// keeps this safe once more than one worker reconciles at a time.
+				return conflictf("cluster secret %s was created concurrently; retrying next pass",
+					want.Name)
+			}
 			return fmt.Errorf("create: %w", err)
 		}
 		r.log.Info("registered cluster",
@@ -726,6 +935,12 @@ func (r *Registrar) apply(ctx context.Context, c child) error {
 
 	case err != nil:
 		return fmt.Errorf("get: %w", err)
+	}
+
+	// Before anything is written, and before the dry-run return below, so that a
+	// pre-flight run reports a takeover it would otherwise have performed.
+	if err := r.checkOwnership(existing, c); err != nil {
+		return err
 	}
 
 	if !changed(existing, want, r.cfg.LabelPrefix) {
@@ -807,14 +1022,18 @@ func changed(existing, want *coreV1.Secret, labelPrefix string) bool {
 // kubeconfig was half-written, or because a label was edited, and treating any
 // of those as "deleted" would deregister live clusters.
 //
-// `unresolved` names the namespaces discover could not evaluate this pass. Their
+// `applied` is what was actually written this pass, NOT everything discovered.
+// A registration that was refused, or whose write failed, vouches for nothing.
+//
+// `unresolved` names the namespaces this pass could not establish a registration
+// for -- unreadable at discovery, failed to apply, or refused. Their
 // registrations are skipped outright, before the existence check, so a namespace
-// that exists but could not be read is never a deletion candidate at all. The
-// namespace Get below is still the proof that matters -- this is the first line
-// of defence, not a replacement for it.
-func (r *Registrar) collect(ctx context.Context, desired []child, unresolved map[string]bool) error {
+// that exists but could not be evaluated is never a deletion candidate at all.
+// The namespace Get below is still the proof that matters -- this is the first
+// line of defence, not a replacement for it.
+func (r *Registrar) collect(ctx context.Context, applied []child, unresolved map[string]bool) error {
 	live := map[string]bool{}
-	for _, d := range desired {
+	for _, d := range applied {
 		live[secretName(d.cluster)] = true
 	}
 
