@@ -65,10 +65,32 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
+      # envtest, so the tests that need a real apiserver are not silently skipped.
+      # Pinned to controller-runtime's release branch rather than @latest: the
+      # tool and the library move together.
+      - name: Set up envtest
+        run: |
+          set -euo pipefail
+          go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.23
+          echo "KUBEBUILDER_ASSETS=$(setup-envtest use -p path)" >> "$GITHUB_ENV"
+
       # There was no test step at all before, while the destructive paths
       # (garbage collection especially) carry the tests that matter most.
       - name: Test
         run: go test -race -cover ./...
+
+      # A test that skips is indistinguishable from a test that passes, and the
+      # envtest cases skip themselves when KUBEBUILDER_ASSETS is unset. So assert
+      # they RAN, rather than trusting the exit code of the step above.
+      - name: The envtest cases actually ran
+        run: |
+          set -euo pipefail
+          go test ./internal/registrar/ -run 'TestAStranded' -v -timeout 5m | tee /tmp/envtest.log
+          if ! grep -q -- '--- PASS: TestAStrandedRegistrationIsCollectedOnStartup' /tmp/envtest.log; then
+            echo "::error::the envtest case did not run; it was skipped or renamed"
+            grep -E -- '--- (PASS|SKIP|FAIL)' /tmp/envtest.log || true
+            exit 1
+          fi
 
       # Metrics were deferred for a release because securing the endpoint pulls in
       # k8s.io/apiserver and its cel-go/gRPC/OTel arm. One import of
@@ -639,6 +661,74 @@ jobs:
             exit 1
           fi
           kubectl delete namespace aaa-second --wait=true
+
+      # A namespace deleted while nothing was running produces no event to catch
+      # up on, so the startup seeder is the only thing that finds its
+      # registration. Proven under envtest too, but here with real RBAC: the
+      # seeder rebuilds its key set by LISTing owned Secrets, which the covering
+      # role must actually permit.
+      - name: A registration orphaned while the pod was down is collected on startup
+        run: |
+          set -euo pipefail
+          dep=deployment/registrar-argocd-cluster-registrar
+          kubectl create namespace k3k-downtime
+          kubectl label namespace k3k-downtime \
+            argocd-cluster-registrar/managed-by=cluster-registrar \
+            argocd-cluster-registrar/cluster=downtime
+          sed 's|https://192.0.2.10|https://192.0.2.51|' /tmp/kubeconfig.yaml > /tmp/downtime.yaml
+          kubectl create secret generic k3k-downtime-kubeconfig \
+            -n k3k-downtime --from-file=kubeconfig.yaml=/tmp/downtime.yaml
+          for i in $(seq 1 12); do
+            kubectl get secret cluster-downtime -n argocd >/dev/null 2>&1 && break
+            sleep 5
+          done
+          kubectl get secret cluster-downtime -n argocd >/dev/null
+
+          # Down, THEN delete: the whole point is that no watch event is delivered.
+          kubectl scale deployment -n registrar registrar-argocd-cluster-registrar --replicas=0
+          kubectl wait --for=delete pod -n registrar \
+            -l app.kubernetes.io/name=argocd-cluster-registrar --timeout=2m
+          kubectl delete namespace k3k-downtime --wait=true
+          kubectl get secret cluster-downtime -n argocd >/dev/null || {
+            echo "::error::the registration vanished while nothing was running"; exit 1; }
+
+          kubectl scale deployment -n registrar registrar-argocd-cluster-registrar --replicas=1
+          kubectl rollout status -n registrar "$dep" --timeout=2m
+          for i in $(seq 1 12); do
+            if ! kubectl get secret cluster-downtime -n argocd >/dev/null 2>&1; then
+              echo "collected after $((i*5))s"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::a registration orphaned during downtime was never collected"
+          kubectl logs -n registrar "$dep" --tail=50
+          exit 1
+
+      # Taking a namespace out of scope is not a deletion, and a label-filtered
+      # cache cannot tell the two apart: the apiserver reports an object that
+      # stops matching the selector as a synthetic Delete. This is the scenario
+      # where making the existence proof a cached read would deregister a live
+      # cluster fleet-wide, which is why the proof goes to the apiserver.
+      #
+      # A broad regression guard rather than a sharp one: it is here to fail if
+      # that read is ever switched to the cache, not to catch a one-line slip.
+      - name: Removing the ownership label does not deregister anything
+        run: |
+          set -euo pipefail
+          dep=deployment/registrar-argocd-cluster-registrar
+          kubectl get secret cluster-capichild -n argocd >/dev/null
+          kubectl label namespace capi-child argocd-cluster-registrar/managed-by-
+          # Longer than interval=5s, so several reconciles see the namespace
+          # out of scope rather than none.
+          sleep 20
+          kubectl get secret cluster-capichild -n argocd >/dev/null || {
+            echo "::error::a registration was deleted when its namespace left scope"
+            kubectl logs -n registrar "$dep" --tail=50; exit 1; }
+          kubectl logs -n registrar "$dep" | grep -q 'no longer carries the ownership label' || {
+            echo "::error::the namespace left scope without the controller noticing"
+            kubectl logs -n registrar "$dep" --tail=50; exit 1; }
+          kubectl label namespace capi-child argocd-cluster-registrar/managed-by=cluster-registrar
 
       # The contested-name step above proves the refusal happens and keeps
       # happening. This proves it is COUNTED, which is the half an operator can
