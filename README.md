@@ -83,49 +83,34 @@ helm upgrade <release_name> --install \
 
 ### Values
 
+Everything is optional. A default install registers k3k clusters into `argocd`:
+
 ```yaml
-# Namespace ArgoCD reads cluster Secrets from. ArgoCD only looks in its own
-# namespace, so in practice this is always "argocd".
+# Provisioners to look for, in precedence order. Presets: k3k, vcluster, kamaji,
+# capi. Unset means k3k. See "Providers" below.
+providers:
+  - k3k
+  - capi
+
+# Namespace ArgoCD reads cluster Secrets from.
 targetNamespace: argocd
 
-# Prefix for the labels read off the source namespace and copied onto the cluster
-# Secret. Change it to match an existing labelling convention.
-labelPrefix: argocd-cluster-registrar/
-
-# Value of the `<labelPrefix>managed-by` label. It picks which namespaces to
-# watch, and which cluster Secrets this release owns. Give each instance its own.
+# Picks which namespaces to watch and which cluster Secrets this release owns.
+# Give each instance its own.
 managedBy: cluster-registrar
-
-# Provisioners to look for, in precedence order. Presets: k3k, vcluster, kamaji,
-# capi. Empty means the binary's own default, which is k3k. See "Providers" below.
-providers: []
-
-# How long before a settled cluster is looked at again. NOT how quickly a new one
-# is registered: that follows the namespace event. This bounds credential
-# freshness after a certificate rotation.
-interval: 60s
-
-# Log what would change without writing anything. Useful the first time you point
-# this at an existing cluster, to check the GC selector matches only what you expect.
-dryRun: false
-
-# Verbose logging.
-debug: false
-
-# Expire demoted registrations after this long. 0s keeps them. See "Operating".
-demotedTTL: 0s
-
-# Prometheus metrics. Off by default, unauthenticated when on. See "Operating".
-metrics:
-  enabled: false
 ```
 
-The binary also falls back to your own kubeconfig when it is not running in a
-cluster, so you can try it before installing anything:
+Every key is documented in the chart itself, which is the copy that cannot drift
+from the code:
 
 ```bash
-argocd-cluster-registrar --once --dry-run --debug
+helm show values oci://ghcr.io/pcanilho/charts/argocd-cluster-registrar
 ```
+
+The ones worth knowing about are `interval`, `demotedTTL`, `leaderElection`,
+`probes` and `metrics`; see [Operating](#operating). You can also try it against
+a live cluster before installing anything, with
+[`--once`](#running-it-without-installing-anything).
 
 ### Providers
 
@@ -334,8 +319,8 @@ one namespace per child. Every **write** is a namespaced `Role` bound to
 `targetNamespace` alone, since that is the only place this ever creates, updates
 or deletes anything. Granting `secrets` write across the whole cluster would be a
 privilege-escalation path in exchange for nothing. Note `watch` is granted on
-namespaces only: see Architecture below for why the kubeconfig `Secret`s are read
-rather than watched.
+namespaces only; [docs/architecture.md](docs/architecture.md) covers why the
+kubeconfig `Secret`s are read rather than watched.
 
 ## Operating
 
@@ -385,28 +370,6 @@ anything. It is the quickest way to see what this would do to an existing
 cluster, and the easiest way to reproduce a decision the running controller made
 without disturbing it. `--dry-run` also disables leader election, so a pre-flight
 check can never take the running instance offline.
-
-### Architecture
-
-Two decisions here are deliberate and look like oversights.
-
-**Only namespaces are watched.** Not the provisioner-written kubeconfig
-`Secret`s, even though watching them would spot a credential rotation sooner.
-k3k regenerates the child's keypair on *every one of its own reconciles*, so
-that `Secret` changes far more often than the credential meaningfully does. The
-interval is what keeps that from becoming a write per k3k reconcile against a
-credential-bearing `Secret` in the ArgoCD namespace, each of which invalidates
-ArgoCD's own cluster cache. Such a watch could not be narrowed either: the
-provisioner owns that `Secret`, so it carries none of our labels, which is the
-same reason discovery is driven by the namespace in the first place.
-
-**Nothing is read through the controller's cache.** Every read goes direct. The
-namespace existence proof in particular must not be cached, because a
-label-filtered cache reports an object that stops matching the selector as a
-deletion -- so a cached `NotFound` cannot tell a deleted namespace from one that
-merely lost a label, and deregistering on the second would be catastrophic. The
-cache is configured to error rather than silently start an informer for anything
-unexpected, and no `Secret` is ever held in it.
 
 ### Who is allowed to set these labels
 
