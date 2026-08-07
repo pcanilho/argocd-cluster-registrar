@@ -747,23 +747,57 @@ jobs:
 
           kubectl delete namespace k3k-scope --wait=true
 
-      # The contested-name step above proves the refusal happens and keeps
-      # happening. This proves it is COUNTED, which is the half an operator can
-      # alert on. Deliberately a separate step rather than a replacement: the log
-      # count is what pins RequeueAfter, and losing it to a metric assertion would
-      # trade one signal for another.
+      # Proves a refusal is COUNTED, which is the half an operator can alert on.
+      # The contested-name step already proves refusals happen and keep happening,
+      # and that assertion stays: it is what pins RequeueAfter, and trading it for
+      # a metric would lose coverage rather than add it.
+      #
+      # Produces its own refusal rather than relying on that one. The downtime
+      # step above restarts the process, and a counter does not survive a restart.
       #
       # Scraped through port-forward rather than a curl pod: the image is
-      # distroless with no shell, and a second pod means an image pull in a job
-      # that already has one.
+      # distroless with no shell, and a second pod means another image pull.
       - name: A refused claim is counted under its own reason
         run: |
           set -euo pipefail
+          dep=deployment/registrar-argocd-cluster-registrar
+
+          # The holder registers FIRST, so the second claimant is refused as an
+          # incumbency rather than as a contested name.
+          kubectl create namespace k3k-holder
+          kubectl label namespace k3k-holder \
+            argocd-cluster-registrar/managed-by=cluster-registrar \
+            argocd-cluster-registrar/cluster=metered
+          sed 's|https://192.0.2.10|https://192.0.2.71|' /tmp/kubeconfig.yaml > /tmp/holder.yaml
+          kubectl create secret generic k3k-holder-kubeconfig \
+            -n k3k-holder --from-file=kubeconfig.yaml=/tmp/holder.yaml
+          for i in $(seq 1 12); do
+            kubectl get secret cluster-metered -n argocd >/dev/null 2>&1 && break
+            sleep 5
+          done
+          kubectl get secret cluster-metered -n argocd >/dev/null || {
+            echo "::error::the holder never registered, so nothing would be refused"; exit 1; }
+
+          kubectl create namespace k3k-usurper
+          kubectl label namespace k3k-usurper \
+            argocd-cluster-registrar/managed-by=cluster-registrar \
+            argocd-cluster-registrar/cluster=metered
+          sed 's|https://192.0.2.10|https://192.0.2.72|' /tmp/kubeconfig.yaml > /tmp/usurper.yaml
+          kubectl create secret generic k3k-usurper-kubeconfig \
+            -n k3k-usurper --from-file=kubeconfig.yaml=/tmp/usurper.yaml
+          for i in $(seq 1 12); do
+            kubectl logs -n registrar "$dep" | grep -q 'conflict=incumbent' && break
+            sleep 5
+          done
+          kubectl logs -n registrar "$dep" | grep -q 'conflict=incumbent' || {
+            echo "::error::the second claimant was never refused as an incumbency"
+            kubectl logs -n registrar "$dep" --tail=50; exit 1; }
+
           kubectl port-forward -n registrar svc/registrar-argocd-cluster-registrar-metrics 18080:8080 &
           pf=$!
           trap 'kill $pf 2>/dev/null || true' EXIT
           for i in $(seq 1 12); do
-            if curl -sf http://127.0.0.1:18080/metrics -o /tmp/metrics.txt; then break; fi
+            curl -sf http://127.0.0.1:18080/metrics -o /tmp/metrics.txt && break
             sleep 5
           done
           test -s /tmp/metrics.txt || { echo "::error::/metrics was never scrapeable"; exit 1; }
@@ -776,15 +810,27 @@ jobs:
             grep argocd_cluster_registrar /tmp/metrics.txt || true
             exit 1
           fi
-          # A refusal happened in the step above, so this cannot legitimately be 0.
           if [ "$(printf '%.0f' "$value")" -lt 1 ]; then
             echo "::error::a refusal was logged but never counted"
             grep argocd_cluster_registrar /tmp/metrics.txt || true
             exit 1
           fi
-          # The gauges come from the audit key, which is a different code path.
+          # Every other reason must be untouched, or a single mislabelled
+          # increment site would go unnoticed.
+          for other in contested_name create_race not_managed orphan_cluster_mismatch; do
+            v=$(awk -v s="reason=\"$other\"" '$0 ~ s {print $2}' /tmp/metrics.txt | tail -1)
+            if [ "$(printf '%.0f' "${v:-0}")" -ne 0 ]; then
+              echo "::error::an incumbency refusal also counted under reason=${other}"
+              grep argocd_cluster_registrar /tmp/metrics.txt || true
+              exit 1
+            fi
+          done
+          # The gauges come from the audit key, a different code path.
           grep -q 'argocd_cluster_registrar_registrations{state="active"}' /tmp/metrics.txt || {
             echo "::error::the registrations gauge was never set"; exit 1; }
+
+          kubectl delete namespace k3k-usurper k3k-holder --wait=true
+
 
       # Renaming demotes the old registration rather than deleting it. Worth doing
       # live because a real apiserver validates label values, and the demotion
