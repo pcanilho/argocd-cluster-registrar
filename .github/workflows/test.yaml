@@ -709,26 +709,43 @@ jobs:
       # cache cannot tell the two apart: the apiserver reports an object that
       # stops matching the selector as a synthetic Delete. This is the scenario
       # where making the existence proof a cached read would deregister a live
-      # cluster fleet-wide, which is why the proof goes to the apiserver.
+      # cluster fleet-wide, which is why that proof goes to the apiserver.
       #
       # A broad regression guard rather than a sharp one: it is here to fail if
       # that read is ever switched to the cache, not to catch a one-line slip.
+      #
+      # Creates its own namespace. Borrowing capi-child does not work: the
+      # half-written-kubeconfig step deletes it to prove GC still runs, so by here
+      # both it and its registration are long gone.
       - name: Removing the ownership label does not deregister anything
         run: |
           set -euo pipefail
           dep=deployment/registrar-argocd-cluster-registrar
-          kubectl get secret cluster-capichild -n argocd >/dev/null
-          kubectl label namespace capi-child argocd-cluster-registrar/managed-by-
-          # Longer than interval=5s, so several reconciles see the namespace
-          # out of scope rather than none.
+          kubectl create namespace k3k-scope
+          kubectl label namespace k3k-scope \
+            argocd-cluster-registrar/managed-by=cluster-registrar \
+            argocd-cluster-registrar/cluster=scoped
+          sed 's|https://192.0.2.10|https://192.0.2.61|' /tmp/kubeconfig.yaml > /tmp/scope.yaml
+          kubectl create secret generic k3k-scope-kubeconfig \
+            -n k3k-scope --from-file=kubeconfig.yaml=/tmp/scope.yaml
+          for i in $(seq 1 12); do
+            kubectl get secret cluster-scoped -n argocd >/dev/null 2>&1 && break
+            sleep 5
+          done
+          kubectl get secret cluster-scoped -n argocd >/dev/null || {
+            echo "::error::the fixture never registered, so this proves nothing"; exit 1; }
+
+          kubectl label namespace k3k-scope argocd-cluster-registrar/managed-by-
+          # Longer than interval=5s, so several reconciles see it out of scope.
           sleep 20
-          kubectl get secret cluster-capichild -n argocd >/dev/null || {
+          kubectl get secret cluster-scoped -n argocd >/dev/null || {
             echo "::error::a registration was deleted when its namespace left scope"
             kubectl logs -n registrar "$dep" --tail=50; exit 1; }
           kubectl logs -n registrar "$dep" | grep -q 'no longer carries the ownership label' || {
             echo "::error::the namespace left scope without the controller noticing"
             kubectl logs -n registrar "$dep" --tail=50; exit 1; }
-          kubectl label namespace capi-child argocd-cluster-registrar/managed-by=cluster-registrar
+
+          kubectl delete namespace k3k-scope --wait=true
 
       # The contested-name step above proves the refusal happens and keeps
       # happening. This proves it is COUNTED, which is the half an operator can
