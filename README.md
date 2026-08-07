@@ -200,6 +200,29 @@ controlPlane:
       - <address>
 ```
 
+**Not preset, and experimental.**
+[HyperShift](https://hypershift-docs.netlify.app/) hosted control planes and
+[Kubermatic KKP](https://docs.kubermatic.com/) user clusters work as a custom entry:
+
+```yaml
+providers:
+  - name: kubermatic
+    secretNamePattern: "admin-kubeconfig"
+    secretKeys: [kubeconfig]
+  - name: hypershift
+    secretNamePattern: "*-admin-kubeconfig"
+    secretKeys: [kubeconfig]
+```
+
+**Declare them in that order** if you run both: `*-admin-kubeconfig` also matches
+KKP's `internal-admin-kubeconfig`, which is reachable only from inside the cluster.
+Against `kamaji` the order is free, since that preset's keys are disjoint from
+these.
+
+**Gardener** is out of scope for the same reason as managed cloud control planes:
+since Kubernetes 1.27 it issues short-lived client certificates through the
+`shoots/adminkubeconfig` subresource instead of writing a static `Secret`.
+
 ### Marking a cluster for registration
 
 Both labels below are required. A namespace carrying `managed-by` but no
