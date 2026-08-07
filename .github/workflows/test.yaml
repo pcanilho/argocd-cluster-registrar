@@ -335,3 +335,136 @@ jobs:
           echo "::error::a stuck namespace suppressed garbage collection for the fleet"
           kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar --tail=50
           exit 1
+
+      # The escalation closed in 0.4.0. apply() used to overwrite and relabel any
+      # pre-existing cluster-<name>, so labelling a namespace was enough to
+      # repoint someone else's registration at your own API server. The fake
+      # clientset cannot prove this against a real apiserver.
+      - name: It refuses to take over a cluster Secret it does not own
+        run: |
+          set -euo pipefail
+          kubectl create secret generic cluster-hand -n argocd \
+            --from-literal=name=hand \
+            --from-literal=server=https://198.51.100.1 \
+            --from-literal=config='{"bearerToken":"handmade"}'
+          kubectl label secret cluster-hand -n argocd \
+            argocd.argoproj.io/secret-type=cluster
+
+          kubectl create namespace tenant-hand
+          kubectl label namespace tenant-hand \
+            argocd-cluster-registrar/managed-by=cluster-registrar \
+            argocd-cluster-registrar/cluster=hand
+          sed 's|https://192.0.2.10|https://203.0.113.9|' /tmp/kubeconfig.yaml > /tmp/hand.yaml
+          kubectl create secret generic k3k-hand-kubeconfig \
+            -n tenant-hand --from-file=kubeconfig.yaml=/tmp/hand.yaml
+
+          sleep 20
+          server="$(kubectl get secret cluster-hand -n argocd -o jsonpath='{.data.server}' | base64 -d)"
+          if [ "$server" != "https://198.51.100.1" ]; then
+            echo "::error::a hand-registered cluster Secret was repointed to ${server}"
+            kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar --tail=30
+            exit 1
+          fi
+          if kubectl get secret cluster-hand -n argocd \
+               -o jsonpath='{.metadata.labels.argocd-cluster-registrar/managed-by}' | grep -q .; then
+            echo "::error::a hand-registered cluster Secret was relabelled as ours"
+            exit 1
+          fi
+          kubectl delete namespace tenant-hand --wait=true
+          kubectl delete secret cluster-hand -n argocd
+
+      # Two namespaces claiming one name: the OLDER wins, and the winner must not
+      # flap afterwards. `zzz-` is created first precisely so that alphabetical
+      # order would give the wrong answer.
+      - name: A contested cluster name goes to the oldest namespace and stays there
+        run: |
+          set -euo pipefail
+          create_claimant() {
+            ns="$1"; addr="$2"
+            kubectl create namespace "$ns"
+            kubectl label namespace "$ns" \
+              argocd-cluster-registrar/managed-by=cluster-registrar \
+              argocd-cluster-registrar/cluster=contested
+            sed "s|https://192.0.2.10|https://192.0.2.${addr}|" \
+              /tmp/kubeconfig.yaml > /tmp/"$ns".yaml
+            kubectl create secret generic "k3k-$ns-kubeconfig" \
+              -n "$ns" --from-file=kubeconfig.yaml=/tmp/"$ns".yaml
+          }
+          create_claimant zzz-first 31
+          # Distinct creation timestamps; the API stores whole seconds.
+          sleep 2
+          create_claimant aaa-second 32
+
+          sleep 20
+          count="$(kubectl get secret -n argocd \
+            -l argocd-cluster-registrar/cluster=contested -o name | wc -l | tr -d ' ')"
+          if [ "$count" != "1" ]; then
+            echo "::error::expected exactly one registration for the contested name, got ${count}"
+            kubectl get secret -n argocd -l argocd-cluster-registrar/cluster=contested
+            exit 1
+          fi
+          owner() {
+            kubectl get secret cluster-contested -n argocd \
+              -o jsonpath='{.metadata.labels.argocd-cluster-registrar/source-namespace}'
+          }
+          if [ "$(owner)" != "zzz-first" ]; then
+            echo "::error::contested name went to $(owner), want the older zzz-first"
+            exit 1
+          fi
+          # Several intervals later it must still be the same winner: the pod has
+          # no persistent state, so a re-elected winner would show up here.
+          sleep 20
+          if [ "$(owner)" != "zzz-first" ]; then
+            echo "::error::the winner flapped to $(owner)"
+            exit 1
+          fi
+          # The registrar must stay up. There are no probes, so pod-Ready means
+          # only "container running"; restarts are the real signal.
+          restarts="$(kubectl get pods -n registrar \
+            -o jsonpath='{.items[*].status.containerStatuses[*].restartCount}' | tr -d ' ')"
+          if [ "$restarts" != "0" ]; then
+            echo "::error::registrar restarted ${restarts} times while refusing a claim"
+            kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar --tail=50
+            exit 1
+          fi
+          kubectl delete namespace aaa-second --wait=true
+
+      # Renaming demotes the old registration rather than deleting it. Worth doing
+      # live because a real apiserver validates label values, and the demotion
+      # stamps a timestamp -- RFC 3339 would be rejected for its colons.
+      - name: A renamed cluster demotes its old registration, reversibly
+        run: |
+          set -euo pipefail
+          kubectl label --overwrite namespace zzz-first \
+            argocd-cluster-registrar/cluster=renamed
+          for i in $(seq 1 12); do
+            if kubectl get secret cluster-renamed -n argocd >/dev/null 2>&1; then
+              break
+            fi
+            sleep 5
+          done
+          kubectl get secret cluster-renamed -n argocd >/dev/null
+
+          old="$(kubectl get secret cluster-contested -n argocd -o json)"
+          if echo "$old" | jq -e '.metadata.labels."argocd.argoproj.io/secret-type"' >/dev/null; then
+            echo "::error::the superseded registration is still visible to ArgoCD"
+            exit 1
+          fi
+          echo "$old" | jq -e '.metadata.labels."argocd-cluster-registrar/superseded-by" == "cluster-renamed"' >/dev/null
+          echo "$old" | jq -e '.metadata.labels."argocd-cluster-registrar/stale-since"' >/dev/null
+
+          # Revert: the demoted registration must come back, not be recreated.
+          kubectl label --overwrite namespace zzz-first \
+            argocd-cluster-registrar/cluster=contested
+          for i in $(seq 1 12); do
+            if kubectl get secret cluster-contested -n argocd \
+                 -o jsonpath='{.metadata.labels.argocd\.argoproj\.io/secret-type}' | grep -q cluster; then
+              echo "restored after $((i*5))s"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::a reverted rename did not restore the demoted registration"
+          kubectl get secret cluster-contested -n argocd -o jsonpath='{.metadata.labels}'; echo
+          kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar --tail=50
+          exit 1
