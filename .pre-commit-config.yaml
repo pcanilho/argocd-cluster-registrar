@@ -9,11 +9,20 @@ repos:
         pass_filenames: false
   - repo: local
     hooks:
+      # `bash -c <<<-'...'` was not valid shell -- `<<<-` is not a redirection,
+      # and `-c` was left without its argument -- so this hook could only ever
+      # exit with "option requires an argument".
       - id: check kubeconform
         name: Kubeconform validation
-        entry: bash -c <<<-'
-          helm template argocd-cluster-registrar deploy/charts/argocd-cluster-registrar | kubeconform -strict -output json -summary
-          '
+        entry: bash -c 'helm template argocd-cluster-registrar deploy/charts/argocd-cluster-registrar | kubeconform -strict -output json -summary'
+        language: system
+        pass_filenames: false
+  - repo: local
+    hooks:
+      # There was no test hook at all, so the suite only ever ran in CI.
+      - id: go-test
+        name: go test
+        entry: go test -race ./...
         language: system
         pass_filenames: false
   - repo: local
