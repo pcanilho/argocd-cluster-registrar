@@ -2,16 +2,20 @@ package registrar
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	coreV1 "k8s.io/api/core/v1"
 	apiErrors "k8s.io/apimachinery/pkg/api/errors"
 	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
@@ -21,12 +25,21 @@ const (
 	// Shared by both test files: it is the ownership marker the registrar
 	// discovers namespaces by and garbage collects on.
 	testManagedBy = "cluster-registrar"
+	testTargetNS  = "argocd"
+	// testSourceNS is the source namespace used by the ownership tests.
+	testSourceNS = "k3k-src"
+	// keyConfig is the ArgoCD cluster Secret's credential key.
+	keyConfig = "config"
+	// testNS is the source namespace most fixtures use.
+	testNS = "k3k-a"
+	// k3kServer is the endpoint inside the k3k kubeconfig fixture.
+	k3kServer = "https://192.168.1.192"
 )
 
 func testConfig() Config {
 	k3k, _ := Preset("k3k")
 	return Config{
-		TargetNamespace: "argocd",
+		TargetNamespace: testTargetNS,
 		ManagedByValue:  testManagedBy,
 		Providers:       []Provider{k3k},
 		LabelPrefix:     testPrefix,
@@ -59,11 +72,20 @@ func newTestRegistrar(objs ...runtime.Object) (*Registrar, *fake.Clientset) {
 func managedNS(name, cluster string) *coreV1.Namespace {
 	return &coreV1.Namespace{ObjectMeta: metaV1.ObjectMeta{
 		Name: name,
+		UID:  types.UID("uid-" + name),
 		Labels: map[string]string{
 			ManagedByLabel(testPrefix): testManagedBy,
 			ClusterLabel(testPrefix):   cluster,
 		},
 	}}
+}
+
+// managedNSAt is managedNS with a creation timestamp, which is what decides a
+// contested cluster name.
+func managedNSAt(name, cluster string, age time.Duration) *coreV1.Namespace {
+	ns := managedNS(name, cluster)
+	ns.CreationTimestamp = metaV1.NewTime(time.Now().Add(-age))
+	return ns
 }
 
 func kubeconfigSecret(ns, name string) *coreV1.Secret {
@@ -78,7 +100,7 @@ func registeredSecret(cluster, srcNS string) *coreV1.Secret {
 	return &coreV1.Secret{
 		ObjectMeta: metaV1.ObjectMeta{
 			Name:      secretName(cluster),
-			Namespace: "argocd",
+			Namespace: testTargetNS,
 			Labels: map[string]string{
 				argoSecretTypeLabel:              argoSecretTypeValue,
 				ManagedByLabel(testPrefix):       testManagedBy,
@@ -92,11 +114,32 @@ func registeredSecret(cluster, srcNS string) *coreV1.Secret {
 
 func secretExists(t *testing.T, c *fake.Clientset, name string) bool {
 	t.Helper()
-	_, err := c.CoreV1().Secrets("argocd").Get(context.Background(), name, metaV1.GetOptions{})
+	_, err := c.CoreV1().Secrets(testTargetNS).Get(context.Background(), name, metaV1.GetOptions{})
 	if err != nil && !apiErrors.IsNotFound(err) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	return err == nil
+}
+
+// getSecret fetches a cluster Secret that the test requires to exist.
+func getSecret(t *testing.T, c *fake.Clientset, name string) *coreV1.Secret {
+	t.Helper()
+	s, err := c.CoreV1().Secrets(testTargetNS).Get(context.Background(), name, metaV1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get %s: %v", name, err)
+	}
+	return s
+}
+
+// discoverNS fetches a namespace and evaluates it, which is what ReconcileOne
+// does between proving the namespace exists and applying the result.
+func discoverNS(t *testing.T, r *Registrar, name string) (child, bool) {
+	t.Helper()
+	ns, err := r.client.CoreV1().Namespaces().Get(context.Background(), name, metaV1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get namespace %s: %v", name, err)
+	}
+	return r.discoverOne(context.Background(), ns)
 }
 
 // The catastrophe this guard exists for: a transient API error must never be
@@ -105,11 +148,11 @@ func secretExists(t *testing.T, c *fake.Clientset, name string) bool {
 // failure as the reassuring "no kubeconfig secret yet".
 func TestTransientSecretListErrorDoesNotDeregisterAnything(t *testing.T) {
 	r, c := newTestRegistrar(
-		managedNS("k3k-a", "a"), kubeconfigSecret("k3k-a", "k3k-a-kubeconfig"), registeredSecret("a", "k3k-a"),
+		managedNS(testNS, "a"), kubeconfigSecret(testNS, "k3k-a-kubeconfig"), registeredSecret("a", testNS),
 		managedNS("k3k-b", "b"), kubeconfigSecret("k3k-b", "k3k-b-kubeconfig"), registeredSecret("b", "k3k-b"),
 	)
 	c.PrependReactor("list", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
-		if action.GetNamespace() != "argocd" {
+		if action.GetNamespace() != testTargetNS {
 			return true, nil, apiErrors.NewInternalError(io.ErrUnexpectedEOF)
 		}
 		return false, nil, nil
@@ -131,13 +174,13 @@ func TestTransientSecretListErrorDoesNotDeregisterAnything(t *testing.T) {
 func TestCollectRequiresProofTheNamespaceIsGone(t *testing.T) {
 	// The namespace exists but carries no cluster label, so it yields no child.
 	unlabelled := &coreV1.Namespace{ObjectMeta: metaV1.ObjectMeta{
-		Name:   "k3k-a",
+		Name:   testNS,
 		Labels: map[string]string{ManagedByLabel(testPrefix): testManagedBy},
 	}}
-	r, c := newTestRegistrar(unlabelled, registeredSecret("a", "k3k-a"))
+	r, c := newTestRegistrar(unlabelled, registeredSecret("a", testNS))
 
-	if err := r.collect(context.Background(), nil, nil); err != nil {
-		t.Fatalf("collect: %v", err)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
 	}
 	if !secretExists(t, c, "cluster-a") {
 		t.Error("cluster-a deleted while its source namespace still exists")
@@ -146,8 +189,8 @@ func TestCollectRequiresProofTheNamespaceIsGone(t *testing.T) {
 
 func TestCollectDeletesWhenNamespaceIsActuallyGone(t *testing.T) {
 	r, c := newTestRegistrar(registeredSecret("gone", "k3k-gone"))
-	if err := r.collect(context.Background(), nil, nil); err != nil {
-		t.Fatalf("collect: %v", err)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
 	}
 	if secretExists(t, c, "cluster-gone") {
 		t.Error("cluster-gone should have been deleted once its namespace was NotFound")
@@ -159,12 +202,12 @@ func TestCollectDeletesWhenNamespaceIsActuallyGone(t *testing.T) {
 func TestCollectNeverTouchesUnlabelledSecrets(t *testing.T) {
 	hand := &coreV1.Secret{ObjectMeta: metaV1.ObjectMeta{
 		Name:      "cluster-handmade",
-		Namespace: "argocd",
+		Namespace: testTargetNS,
 		Labels:    map[string]string{argoSecretTypeLabel: argoSecretTypeValue},
 	}}
 	r, c := newTestRegistrar(hand)
-	if err := r.collect(context.Background(), nil, nil); err != nil {
-		t.Fatalf("collect: %v", err)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
 	}
 	if !secretExists(t, c, "cluster-handmade") {
 		t.Error("a hand-registered cluster Secret was deleted")
@@ -173,7 +216,7 @@ func TestCollectNeverTouchesUnlabelledSecrets(t *testing.T) {
 
 // One undeletable Secret must not stall GC for every other cluster.
 func TestCollectContinuesPastDeleteErrors(t *testing.T) {
-	r, c := newTestRegistrar(registeredSecret("a", "k3k-a"), registeredSecret("b", "k3k-b"))
+	r, c := newTestRegistrar(registeredSecret("a", testNS), registeredSecret("b", "k3k-b"))
 	c.PrependReactor("delete", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		if action.(k8stesting.DeleteAction).GetName() == "cluster-a" {
 			return true, nil, apiErrors.NewForbidden(schema.GroupResource{Resource: "secrets"}, "cluster-a", io.ErrUnexpectedEOF)
@@ -181,7 +224,7 @@ func TestCollectContinuesPastDeleteErrors(t *testing.T) {
 		return false, nil, nil
 	})
 
-	if err := r.collect(context.Background(), nil, nil); err == nil {
+	if err := r.Reconcile(context.Background()); err == nil {
 		t.Error("expected the forbidden delete to be reported")
 	}
 	if secretExists(t, c, "cluster-b") {
@@ -192,7 +235,7 @@ func TestCollectContinuesPastDeleteErrors(t *testing.T) {
 // Update replaces the whole object, so a freshly-built Secret would silently drop
 // ArgoCD's own fields and any operator-set annotations.
 func TestApplyPreservesForeignFieldsAndAnnotations(t *testing.T) {
-	existing := registeredSecret("a", "k3k-a")
+	existing := registeredSecret("a", testNS)
 	existing.Data["namespaces"] = []byte("team-a")
 	existing.Data["project"] = []byte("infra")
 	existing.Annotations = map[string]string{"managed-by": "argocd.argoproj.io"}
@@ -200,14 +243,14 @@ func TestApplyPreservesForeignFieldsAndAnnotations(t *testing.T) {
 
 	r, c := newTestRegistrar(existing)
 	err := r.apply(context.Background(), child{
-		cluster: "a", namespace: "k3k-a",
+		cluster: "a", namespace: testNS,
 		server: "https://new", config: `{"tlsClientConfig":{"insecure":false}}`,
 	})
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 
-	got, err := c.CoreV1().Secrets("argocd").Get(context.Background(), "cluster-a", metaV1.GetOptions{})
+	got, err := c.CoreV1().Secrets(testTargetNS).Get(context.Background(), "cluster-a", metaV1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -266,7 +309,7 @@ func secretWith(ns, name, key, body string) *coreV1.Secret {
 // managed-by value garbage collect each other's Secrets.
 func TestMultipleProvidersRegisterSideBySide(t *testing.T) {
 	r, c := newTestRegistrar(
-		managedNS("k3k-a", "a"), kubeconfigSecret("k3k-a", "k3k-a-kubeconfig"),
+		managedNS(testNS, "a"), kubeconfigSecret(testNS, "k3k-a-kubeconfig"),
 		managedNS("tenant-b", "b"), secretWith("tenant-b", "b-admin-kubeconfig", "admin.conf", kamajiKubeconfig),
 	)
 	r.cfg.Providers = mustPresets(t, "k3k", "kamaji")
@@ -276,7 +319,7 @@ func TestMultipleProvidersRegisterSideBySide(t *testing.T) {
 	}
 
 	for cluster, wantProvider := range map[string]string{"a": "k3k", "b": "kamaji"} {
-		got, err := c.CoreV1().Secrets("argocd").Get(context.Background(), secretName(cluster), metaV1.GetOptions{})
+		got, err := c.CoreV1().Secrets(testTargetNS).Get(context.Background(), secretName(cluster), metaV1.GetOptions{})
 		if err != nil {
 			t.Fatalf("cluster-%s was not registered: %v", cluster, err)
 		}
@@ -291,7 +334,7 @@ func TestMultipleProvidersRegisterSideBySide(t *testing.T) {
 // is the way this change could destroy data, so it is asserted directly.
 func TestGarbageCollectionIsPerClusterAcrossProviders(t *testing.T) {
 	r, c := newTestRegistrar(
-		managedNS("k3k-a", "a"), kubeconfigSecret("k3k-a", "k3k-a-kubeconfig"), registeredSecret("a", "k3k-a"),
+		managedNS(testNS, "a"), kubeconfigSecret(testNS, "k3k-a-kubeconfig"), registeredSecret("a", testNS),
 		// b's namespace is gone; only its registration remains.
 		registeredSecret("b", "tenant-b"),
 	)
@@ -320,21 +363,18 @@ func TestKamajiViaCAPIRegistersOnce(t *testing.T) {
 	)
 	r.cfg.Providers = mustPresets(t, "kamaji", "capi")
 
-	children, _, err := r.discover(context.Background())
-	if err != nil {
-		t.Fatalf("discover: %v", err)
+	ch, ok := discoverNS(t, r, "tenant-b")
+	if !ok {
+		t.Fatal("one physical cluster produced no registration")
 	}
-	if len(children) != 1 {
-		t.Fatalf("one physical cluster produced %d registrations: %+v", len(children), children)
-	}
-	if children[0].provider != "kamaji" {
-		t.Errorf("provider = %q, want kamaji (declared first)", children[0].provider)
+	if ch.provider != "kamaji" {
+		t.Errorf("provider = %q, want kamaji (declared first)", ch.provider)
 	}
 
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	list, err := c.CoreV1().Secrets("argocd").List(context.Background(), metaV1.ListOptions{})
+	list, err := c.CoreV1().Secrets(testTargetNS).List(context.Background(), metaV1.ListOptions{})
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -359,15 +399,12 @@ func TestPrefersUsableCandidateOverExecCredential(t *testing.T) {
 	)
 	r.cfg.Providers = mustPresets(t, "capi")
 
-	children, _, err := r.discover(context.Background())
-	if err != nil {
-		t.Fatalf("discover: %v", err)
+	ch, ok := discoverNS(t, r, "capi-c")
+	if !ok {
+		t.Fatal("expected one registration, got none")
 	}
-	if len(children) != 1 {
-		t.Fatalf("expected one registration, got %d: %+v", len(children), children)
-	}
-	if children[0].server != "https://192.168.1.196:6443" {
-		t.Errorf("registered the exec-credential kubeconfig: server = %q", children[0].server)
+	if ch.server != "https://192.168.1.196:6443" {
+		t.Errorf("registered the exec-credential kubeconfig: server = %q", ch.server)
 	}
 }
 
@@ -376,9 +413,9 @@ func TestPrefersUsableCandidateOverExecCredential(t *testing.T) {
 // does not parse. That window must never look like a deletion.
 func TestUnparseableKubeconfigDoesNotDeregister(t *testing.T) {
 	r, c := newTestRegistrar(
-		managedNS("k3k-a", "a"),
-		secretWith("k3k-a", "k3k-a-kubeconfig", "kubeconfig.yaml", "<html>not a kubeconfig</html>"),
-		registeredSecret("a", "k3k-a"),
+		managedNS(testNS, "a"),
+		secretWith(testNS, "k3k-a-kubeconfig", "kubeconfig.yaml", "<html>not a kubeconfig</html>"),
+		registeredSecret("a", testNS),
 	)
 
 	if err := r.Reconcile(context.Background()); err != nil {
@@ -410,6 +447,658 @@ func TestUnresolvedNamespaceDoesNotBlockCollectionOfOthers(t *testing.T) {
 	}
 	if secretExists(t, c, "cluster-gone") {
 		t.Error("an unrelated stuck namespace blocked collection of a genuinely deleted cluster")
+	}
+}
+
+// The escalation this release closes. apply() used to Get the Secret, overwrite it
+// and relabel it as ours regardless of who wrote it, so a tenant able to label
+// their own namespace could repoint a hand-registered cluster at their own API
+// server. TestCollectNeverTouchesUnlabelledSecrets covers only collect() and gave
+// false reassurance about this path.
+func TestApplyRefusesUnownedSecret(t *testing.T) {
+	hand := &coreV1.Secret{
+		ObjectMeta: metaV1.ObjectMeta{
+			Name:      "cluster-prod",
+			Namespace: testTargetNS,
+			Labels:    map[string]string{argoSecretTypeLabel: argoSecretTypeValue},
+		},
+		Data: map[string][]byte{
+			"name":    []byte("prod"),
+			"server":  []byte("https://real-prod:6443"),
+			keyConfig: []byte(`{"bearerToken":"real"}`),
+		},
+	}
+	r, c := newTestRegistrar(hand)
+
+	err := r.apply(context.Background(), child{
+		cluster: "prod", namespace: "tenant-evil", namespaceUID: "uid-tenant-evil",
+		server: "https://attacker:6443", config: `{"bearerToken":"stolen"}`,
+	})
+	var conflict *conflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("apply returned %v, want a conflictError", err)
+	}
+
+	got := getSecret(t, c, "cluster-prod")
+	if string(got.Data["server"]) != "https://real-prod:6443" {
+		t.Errorf("server was repointed to %q", got.Data["server"])
+	}
+	if string(got.Data[keyConfig]) != `{"bearerToken":"real"}` {
+		t.Errorf("credentials were replaced: %q", got.Data[keyConfig])
+	}
+	if v, ok := got.Labels[ManagedByLabel(testPrefix)]; ok {
+		t.Errorf("a hand-registered Secret was relabelled as ours (%s=%q)",
+			ManagedByLabel(testPrefix), v)
+	}
+	if v, ok := got.Labels[SourceNamespaceLabel(testPrefix)]; ok {
+		t.Errorf("source-namespace was stamped at the attacker (%q), making it GC-eligible", v)
+	}
+}
+
+// The same refusal between two namespaces that are both legitimately managed.
+func TestApplyRefusesSecretOwnedByAnotherNamespace(t *testing.T) {
+	existing := registeredSecret("a", testSourceNS)
+	existing.Data["server"] = []byte("https://incumbent:6443")
+	r, c := newTestRegistrar(existing)
+
+	err := r.apply(context.Background(), child{
+		cluster: "a", namespace: "k3k-evil", namespaceUID: "uid-k3k-evil",
+		server: "https://challenger:6443", config: "{}",
+	})
+	var conflict *conflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("apply returned %v, want a conflictError", err)
+	}
+
+	got := getSecret(t, c, "cluster-a")
+	if string(got.Data["server"]) != "https://incumbent:6443" {
+		t.Errorf("the incumbent registration was repointed to %q", got.Data["server"])
+	}
+	if got.Labels[SourceNamespaceLabel(testPrefix)] != testSourceNS {
+		t.Errorf("ownership moved to %q", got.Labels[SourceNamespaceLabel(testPrefix)])
+	}
+}
+
+// An owned Secret with no recorded source is adoptable, but only by the cluster it
+// already names. Stripping the label must not turn into a way to claim someone
+// else's registration.
+func TestApplyAdoptsSecretWithMatchingClusterLabel(t *testing.T) {
+	existing := registeredSecret("a", testSourceNS)
+	delete(existing.Labels, SourceNamespaceLabel(testPrefix))
+	r, c := newTestRegistrar(existing)
+
+	if err := r.apply(context.Background(), child{
+		cluster: "a", namespace: testSourceNS, namespaceUID: "uid-k3k-a",
+		server: "https://x", config: "{}",
+	}); err != nil {
+		t.Fatalf("apply refused to adopt its own registration: %v", err)
+	}
+
+	got := getSecret(t, c, "cluster-a")
+	if got.Labels[SourceNamespaceLabel(testPrefix)] != testSourceNS {
+		t.Errorf("adoption did not record the source namespace: %v", got.Labels)
+	}
+}
+
+// Adoption is bounded by the cluster label. A Secret at the name `cluster-a` whose
+// own labels say it belongs to a different cluster is not an orphan of ours, so
+// stripping source-namespace must not make it claimable.
+func TestApplyRefusesAdoptionWhenClusterLabelDiffers(t *testing.T) {
+	existing := registeredSecret("a", testSourceNS)
+	delete(existing.Labels, SourceNamespaceLabel(testPrefix))
+	existing.Labels[ClusterLabel(testPrefix)] = "somethingelse"
+	r, c := newTestRegistrar(existing)
+
+	err := r.apply(context.Background(), child{
+		cluster: "a", namespace: testSourceNS, namespaceUID: "uid-k3k-a",
+		server: "https://new", config: "{}",
+	})
+	var conflict *conflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("apply returned %v, want a conflictError", err)
+	}
+
+	got := getSecret(t, c, "cluster-a")
+	if string(got.Data["server"]) == "https://new" {
+		t.Error("the Secret was adopted and overwritten anyway")
+	}
+}
+
+// Nobody holds the name, so incumbency cannot settle it. The oldest namespace wins.
+func TestOldestNamespaceWinsAContestedName(t *testing.T) {
+	// Deliberately named so that the OLDER namespace sorts last: if alphabetical
+	// order were deciding, this test would fail.
+	r, c := newTestRegistrar(
+		managedNSAt("zzz-older", "a", 2*time.Hour), kubeconfigSecret("zzz-older", "k3k-zzz-kubeconfig"),
+		managedNSAt("aaa-newer", "a", 1*time.Hour), kubeconfigSecret("aaa-newer", "k3k-aaa-kubeconfig"),
+		// Oldest of all, and first alphabetically, but claims a different cluster.
+		// If the claimant lookup ignored its label selector this would win.
+		managedNSAt("aaa-decoy", "other", 5*time.Hour), kubeconfigSecret("aaa-decoy", "k3k-decoy-kubeconfig"),
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("a contested name must not fail the pass: %v", err)
+	}
+
+	got := getSecret(t, c, "cluster-a")
+	if src := got.Labels[SourceNamespaceLabel(testPrefix)]; src != "zzz-older" {
+		t.Errorf("cluster-a went to %q, want the oldest claimant zzz-older", src)
+	}
+	if !secretExists(t, c, "cluster-other") {
+		t.Error("the uncontested cluster was not registered")
+	}
+}
+
+// The property the whole design rests on: incumbency outranks the tiebreak. An
+// older namespace appearing later must never evict a live registration, or the
+// tiebreak becomes an eviction primitive rather than an allocation rule.
+// The challenger is named to sort LAST, so that without the ownership check it
+// would be the final writer and would win. Passing by luck of iteration order is
+// exactly what this test has to rule out.
+func TestIncumbentKeepsNameAgainstAnOlderChallenger(t *testing.T) {
+	// The two claimants carry DIFFERENT kubeconfigs, so `server` shows which one
+	// actually got written rather than merely which label survived.
+	r, c := newTestRegistrar(
+		managedNSAt("aaa-incumbent", "a", 1*time.Hour),
+		kubeconfigSecret("aaa-incumbent", "k3k-inc-kubeconfig"),
+		managedNSAt("zzz-challenger", "a", 9*time.Hour),
+		secretWith("zzz-challenger", "chal-kubeconfig", "value", capiKubeconfig),
+		registeredSecret("a", "aaa-incumbent"),
+	)
+	r.cfg.Providers = mustPresets(t, "k3k", "capi")
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	got := getSecret(t, c, "cluster-a")
+	if src := got.Labels[SourceNamespaceLabel(testPrefix)]; src != "aaa-incumbent" {
+		t.Errorf("an older challenger evicted the incumbent: source-namespace = %q", src)
+	}
+	if got.Labels[ProviderLabel(testPrefix)] != "k3k" {
+		t.Errorf("provider = %q, want the incumbent's k3k", got.Labels[ProviderLabel(testPrefix)])
+	}
+	if s := string(got.Data["server"]); s != k3kServer {
+		t.Errorf("the registration was repointed at the challenger's endpoint: %q", s)
+	}
+}
+
+// A refused claimant vouches for nothing. If it still marked the name live, then
+// once the WINNER's namespace was deleted the registration would be stranded
+// forever: the loser stays refused, and GC keeps seeing the name as claimed.
+func TestConflictedLoserDoesNotStrandTheWinnersSecret(t *testing.T) {
+	// k3k-winner is gone; only its registration remains.
+	r, c := newTestRegistrar(
+		registeredSecret("a", "k3k-winner"),
+		managedNSAt("k3k-loser", "a", 1*time.Hour), kubeconfigSecret("k3k-loser", "k3k-loser-kubeconfig"),
+	)
+
+	// Pass one refuses the loser, then collects the dead winner's registration.
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	// Pass two: the name is free, so the loser takes it. Two passes because apply
+	// runs before collect within a pass.
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+
+	got := getSecret(t, c, "cluster-a")
+	if src := got.Labels[SourceNamespaceLabel(testPrefix)]; src != "k3k-loser" {
+		t.Errorf("source-namespace = %q, want k3k-loser", src)
+	}
+}
+
+// Someone wrote the Secret between our Get and our Create. Benign, resolved by
+// incumbency next pass -- and the tiebreak that keeps this safe once more than one
+// worker reconciles at a time.
+func TestCreateRaceReturnsConflict(t *testing.T) {
+	r, c := newTestRegistrar(managedNS(testSourceNS, "a"), kubeconfigSecret(testSourceNS, "k3k-a-kubeconfig"))
+	c.PrependReactor("create", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apiErrors.NewAlreadyExists(
+			schema.GroupResource{Resource: "secrets"}, "cluster-a")
+	})
+
+	err := r.apply(context.Background(), child{
+		cluster: "a", namespace: testSourceNS, namespaceUID: "uid-k3k-a",
+		server: "https://x", config: "{}",
+	})
+	var conflict *conflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("apply returned %v, want a conflictError", err)
+	}
+}
+
+// --dry-run exists to be run against an existing cluster before committing to it.
+// A takeover it would have performed is exactly what it must report, so the
+// ownership check has to sit ahead of the dry-run return.
+func TestDryRunReportsConflictAndWritesNothing(t *testing.T) {
+	existing := registeredSecret("a", testSourceNS)
+	r, c := newTestRegistrar(existing)
+	r.cfg.DryRun = true
+
+	err := r.apply(context.Background(), child{
+		cluster: "a", namespace: "k3k-evil", namespaceUID: "uid-k3k-evil",
+		server: "https://attacker", config: "{}",
+	})
+	var conflict *conflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("dry-run reported %v, want a conflictError", err)
+	}
+
+	got := getSecret(t, c, "cluster-a")
+	if got.Labels[SourceNamespaceLabel(testPrefix)] != testSourceNS {
+		t.Error("dry-run mutated the Secret")
+	}
+}
+
+// A conflict alone must not fail the pass; a genuine write failure must.
+func TestReconcileReturnsNilOnConflictButErrorsOnRealFailure(t *testing.T) {
+	newFixture := func() (*Registrar, *fake.Clientset) {
+		return newTestRegistrar(
+			registeredSecret("a", testSourceNS),
+			managedNS("k3k-evil", "a"), kubeconfigSecret("k3k-evil", "k3k-evil-kubeconfig"),
+			managedNS("k3k-b", "b"), kubeconfigSecret("k3k-b", "k3k-b-kubeconfig"),
+		)
+	}
+
+	r, _ := newFixture()
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Errorf("a contested name failed the pass: %v", err)
+	}
+
+	r, c := newFixture()
+	c.PrependReactor("create", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apiErrors.NewForbidden(
+			schema.GroupResource{Resource: "secrets"}, "cluster-b", io.ErrUnexpectedEOF)
+	})
+	if err := r.Reconcile(context.Background()); err == nil {
+		t.Error("a forbidden write was not reported")
+	}
+}
+
+// Renaming a cluster used to strand the old registration forever: its source
+// namespace still exists, so collect refuses to delete and merely warns. That is
+// not inert -- apply only runs over what was discovered, so the stale Secret is
+// never rewritten and keeps working off a frozen kubeconfig, and ArgoCD picks
+// between two registrations sharing a server URL nondeterministically.
+func TestClusterRenameDemotesOldRegistration(t *testing.T) {
+	r, c := newTestRegistrar(
+		managedNS("k3k-x", "a2"), kubeconfigSecret("k3k-x", "k3k-x-kubeconfig"),
+		registeredSecret("a", "k3k-x"),
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if !secretExists(t, c, "cluster-a2") {
+		t.Fatal("the renamed cluster was not registered")
+	}
+	old := getSecret(t, c, "cluster-a")
+	if _, ok := old.Labels[argoSecretTypeLabel]; ok {
+		t.Error("the superseded registration is still visible to ArgoCD")
+	}
+	if got := old.Labels[OrphanedSecretTypeLabel(testPrefix)]; got != argoSecretTypeValue {
+		t.Errorf("secret-type was not parked: %q", got)
+	}
+	if got := old.Labels[SupersededByLabel(testPrefix)]; got != "cluster-a2" {
+		t.Errorf("superseded-by = %q, want cluster-a2", got)
+	}
+	if old.Labels[StaleSinceLabel(testPrefix)] == "" {
+		t.Error("stale-since was not stamped")
+	}
+	// A label value may not contain ':', which is why stale-since is not RFC3339.
+	// The fake clientset does not validate, so assert it here or a real apiserver
+	// would reject every demotion.
+	for k, v := range old.Labels {
+		if errs := validation.IsValidLabelValue(v); len(errs) > 0 {
+			t.Errorf("label %s=%q is not a valid label value: %v", k, v, errs)
+		}
+	}
+}
+
+// The reason this demotes rather than deletes. A rename that gets reverted must
+// come back whole, including everything ArgoCD and operators wrote into it.
+func TestRevertedRenameRestoresDemotedRegistrationWithForeignData(t *testing.T) {
+	existing := registeredSecret("a", "k3k-x")
+	existing.Data["namespaces"] = []byte("team-a")
+	existing.Data["project"] = []byte("infra")
+	existing.Annotations = map[string]string{"managed-by": "argocd.argoproj.io"}
+	existing.Labels["unrelated"] = "keepme"
+
+	ns := managedNS("k3k-x", "a2")
+	r, c := newTestRegistrar(ns, kubeconfigSecret("k3k-x", "k3k-x-kubeconfig"), existing)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile (renamed): %v", err)
+	}
+	if _, ok := getSecret(t, c, "cluster-a").Labels[argoSecretTypeLabel]; ok {
+		t.Fatal("precondition: cluster-a should have been demoted")
+	}
+
+	// Revert the rename.
+	ns.Labels[ClusterLabel(testPrefix)] = "a"
+	if _, err := c.CoreV1().Namespaces().Update(context.Background(), ns, metaV1.UpdateOptions{}); err != nil {
+		t.Fatalf("update namespace: %v", err)
+	}
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile (reverted): %v", err)
+	}
+
+	got := getSecret(t, c, "cluster-a")
+	if got.Labels[argoSecretTypeLabel] != argoSecretTypeValue {
+		t.Error("the registration was not restored to ArgoCD's view")
+	}
+	for _, l := range []string{
+		OrphanedSecretTypeLabel(testPrefix),
+		SupersededByLabel(testPrefix),
+		StaleSinceLabel(testPrefix),
+	} {
+		if v, ok := got.Labels[l]; ok {
+			t.Errorf("demotion label %s=%q survived the restore", l, v)
+		}
+	}
+	if string(got.Data["namespaces"]) != "team-a" || string(got.Data["project"]) != "infra" {
+		t.Errorf("ArgoCD's own fields were lost: %q %q", got.Data["namespaces"], got.Data["project"])
+	}
+	if got.Annotations["managed-by"] != "argocd.argoproj.io" {
+		t.Errorf("annotations were lost: %v", got.Annotations)
+	}
+	if got.Labels["unrelated"] != "keepme" {
+		t.Errorf("foreign label was lost: %v", got.Labels)
+	}
+	if string(got.Data["server"]) != k3kServer {
+		t.Errorf("credentials were not refreshed on restore: %q", got.Data["server"])
+	}
+}
+
+// A demoted Secret keeps no ArgoCD label, so garbage collection must not select on
+// one, or it would linger forever once its namespace finally went away.
+func TestDemotedSecretIsStillCollectedWhenNamespaceGone(t *testing.T) {
+	demoted := registeredSecret("a", "k3k-gone")
+	delete(demoted.Labels, argoSecretTypeLabel)
+	demoted.Labels[OrphanedSecretTypeLabel(testPrefix)] = argoSecretTypeValue
+	demoted.Labels[SupersededByLabel(testPrefix)] = "cluster-a2"
+
+	r, c := newTestRegistrar(demoted)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if secretExists(t, c, "cluster-a") {
+		t.Error("a demoted registration was not collected once its namespace was gone")
+	}
+}
+
+// Demotion happens once. Repeating it every interval would rewrite stale-since
+// forever and churn the object.
+func TestDemotionIsNotRepeated(t *testing.T) {
+	r, c := newTestRegistrar(
+		managedNS("k3k-x", "a2"), kubeconfigSecret("k3k-x", "k3k-x-kubeconfig"),
+		registeredSecret("a", "k3k-x"),
+	)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	first := getSecret(t, c, "cluster-a").Labels[StaleSinceLabel(testPrefix)]
+
+	c.PrependReactor("update", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.(k8stesting.UpdateAction).GetObject().(*coreV1.Secret).Name == "cluster-a" {
+			t.Error("cluster-a was demoted a second time")
+		}
+		return false, nil, nil
+	})
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	if got := getSecret(t, c, "cluster-a").Labels[StaleSinceLabel(testPrefix)]; got != first {
+		t.Errorf("stale-since was rewritten: %q then %q", first, got)
+	}
+}
+
+// A terminating namespace is the one case that reaches collection having produced
+// no registration WITHOUT being marked unevaluable. Its live Secret must be left
+// exactly as it is: not re-registered, and above all not demoted. Demoting here
+// would hide a working cluster moments before its namespace finished going away,
+// and would leave it hidden for good if a finalizer then aborted the deletion.
+func TestTerminatingNamespaceIsNeitherRegisteredNorCollected(t *testing.T) {
+	ns := managedNS("k3k-x", "a")
+	now := metaV1.Now()
+	ns.DeletionTimestamp = &now
+	ns.Finalizers = []string{"kubernetes.io/test"}
+
+	r, c := newTestRegistrar(ns, kubeconfigSecret("k3k-x", "k3k-x-kubeconfig"),
+		registeredSecret("a", "k3k-x"))
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	got := getSecret(t, c, "cluster-a")
+	if got.Labels[argoSecretTypeLabel] != argoSecretTypeValue {
+		t.Error("a terminating namespace demoted its own live registration")
+	}
+	for _, l := range []string{
+		OrphanedSecretTypeLabel(testPrefix),
+		SupersededByLabel(testPrefix),
+		StaleSinceLabel(testPrefix),
+	} {
+		if _, ok := got.Labels[l]; ok {
+			t.Errorf("registration was demoted while its namespace was terminating (%s)", l)
+		}
+	}
+}
+
+// The sweep has to revisit namespaces that no longer exist, or nothing would ever
+// be collected. Their names are recoverable only from the registrations they left
+// behind.
+func TestSweepVisitsNamespacesKnownOnlyFromTheirRegistrations(t *testing.T) {
+	r, _ := newTestRegistrar(registeredSecret("gone", "k3k-gone"), managedNS("k3k-live", "live"))
+
+	keys, err := r.reconcileKeys(context.Background())
+	if err != nil {
+		t.Fatalf("reconcileKeys: %v", err)
+	}
+	want := map[string]bool{"k3k-gone": true, "k3k-live": true}
+	if len(keys) != len(want) {
+		t.Fatalf("keys = %v, want %v", keys, want)
+	}
+	for _, k := range keys {
+		if !want[k] {
+			t.Errorf("unexpected key %q", k)
+		}
+	}
+}
+
+// An owned Secret whose source-namespace label was stripped matches no collection
+// selector and routes to no key, so it is invisible unless something goes looking.
+func TestAuditReportsSecretsThatCanNeverBeCollected(t *testing.T) {
+	stranded := registeredSecret("a", testNS)
+	delete(stranded.Labels, SourceNamespaceLabel(testPrefix))
+
+	var buf strings.Builder
+	r, c := newTestRegistrar(stranded)
+	r.log = slog.New(slog.NewTextHandler(&buf, nil))
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !secretExists(t, c, "cluster-a") {
+		t.Fatal("an unroutable Secret was deleted; it must never be, there is no proof")
+	}
+	if !strings.Contains(buf.String(), "records no source namespace") {
+		t.Errorf("the audit said nothing about it:\n%s", buf.String())
+	}
+}
+
+// Under a watch the gap between proving a namespace gone and deleting its
+// registration is event latency plus a requeue, not microseconds. If the Secret is
+// recreated in that window the delete must not land on the new object, which is
+// what the UID precondition is for. The fake clientset does not enforce
+// preconditions, so this asserts the request carries one.
+func TestOrphanDeleteIsPreconditionedOnTheSecretUID(t *testing.T) {
+	orphan := registeredSecret("gone", "k3k-gone")
+	orphan.UID = types.UID("uid-cluster-gone")
+
+	r, c := newTestRegistrar(orphan)
+	var gotUID types.UID
+	var sawDelete bool
+	c.PrependReactor("delete", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		sawDelete = true
+		if pre := action.(k8stesting.DeleteActionImpl).DeleteOptions.Preconditions; pre != nil && pre.UID != nil {
+			gotUID = *pre.UID
+		}
+		return false, nil, nil
+	})
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !sawDelete {
+		t.Fatal("the orphaned registration was never deleted")
+	}
+	if gotUID != orphan.UID {
+		t.Errorf("delete precondition UID = %q, want %q", gotUID, orphan.UID)
+	}
+}
+
+// Deletion used to take up to a full interval to happen, which was often long
+// enough for a human to notice a mistaken label edit. It is now near-instant, so
+// there is an escape hatch.
+func TestPruneDisabledSurvivesBothRemovalPaths(t *testing.T) {
+	t.Run("deletion", func(t *testing.T) {
+		pinned := registeredSecret("gone", "k3k-gone")
+		pinned.Labels[PruneLabel(testPrefix)] = PruneDisabled
+		r, c := newTestRegistrar(pinned)
+
+		if err := r.Reconcile(context.Background()); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		if !secretExists(t, c, "cluster-gone") {
+			t.Error("an opted-out registration was deleted when its namespace went away")
+		}
+	})
+
+	t.Run("demotion", func(t *testing.T) {
+		pinned := registeredSecret("a", "k3k-x")
+		pinned.Labels[PruneLabel(testPrefix)] = PruneDisabled
+		r, c := newTestRegistrar(managedNS("k3k-x", "a2"),
+			kubeconfigSecret("k3k-x", "k3k-x-kubeconfig"), pinned)
+
+		if err := r.Reconcile(context.Background()); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		got := getSecret(t, c, "cluster-a")
+		if got.Labels[argoSecretTypeLabel] != argoSecretTypeValue {
+			t.Error("an opted-out registration was demoted on rename")
+		}
+	})
+}
+
+// A typo must fail safe towards normal collection, not silently pin a
+// registration in place forever.
+func TestPruneOnlyRecognisesDisabled(t *testing.T) {
+	pinned := registeredSecret("gone", "k3k-gone")
+	pinned.Labels[PruneLabel(testPrefix)] = "false"
+	r, c := newTestRegistrar(pinned)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if secretExists(t, c, "cluster-gone") {
+		t.Error(`prune="false" was treated as an opt-out; only "disabled" may be`)
+	}
+}
+
+// The opt-out belongs to whoever owns the ArgoCD namespace. A tenant setting it
+// on their own namespace must not be able to pin a registration that outlives
+// their cluster.
+func TestPruneCannotBePropagatedFromTheSourceNamespace(t *testing.T) {
+	ns := managedNS("k3k-a", "a")
+	ns.Labels[PruneLabel(testPrefix)] = PruneDisabled
+	r, c := newTestRegistrar(ns, kubeconfigSecret(testNS, "k3k-a-kubeconfig"))
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if v, ok := getSecret(t, c, "cluster-a").Labels[PruneLabel(testPrefix)]; ok {
+		t.Errorf("prune=%q was copied off the source namespace", v)
+	}
+}
+
+// Namespace names are reusable and UIDs are not. Deleting and recreating a
+// namespace -- which a GitOps re-apply does routinely -- leaves the predecessor's
+// registration pointing at a destroyed API server, and every other path returns
+// early rather than conclude anything about a namespace it could not evaluate.
+func TestReplacedNamespaceDoesNotStrandItsPredecessorsRegistration(t *testing.T) {
+	stale := registeredSecret("a", testNS)
+	stale.Labels[SourceNamespaceUIDLabel(testPrefix)] = "uid-old"
+
+	// The replacement exists but never becomes discoverable: no kubeconfig Secret.
+	replacement := managedNS(testNS, "a")
+	replacement.UID = "uid-new"
+
+	r, c := newTestRegistrar(replacement, stale)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if secretExists(t, c, "cluster-a") {
+		t.Error("a registration whose source namespace was replaced is still present, " +
+			"pointing at a cluster that no longer exists")
+	}
+}
+
+// Absence of the label is not a mismatch. Every Secret written before 0.4.0 lacks
+// it, so reading absence as "replaced" would deregister a fleet on upgrade.
+func TestRegistrationsWithoutARecordedUIDAreNeverCollectedAsStale(t *testing.T) {
+	legacy := registeredSecret("a", testNS)
+	if _, ok := legacy.Labels[SourceNamespaceUIDLabel(testPrefix)]; ok {
+		t.Fatal("precondition: the fixture must not carry a recorded UID")
+	}
+	ns := managedNS(testNS, "a")
+	ns.UID = "uid-whatever"
+
+	r, c := newTestRegistrar(ns, legacy)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !secretExists(t, c, "cluster-a") {
+		t.Error("a pre-0.4.0 registration was collected because it records no UID")
+	}
+}
+
+// A matching UID is the ordinary case and must be untouched, including on the
+// paths that skip discovery entirely.
+func TestMatchingUIDIsLeftAlone(t *testing.T) {
+	ns := managedNS(testNS, "a")
+	current := registeredSecret("a", testNS)
+	current.Labels[SourceNamespaceUIDLabel(testPrefix)] = string(ns.UID)
+
+	r, c := newTestRegistrar(ns, current) // no kubeconfig Secret: discovery fails
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !secretExists(t, c, "cluster-a") {
+		t.Error("a registration whose source namespace is unchanged was collected")
+	}
+}
+
+// The opt-out has to hold on this path too, or pinning a registration protects it
+// from one collector and not the other.
+func TestPruneDisabledSurvivesAReplacedNamespace(t *testing.T) {
+	pinned := registeredSecret("a", testNS)
+	pinned.Labels[SourceNamespaceUIDLabel(testPrefix)] = "uid-old"
+	pinned.Labels[PruneLabel(testPrefix)] = PruneDisabled
+
+	ns := managedNS(testNS, "a")
+	ns.UID = "uid-new"
+
+	r, c := newTestRegistrar(ns, pinned)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !secretExists(t, c, "cluster-a") {
+		t.Error("an opted-out registration was collected as stale")
 	}
 }
 
@@ -458,14 +1147,7 @@ func TestDiscoverSkipsInvalidClusterNames(t *testing.T) {
 		managedNS("k3k-bad", "Prod_Cluster"),
 		kubeconfigSecret("k3k-bad", "k3k-bad-kubeconfig"),
 	)
-	children, unresolved, err := r.discover(context.Background())
-	if err != nil {
-		t.Fatalf("discover: %v", err)
-	}
-	if len(children) != 0 {
-		t.Errorf("expected the invalid name to be skipped, got %+v", children)
-	}
-	if !unresolved["k3k-bad"] {
-		t.Error("a skipped namespace must be recorded as unresolved so its registration is exempt from GC")
+	if _, ok := discoverNS(t, r, "k3k-bad"); ok {
+		t.Error("expected the invalid cluster name to be skipped")
 	}
 }

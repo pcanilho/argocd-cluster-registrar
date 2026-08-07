@@ -12,6 +12,7 @@ import (
 
 	"github.com/pcanilho/argocd-cluster-registrar/internal/registrar"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 var (
@@ -36,6 +37,10 @@ var (
 	secretNamePattern string
 	secretKey         string
 	labelPrefix       string
+
+	leaderElect            bool
+	leaderElectionID       string
+	healthProbeBindAddress string
 )
 
 // resolveProviders turns the flags into the provider list, honouring the
@@ -81,10 +86,15 @@ func resolveProviders(cmd *cobra.Command) ([]registrar.Provider, error) {
 }
 
 var rootCmd = &cobra.Command{
-	Use:     "cluster-registrar",
-	Short:   "Register child Kubernetes clusters with ArgoCD",
-	Version: version + " (" + commit + ") " + date,
-	Long: `Reconciles child-cluster kubeconfig Secrets into ArgoCD cluster Secrets.
+	Use: "argocd-cluster-registrar",
+	// A runtime failure is not a usage error. Without these, any error out of
+	// RunE prints the whole Long help after it, which in pod logs buries the
+	// thing that actually went wrong.
+	SilenceUsage:  true,
+	SilenceErrors: false,
+	Short:         "Kubernetes controller that registers child clusters with ArgoCD",
+	Version:       version + " (" + commit + ") " + date,
+	Long: `A controller that reconciles child-cluster kubeconfig Secrets into ArgoCD cluster Secrets.
 
 Discovery is namespace-driven: any namespace labelled
 ` + registrar.ManagedByLabel(registrar.DefaultLabelPrefix) + `=<value> is inspected for a Secret
@@ -100,7 +110,13 @@ works; presets ship for ` + strings.Join(registrar.PresetNames(), ", ") + `, and
 once so one instance can serve a mixed fleet.
 
 Secrets whose source namespace has gone away are DELETED, so a destroyed cluster
-does not leave a broken entry behind in ArgoCD.`,
+does not leave a broken entry behind in ArgoCD. Renaming a cluster instead
+DEMOTES the old Secret: it is hidden from ArgoCD but kept, so reverting the
+rename restores it.
+
+A registration is never taken over. If the Secret already exists and records a
+different source namespace, or is not ours at all, it is refused and logged. An
+unclaimed name contested by several namespaces goes to the oldest.`,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		level := slog.LevelInfo
 		if debug {
@@ -112,8 +128,10 @@ does not leave a broken entry behind in ArgoCD.`,
 		}))
 
 		if interval <= 0 {
-			// time.NewTicker panics on a non-positive duration, so a Helm value of
-			// `interval: 0s` would crash-loop the Deployment on a stack trace.
+			// RequeueAfter: 0 means "do not requeue", so a Helm value of
+			// `interval: 0s` would leave every registration reconciled once and
+			// then never refreshed again -- silently, until a certificate
+			// rotation broke it days later.
 			return fmt.Errorf("--interval must be positive, got %s", interval)
 		}
 
@@ -141,10 +159,6 @@ does not leave a broken entry behind in ArgoCD.`,
 		ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 
-		if once {
-			return r.Reconcile(ctx)
-		}
-
 		// Report the providers actually in force, not the deprecated flag's
 		// default. This line is the only startup evidence of what the process is
 		// looking for, and logging `secretNamePattern` meant it always announced
@@ -153,44 +167,49 @@ does not leave a broken entry behind in ArgoCD.`,
 		for _, p := range providers {
 			names = append(names, p.Name)
 		}
-		log.Info("starting reconcile loop",
-			slog.Duration("interval", interval),
-			slog.String("targetNamespace", targetNamespace),
-			slog.String("managedBy", managedByValue),
-			slog.String("providers", strings.Join(names, ",")))
+		log.Info("resolved providers", slog.String("providers", strings.Join(names, ",")))
 
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			// select below can pick the ticker even when ctx is already done, so
-			// check explicitly or shutdown can run one extra full pass.
-			if ctx.Err() != nil {
-				log.Info("shutting down")
-				return nil
-			}
-			// A failed pass is logged, never fatal: one unreachable child must not
-			// take the registrar down for every other cluster.
-			if err := r.Reconcile(ctx); err != nil {
-				log.Error("reconcile failed", slog.Any("error", err))
-			}
-			select {
-			case <-ctx.Done():
-				log.Info("shutting down")
-				return nil
-			case <-ticker.C:
-			}
+		// --once never builds a manager. It is documented as a pre-flight check to
+		// run against a live cluster, so acquiring the lease would take the running
+		// instance offline for the duration of a dry run.
+		if once {
+			return r.Reconcile(ctx)
 		}
+
+		if leaderElect && dryRun {
+			// Same hazard, slower: a --dry-run process holding the lease is a
+			// registrar that reports what it would do while the real one waits.
+			log.Warn("--dry-run disables leader election")
+			leaderElect = false
+		}
+
+		return r.Start(ctx, registrar.ControllerOptions{
+			Interval:               interval,
+			LeaderElection:         leaderElect,
+			LeaderElectionID:       leaderElectionID,
+			HealthProbeBindAddress: healthProbeBindAddress,
+		})
 	},
 }
 
 func init() {
-	f := rootCmd.PersistentFlags()
+	registerFlags(rootCmd.PersistentFlags())
+}
+
+// registerFlags is separate from init so that tests can build a command with the
+// real flag definitions rather than a copy that drifts from them. The `Changed`
+// gate in resolveProviders is only meaningful against flags declared exactly as
+// they are here, defaults included.
+func registerFlags(f *pflag.FlagSet) {
 	f.BoolVar(&debug, "debug", false, "enable debug logging")
 	f.BoolVar(&dryRun, "dry-run", false, "log intended changes without writing")
 	// Long-running is the default. A one-shot Job cannot garbage-collect, because
 	// a cluster is usually destroyed long after the last sync that created it.
-	f.BoolVar(&once, "once", false, "run a single reconcile pass and exit")
-	f.DurationVar(&interval, "interval", 60*time.Second, "reconcile interval")
+	f.BoolVar(&once, "once", false,
+		"run a single sweep and exit, without building a manager or taking a lease")
+	f.DurationVar(&interval, "interval", 60*time.Second,
+		"how long before a settled cluster is revisited; bounds credential freshness, "+
+			"not registration latency")
 	f.StringVarP(&targetNamespace, "target-namespace", "t", "argocd",
 		"namespace ArgoCD reads cluster Secrets from")
 	f.StringVar(&managedByValue, "managed-by", "cluster-registrar",
@@ -209,4 +228,14 @@ func init() {
 		"DEPRECATED, use --provider: key inside that Secret holding the kubeconfig")
 	f.StringVar(&labelPrefix, "label-prefix", registrar.DefaultLabelPrefix,
 		"prefix for the labels read from the source namespace and copied onto the cluster Secret")
+	f.BoolVar(&leaderElect, "leader-elect", false,
+		"only reconcile while holding the lease, so two identically configured instances do not both run")
+	// Derived from the configuration that decides whether two instances actually
+	// collide, NOT from the release name: ownership is established purely by
+	// label-prefix and managed-by, so instances differing only in release name
+	// contend for the same Secrets and must contend for the same lease.
+	f.StringVar(&leaderElectionID, "leader-election-id", "argocd-cluster-registrar",
+		"name of the Lease used for leader election, within --target-namespace")
+	f.StringVar(&healthProbeBindAddress, "health-probe-bind-address", ":8081",
+		"address serving /healthz and /readyz; empty disables it")
 }

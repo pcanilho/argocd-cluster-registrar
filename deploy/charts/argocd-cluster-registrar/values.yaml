@@ -8,8 +8,17 @@ targetNamespace: argocd
 labelPrefix: argocd-cluster-registrar/
 
 # Value of the `<labelPrefix>managed-by` label that identifies both the namespaces
-# to watch and the ArgoCD cluster Secrets this release owns. Two registrars
-# pointed at the same value would fight over the same Secrets; give each its own.
+# to watch and the ArgoCD cluster Secrets this release owns. Give each release its
+# own: two registrars sharing a value discover the same namespaces and do the same
+# work twice. They do not corrupt each other -- neither will take over a
+# registration the other holds -- but if they are configured with different
+# `providers` they rewrite each other's `<labelPrefix>provider` label on every
+# reconcile, forever. `leaderElection` is the fix if you must run two.
+#
+# Changing this later orphans every Secret already registered. It is part of the
+# ownership record, so the new instance refuses to adopt them and garbage
+# collection no longer selects them. See "Changing managedBy or labelPrefix" in
+# the README.
 managedBy: cluster-registrar
 
 # Provisioners to look for, in precedence order. Order matters, because the
@@ -51,15 +60,55 @@ providers: []
 secretNamePattern: ""
 secretKey: ""
 
-# How often to reconcile. Each pass re-reads every kubeconfig, which is what
-# keeps registrations valid across a k3s server restart -- those rotate the client
-# certificate and would otherwise leave a silently broken cluster Secret.
+# How long before a settled cluster is looked at again.
+#
+# This is NOT how quickly a new cluster is registered or a deleted one removed:
+# both are driven by namespace events now and happen as fast as the apiserver
+# delivers one. What this bounds is credential freshness -- a k3s server restart
+# rotates the child's client certificate, and until the registration is re-read
+# ArgoCD is holding the old one. Lowering it no longer speeds anything else up.
 interval: 60s
 
 # Log intended changes without writing. Worth using when first pointing this at
 # an existing cluster, to confirm the GC selector matches only what you expect.
 dryRun: false
 debug: false
+
+# Only reconcile while holding a lease, so two instances configured identically
+# do not both run. Off by default: enabling it needs RBAC for leases and events
+# in `targetNamespace`, which is often a namespace someone else owns.
+#
+# The lease is named for `labelPrefix` and `managedBy` rather than for the Helm
+# release, because those are what decide whether two instances collide at all --
+# ownership is established purely by label. Two releases differing only in name
+# contend for the same Secrets and must contend for the same lease.
+leaderElection:
+  enabled: false
+
+# /healthz and /readyz. Readiness means the manager is running, not that this
+# replica is the leader, so a standby stays Ready.
+probes:
+  enabled: true
+  bindAddress: ":8081"
+  liveness:
+    initialDelaySeconds: 15
+    periodSeconds: 20
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+
+# One is the right number. There is no work to parallelise and no HA requirement;
+# a brief outage of this controller costs nothing, since it converges on restart.
+# More than one requires leaderElection.enabled, or they would rewrite each
+# other's provider labels forever.
+replicaCount: 1
+
+strategy:
+  type: Recreate
+
+# controller-runtime waits up to 30s for a graceful shutdown, which is exactly the
+# pod default, so leave headroom or the drain is SIGKILLed halfway.
+terminationGracePeriodSeconds: 40
 
 # Internals
 commonAnnotations: ~

@@ -5,9 +5,131 @@ All notable changes to **argocd-cluster-registrar** are documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-08-07
+
+A controller. Registration and removal now follow namespace events instead of a
+sixty-second poll, so they happen about as fast as the API server delivers one.
+
+Also closes a privilege escalation present in 0.2.0 and 0.3.0, and stops a
+renamed cluster leaving a working duplicate behind. Both are described below.
+
+Upgrading needs no configuration change. It does need new RBAC, which `helm
+upgrade` applies for you; see "Migrating from 0.3.x".
+
+### Added
+
+- **Runs as a controller.** Namespace events drive registration and removal, so a
+  new cluster appears in ArgoCD in about as long as the API server takes to
+  deliver one, and a deleted one disappears just as fast. Built on
+  controller-runtime.
+
+  Source kubeconfig `Secret`s are deliberately **not** watched. k3k regenerates
+  the child's keypair on every one of its own reconciles, so that `Secret`
+  changes far more often than the credential meaningfully does; watching it would
+  turn each of those into a write against a credential-bearing `Secret` in the
+  ArgoCD namespace. Such a watch could not be narrowed either, since the
+  provisioner owns that `Secret` and it carries none of our labels. The reasoning
+  is in the README's Architecture section.
+
+- **`/healthz` and `/readyz`**, on `:8081` by default, tunable under `probes`.
+  There were no probes at all before, so a wedged process was invisible.
+
+- **Optional leader election**, off by default. Enabling it needs `leases` and
+  `events` in `targetNamespace`. The lease is named for `labelPrefix` and
+  `managedBy` rather than the release, because those decide whether two installs
+  collide at all. `replicaCount` above one now requires it.
+
+- **`<labelPrefix>prune: disabled`** on a cluster `Secret` opts that one
+  registration out of both deletion and demotion. Removal is event-driven now and
+  therefore near-instant, where a mistake used to have up to a full interval to be
+  noticed.
+
+- **`--once` is a supported way to run this without installing it.** It performs a
+  single sweep, never builds a manager, never takes a lease, and falls back to
+  your own kubeconfig. With `--dry-run` it prints every decision it would make,
+  including refusals, without writing anything.
+
+### Fixed
+
+- **A cluster `Secret` is never taken over by a namespace that did not create it.**
+  `apply` did an unconditional `Get`, and if `cluster-<name>` existed it was
+  overwritten and relabelled as ours no matter who wrote it. Anyone able to label a
+  namespace `<prefix>managed-by` and `<prefix>cluster` could therefore repoint an
+  existing registration at their own API server with their own credentials and,
+  because the takeover rewrote `source-namespace` too, make it garbage collectable
+  on their terms. Present in 0.2.0 and 0.3.0. Reaching it needs the ability to set
+  labels on a namespace, which the documented deployment model does not grant to
+  tenants; the new "Who is allowed to set these labels" section of the README says
+  what to do if yours does.
+
+  An owned `Secret` that records no source namespace is still adoptable, but only
+  by the cluster it already names.
+
+- **Renaming a cluster no longer leaves a working duplicate behind.** Changing a
+  namespace's `<prefix>cluster` label registered the new name and stranded the old
+  `Secret` forever, because its source namespace still existed. That was not inert:
+  `apply` only runs over what discovery returned, so the stale `Secret` was never
+  rewritten and went on working from a frozen kubeconfig for as long as its
+  certificate lasted. With two registrations sharing one server URL, which one
+  ArgoCD acts on is undefined.
+
+  The old registration is now **demoted** rather than deleted: its
+  `argocd.argoproj.io/secret-type` label is parked under
+  `<prefix>orphaned-secret-type`, and `<prefix>superseded-by` and
+  `<prefix>stale-since` are added. ArgoCD stops seeing it at once, but nothing is
+  destroyed, so the `namespaces`, `clusterResources` and `project` keys ArgoCD
+  writes, plus any annotations you added, all survive. Reverting the rename
+  restores the registration, credentials and all. Demoted `Secret`s are still
+  collected once their namespace is gone.
+
+  A demoted registration keeps its cluster name reserved, which is what makes the
+  revert possible: another namespace claiming that name is refused while it exists.
+  Delete it if the name should pass to someone else.
 
 ### Changed
+
+- **Two namespaces claiming one cluster name no longer skip both.** Whoever holds
+  the registration keeps it and the other namespace is refused and logged; an
+  unclaimed name contested by several namespaces goes to the **oldest** claimant.
+  Previously neither registered, so a stale or copy-pasted namespace could deny a
+  healthy cluster its registration indefinitely. A refusal is logged at error level
+  but does not fail the pass, because a contested name persists until a human
+  fixes it.
+
+  A namespace that never produced a usable kubeconfig also used to poison a healthy
+  namespace claiming the same name, because the name was claimed before the
+  kubeconfig was read. It no longer does.
+
+- Garbage collection selects owned `Secret`s on `<prefix>managed-by` alone rather
+  than also requiring ArgoCD's `secret-type` label, so demoted registrations stay
+  collectable. Only `Secret`s carrying the ownership label are ever eligible, as
+  before.
+
+- **A namespace deleted and recreated under the same name no longer strands its
+  predecessor's registration.** Namespace names are reusable and UIDs are not, so a
+  registration recording a UID other than the one the namespace now carries has a
+  source that is provably gone. Previously, if the replacement never became
+  discoverable, every path returned early rather than conclude anything about it
+  and the old registration went on pointing at a destroyed API server. Only
+  registrations that actually record a UID are eligible, so nothing written before
+  this release is affected.
+
+- Cluster `Secret`s now record `<prefix>source-namespace-uid`, and the garbage
+  collection delete is preconditioned on the `Secret`'s own UID. Under a watch the
+  gap between proving a namespace gone and removing its registration is event
+  latency rather than microseconds, so without this a delete decided in one
+  reconcile could land on a `Secret` a later one had already recreated.
+
+- **`interval` means something different.** It is now the requeue period: how long
+  before a settled cluster is looked at again, and therefore the bound on how
+  stale a credential can be after a certificate rotation. It is no longer the
+  latency for registering or deregistering anything. The default is unchanged and
+  no action is needed.
+
+- Two instances sharing a `managedBy` value no longer merely "fight". Neither
+  will take over a registration the other holds; if they are configured with
+  different `providers` they rewrite each other's provider label, and
+  `leaderElection` is the fix.
 
 - `capi` promoted from *assumed* to *tested*. Verified against Cluster API v1.13.4
   with the Docker infrastructure provider: the kubeadm control-plane controller
@@ -21,6 +143,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README trimmed. The per-provider sections had grown to 43% of the page, most of
   it test provenance rather than instruction. Provenance lives here now; the README
   keeps the table, the configuration forms and the operational gotchas.
+
+### Migrating from 0.3.x
+
+Nothing to change. `helm upgrade` is enough for a default install, and no value
+changes meaning in a way that requires action.
+
+What is worth knowing before you upgrade:
+
+1. **The behaviour changes from this release apply on first start.** If you have a
+   cluster name claimed by two namespaces, or a registration that was previously
+   "fixed" by relabelling a namespace, you will see refusals logged at error
+   level. That is the takeover fix working. See *Fixed* above; the resolution is
+   to remove the duplicate claim.
+
+2. **RBAC widens.** `watch` on `namespaces`, cluster-wide. Nothing new in
+   `targetNamespace` unless you enable
+   `leaderElection`, which adds `leases` (get/create/update) and `events`
+   (create/patch) there. `helm upgrade` applies all of it, but if you mirror this
+   chart's RBAC into your own GitOps repo, or gate writes to the ArgoCD namespace
+   with an admission policy, allow the new rules first.
+
+   Note `watch` is **not** granted on `secrets` anywhere, and cluster-wide access
+   to them is still `list` only: they are read directly and never cached.
+
+3. **Probes are new.** If a `NetworkPolicy` restricts ingress to the registrar
+   pod, permit the kubelet to reach `:8081` or the pod will fail its probes after
+   upgrade.
+
+4. **Deletion is immediate.** Removing a namespace, or mistyping its `cluster`
+   label, now takes effect within seconds rather than up to a minute. Use
+   `<labelPrefix>prune: disabled` on any registration you want pinned.
+
+5. **`leaderElection` is available and off.** Turn it on only if you can grant
+   `leases` and `events` in `targetNamespace`.
+
+Changing `managedBy` or `labelPrefix` still orphans every existing registration,
+and now also changes which lease you contend for. See "Changing `managedBy` or
+`labelPrefix` later" in the README.
 
 ## [0.3.0] - 2026-08-07
 

@@ -72,7 +72,7 @@ kos:
       # Not {{.GitURL}}: that yields the SSH remote, which GHCR will not link.
       org.opencontainers.image.source: "https://github.com/pcanilho/argocd-cluster-registrar"
       org.opencontainers.image.licenses: "Apache-2.0"
-      org.opencontainers.image.description: "Registers the clusters you run inside your cluster with ArgoCD, and removes them again when they are deleted"
+      org.opencontainers.image.description: "Kubernetes controller that registers the clusters you run inside your cluster with ArgoCD, and removes them again when they are deleted"
     bare: true
     preserve_import_paths: false
     tags:
