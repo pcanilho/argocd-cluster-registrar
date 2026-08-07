@@ -60,6 +60,23 @@ const (
 	// introspectable and an ApplicationSet can select by provisioner.
 	SuffixProvider = "provider"
 
+	// SuffixOrphanedSecretType parks the value of argoSecretTypeLabel on a
+	// registration whose source has moved on. ArgoCD discovers clusters purely by
+	// that label selector, so moving the key deregisters the cluster immediately
+	// while destroying nothing -- a reversible delete.
+	SuffixOrphanedSecretType = "orphaned-secret-type"
+
+	// SuffixSupersededBy names the registration that replaced this one.
+	SuffixSupersededBy = "superseded-by"
+
+	// SuffixStaleSince records when the demotion happened, as a label-safe
+	// timestamp: label values may not contain ':', so RFC3339 is not an option
+	// and this uses the basic ISO 8601 form instead.
+	SuffixStaleSince = "stale-since"
+
+	// staleSinceFormat is that basic form, e.g. 20260807T143000Z.
+	staleSinceFormat = "20060102T150405Z"
+
 	// argoSecretTypeLabel is what makes ArgoCD treat a Secret as a cluster. It is
 	// a label key, not a credential; gosec G101 matches on the identifier holding
 	// "Secret" next to a string literal.
@@ -79,6 +96,15 @@ func SourceNamespaceLabel(prefix string) string { return prefix + SuffixSourceNa
 // SourceNamespaceUIDLabel is the source-namespace-uid label key for a given prefix.
 func SourceNamespaceUIDLabel(prefix string) string { return prefix + SuffixSourceNamespaceUID }
 
+// OrphanedSecretTypeLabel is the parked-secret-type label key for a given prefix.
+func OrphanedSecretTypeLabel(prefix string) string { return prefix + SuffixOrphanedSecretType }
+
+// SupersededByLabel is the superseded-by label key for a given prefix.
+func SupersededByLabel(prefix string) string { return prefix + SuffixSupersededBy }
+
+// StaleSinceLabel is the stale-since label key for a given prefix.
+func StaleSinceLabel(prefix string) string { return prefix + SuffixStaleSince }
+
 // ProviderLabel is the matched-provider label key for a given prefix.
 func ProviderLabel(prefix string) string { return prefix + SuffixProvider }
 
@@ -95,6 +121,9 @@ var reservedSuffixes = []string{
 	SuffixSourceNamespace,
 	SuffixSourceNamespaceUID,
 	SuffixProvider,
+	SuffixOrphanedSecretType,
+	SuffixSupersededBy,
+	SuffixStaleSince,
 }
 
 // Provider is one provisioner's kubeconfig Secret shape.
@@ -356,6 +385,12 @@ func (r *Registrar) providerLabel() string        { return ProviderLabel(r.cfg.L
 func (r *Registrar) sourceNamespaceUIDLabel() string {
 	return SourceNamespaceUIDLabel(r.cfg.LabelPrefix)
 }
+
+func (r *Registrar) orphanedSecretTypeLabel() string {
+	return OrphanedSecretTypeLabel(r.cfg.LabelPrefix)
+}
+func (r *Registrar) supersededByLabel() string { return SupersededByLabel(r.cfg.LabelPrefix) }
+func (r *Registrar) staleSinceLabel() string   { return StaleSinceLabel(r.cfg.LabelPrefix) }
 
 // clientTimeout bounds every API call. Without it rest.Config.Timeout is 0, so a
 // hung request inside Reconcile blocks forever: the ticker never fires again and
@@ -986,6 +1021,51 @@ func (r *Registrar) apply(ctx context.Context, c child) error {
 	return nil
 }
 
+// demote takes a registration out of ArgoCD's sight without destroying it.
+//
+// Deleting would be simpler and is what a prune-style tool does, but this Secret
+// is not solely ours: ArgoCD writes `namespaces`, `clusterResources` and
+// `project` into it, and operators add annotations and foreign labels. apply()
+// goes to some length not to clobber those (see the read-modify-write there), and
+// deleting on a rename would throw away everything it protects. A mistaken rename
+// that gets reverted would silently take an operator's per-cluster configuration
+// with it.
+//
+// ArgoCD discovers clusters purely by the argocd.argoproj.io/secret-type label
+// selector, so parking that one key deregisters the cluster immediately and
+// completely, while every byte survives. It also self-heals: apply() copies
+// want.Labels over the existing object, restoring secret-type, and its
+// prefixed-label sweep removes the three labels written here because they are
+// prefixed and absent from want.Labels. So reverting the rename restores the
+// registration, credentials and all, with no special case anywhere.
+func (r *Registrar) demote(ctx context.Context, s *coreV1.Secret, supersededBy string) error {
+	if r.cfg.DryRun {
+		r.log.Info("[dry-run] would demote superseded cluster secret",
+			slog.String("secret", s.Name), slog.String("supersededBy", supersededBy))
+		return nil
+	}
+
+	updated := s.DeepCopy()
+	if updated.Labels == nil {
+		updated.Labels = map[string]string{}
+	}
+	if v, ok := updated.Labels[argoSecretTypeLabel]; ok {
+		updated.Labels[r.orphanedSecretTypeLabel()] = v
+		delete(updated.Labels, argoSecretTypeLabel)
+	}
+	updated.Labels[r.supersededByLabel()] = supersededBy
+	updated.Labels[r.staleSinceLabel()] = time.Now().UTC().Format(staleSinceFormat)
+
+	if _, err := r.client.CoreV1().Secrets(r.cfg.TargetNamespace).
+		Update(ctx, updated, metaV1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("demote %s: %w", s.Name, err)
+	}
+	r.log.Warn("demoted superseded cluster registration; it is no longer visible to ArgoCD but has been kept",
+		slog.String("secret", s.Name), slog.String("supersededBy", supersededBy),
+		slog.String("namespace", s.Labels[r.sourceNamespaceLabel()]))
+	return nil
+}
+
 // changed reports whether the live Secret differs from what we would write.
 // Compares Data (what the apiserver stores) against StringData (what we set).
 func changed(existing, want *coreV1.Secret, labelPrefix string) bool {
@@ -1033,13 +1113,23 @@ func changed(existing, want *coreV1.Secret, labelPrefix string) bool {
 // line of defence, not a replacement for it.
 func (r *Registrar) collect(ctx context.Context, applied []child, unresolved map[string]bool) error {
 	live := map[string]bool{}
+	// moved maps a source namespace to the registration it holds NOW. One
+	// namespace carries one cluster label, so this is 1:1 by construction.
+	//
+	// This is not the cross-namespace coupling a per-namespace reconcile has to
+	// shed: it is only ever read as moved[srcNS] for the Secret's OWN recorded
+	// namespace, so it decomposes cleanly. Do not delete it as a blocker.
+	moved := make(map[string]string, len(applied))
 	for _, d := range applied {
 		live[secretName(d.cluster)] = true
+		moved[d.namespace] = secretName(d.cluster)
 	}
 
-	selector := fmt.Sprintf("%s=%s,%s=%s",
-		argoSecretTypeLabel, argoSecretTypeValue,
-		r.managedByLabel(), r.cfg.ManagedByValue)
+	// Selected on ownership ALONE, deliberately. Selecting on secret-type as well
+	// would hide already-demoted registrations, which still need collecting once
+	// their namespace finally goes away. managed-by is the ownership marker; the
+	// ArgoCD label is incidental to us.
+	selector := fmt.Sprintf("%s=%s", r.managedByLabel(), r.cfg.ManagedByValue)
 
 	secrets, err := r.client.CoreV1().Secrets(r.cfg.TargetNamespace).List(ctx, metaV1.ListOptions{LabelSelector: selector})
 	if err != nil {
@@ -1070,8 +1160,30 @@ func (r *Registrar) collect(ctx context.Context, applied []child, unresolved map
 		}
 
 		if _, err := r.client.CoreV1().Namespaces().Get(ctx, srcNS, metaV1.GetOptions{}); err == nil {
-			// Still there. Something else kept it out of `desired`, so this is a
-			// problem to report, never a deletion.
+			// The namespace is still there, so this is never a deletion. But it
+			// is not automatically a reason to keep the registration VISIBLE: if
+			// that namespace was fully evaluated this pass and registered under a
+			// different name, it has disclaimed this one and nothing will ever
+			// reclaim it. That is positive proof of a second kind, not an absence.
+			//
+			// Left alone, the stale Secret is not inert. apply() only runs over
+			// what was discovered, so it is never rewritten -- its kubeconfig
+			// freezes with a certificate good for about a year, and ArgoCD
+			// resolves two registrations sharing one server URL by taking
+			// whichever the informer index yields first.
+			if now, ok := moved[srcNS]; ok && now != s.Name {
+				if s.Labels[r.orphanedSecretTypeLabel()] != "" {
+					// Already demoted on an earlier pass. Nothing to do, and
+					// nothing worth saying every interval.
+					r.log.Debug("superseded registration is already demoted",
+						slog.String("secret", s.Name), slog.String("supersededBy", now))
+					continue
+				}
+				if err := r.demote(ctx, s, now); err != nil {
+					errs = append(errs, err.Error())
+				}
+				continue
+			}
 			r.log.Warn("source namespace still exists but produced no registration; not deleting",
 				slog.String("secret", s.Name), slog.String("namespace", srcNS))
 			continue

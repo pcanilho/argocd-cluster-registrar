@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
@@ -704,6 +705,145 @@ func TestReconcileReturnsNilOnConflictButErrorsOnRealFailure(t *testing.T) {
 	})
 	if err := r.Reconcile(context.Background()); err == nil {
 		t.Error("a forbidden write was not reported")
+	}
+}
+
+// Renaming a cluster used to strand the old registration forever: its source
+// namespace still exists, so collect refuses to delete and merely warns. That is
+// not inert -- apply only runs over what was discovered, so the stale Secret is
+// never rewritten and keeps working off a frozen kubeconfig, and ArgoCD picks
+// between two registrations sharing a server URL nondeterministically.
+func TestClusterRenameDemotesOldRegistration(t *testing.T) {
+	r, c := newTestRegistrar(
+		managedNS("k3k-x", "a2"), kubeconfigSecret("k3k-x", "k3k-x-kubeconfig"),
+		registeredSecret("a", "k3k-x"),
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if !secretExists(t, c, "cluster-a2") {
+		t.Fatal("the renamed cluster was not registered")
+	}
+	old := getSecret(t, c, "cluster-a")
+	if _, ok := old.Labels[argoSecretTypeLabel]; ok {
+		t.Error("the superseded registration is still visible to ArgoCD")
+	}
+	if got := old.Labels[OrphanedSecretTypeLabel(testPrefix)]; got != argoSecretTypeValue {
+		t.Errorf("secret-type was not parked: %q", got)
+	}
+	if got := old.Labels[SupersededByLabel(testPrefix)]; got != "cluster-a2" {
+		t.Errorf("superseded-by = %q, want cluster-a2", got)
+	}
+	if old.Labels[StaleSinceLabel(testPrefix)] == "" {
+		t.Error("stale-since was not stamped")
+	}
+	// A label value may not contain ':', which is why stale-since is not RFC3339.
+	// The fake clientset does not validate, so assert it here or a real apiserver
+	// would reject every demotion.
+	for k, v := range old.Labels {
+		if errs := validation.IsValidLabelValue(v); len(errs) > 0 {
+			t.Errorf("label %s=%q is not a valid label value: %v", k, v, errs)
+		}
+	}
+}
+
+// The reason this demotes rather than deletes. A rename that gets reverted must
+// come back whole, including everything ArgoCD and operators wrote into it.
+func TestRevertedRenameRestoresDemotedRegistrationWithForeignData(t *testing.T) {
+	existing := registeredSecret("a", "k3k-x")
+	existing.Data["namespaces"] = []byte("team-a")
+	existing.Data["project"] = []byte("infra")
+	existing.Annotations = map[string]string{"managed-by": "argocd.argoproj.io"}
+	existing.Labels["unrelated"] = "keepme"
+
+	ns := managedNS("k3k-x", "a2")
+	r, c := newTestRegistrar(ns, kubeconfigSecret("k3k-x", "k3k-x-kubeconfig"), existing)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile (renamed): %v", err)
+	}
+	if _, ok := getSecret(t, c, "cluster-a").Labels[argoSecretTypeLabel]; ok {
+		t.Fatal("precondition: cluster-a should have been demoted")
+	}
+
+	// Revert the rename.
+	ns.Labels[ClusterLabel(testPrefix)] = "a"
+	if _, err := c.CoreV1().Namespaces().Update(context.Background(), ns, metaV1.UpdateOptions{}); err != nil {
+		t.Fatalf("update namespace: %v", err)
+	}
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile (reverted): %v", err)
+	}
+
+	got := getSecret(t, c, "cluster-a")
+	if got.Labels[argoSecretTypeLabel] != argoSecretTypeValue {
+		t.Error("the registration was not restored to ArgoCD's view")
+	}
+	for _, l := range []string{
+		OrphanedSecretTypeLabel(testPrefix),
+		SupersededByLabel(testPrefix),
+		StaleSinceLabel(testPrefix),
+	} {
+		if v, ok := got.Labels[l]; ok {
+			t.Errorf("demotion label %s=%q survived the restore", l, v)
+		}
+	}
+	if string(got.Data["namespaces"]) != "team-a" || string(got.Data["project"]) != "infra" {
+		t.Errorf("ArgoCD's own fields were lost: %q %q", got.Data["namespaces"], got.Data["project"])
+	}
+	if got.Annotations["managed-by"] != "argocd.argoproj.io" {
+		t.Errorf("annotations were lost: %v", got.Annotations)
+	}
+	if got.Labels["unrelated"] != "keepme" {
+		t.Errorf("foreign label was lost: %v", got.Labels)
+	}
+	if string(got.Data["server"]) != "https://192.168.1.192" {
+		t.Errorf("credentials were not refreshed on restore: %q", got.Data["server"])
+	}
+}
+
+// A demoted Secret keeps no ArgoCD label, so garbage collection must not select on
+// one, or it would linger forever once its namespace finally went away.
+func TestDemotedSecretIsStillCollectedWhenNamespaceGone(t *testing.T) {
+	demoted := registeredSecret("a", "k3k-gone")
+	delete(demoted.Labels, argoSecretTypeLabel)
+	demoted.Labels[OrphanedSecretTypeLabel(testPrefix)] = argoSecretTypeValue
+	demoted.Labels[SupersededByLabel(testPrefix)] = "cluster-a2"
+
+	r, c := newTestRegistrar(demoted)
+	if err := r.collect(context.Background(), nil, nil); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	if secretExists(t, c, "cluster-a") {
+		t.Error("a demoted registration was not collected once its namespace was gone")
+	}
+}
+
+// Demotion happens once. Repeating it every interval would rewrite stale-since
+// forever and churn the object.
+func TestDemotionIsNotRepeated(t *testing.T) {
+	r, c := newTestRegistrar(
+		managedNS("k3k-x", "a2"), kubeconfigSecret("k3k-x", "k3k-x-kubeconfig"),
+		registeredSecret("a", "k3k-x"),
+	)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	first := getSecret(t, c, "cluster-a").Labels[StaleSinceLabel(testPrefix)]
+
+	c.PrependReactor("update", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.(k8stesting.UpdateAction).GetObject().(*coreV1.Secret).Name == "cluster-a" {
+			t.Error("cluster-a was demoted a second time")
+		}
+		return false, nil, nil
+	})
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	if got := getSecret(t, c, "cluster-a").Labels[StaleSinceLabel(testPrefix)]; got != first {
+		t.Errorf("stale-since was rewritten: %q then %q", first, got)
 	}
 }
 
