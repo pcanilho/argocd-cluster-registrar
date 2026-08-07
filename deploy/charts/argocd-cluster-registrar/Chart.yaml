@@ -1,6 +1,6 @@
 apiVersion: v2
 name: argocd-cluster-registrar
-description: Registers the clusters you run inside your cluster with ArgoCD, and removes them again when they are deleted
+description: Kubernetes controller that registers the clusters you run inside your cluster with ArgoCD, and removes them again when they are deleted
 
 type: application
 version: 0.4.0
@@ -22,6 +22,8 @@ keywords:
   - vcluster
   - kamaji
   - kubernetes
+  - controller
+  - operator
 
 maintainers:
   - name: pcanilho

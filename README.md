@@ -37,11 +37,15 @@ usually skip:
 * Registers each child cluster it finds, so ArgoCD can target it by name.
 * Deletes the registration when the cluster is gone. Otherwise a destroyed
   cluster leaves a dead entry in ArgoCD forever.
-* Re-reads every kubeconfig on each pass. A k3s server restart rotates the
-  child's client certificate, and without this ArgoCD quietly starts failing
-  authentication.
+* Re-reads every kubeconfig on a timer, on top of reacting to changes. A k3s
+  server restart rotates the child's client certificate, and without this ArgoCD
+  quietly starts failing authentication.
 
 > [!IMPORTANT]
+> Upgrading from `0.3.x`? Nothing to change, but registration is event-driven now
+> and the RBAC widens. See
+> [Migrating from 0.3.x](CHANGELOG.md#migrating-from-03x).
+>
 > Upgrading from `0.1.x` (`vcluster-argocd-exporter`)? The flags, values, Secret
 > names and labels all changed, and a stale values file fails silently. See
 > [Migrating from 0.1.x](CHANGELOG.md#migrating-from-01x). That section predates
@@ -54,8 +58,9 @@ Install it once, as a singleton. Do not add it as a dependency of a per-cluster
 chart: every instance reconciles cluster-wide, so a second one is at best doing
 the same work twice. Give each instance its own `managedBy` if you do run more
 than one. Two instances sharing that value but configured with different
-`providers` will rewrite each other's `<labelPrefix>provider` label every pass,
-forever.
+`providers` will rewrite each other's `<labelPrefix>provider` label on every
+reconcile, forever. Setting `leaderElection.enabled` makes that safe instead:
+whichever acquires the lease runs, and the other waits.
 
 ### Helm `dependency`
 
@@ -95,8 +100,9 @@ managedBy: cluster-registrar
 # capi. Empty means the binary's own default, which is k3k. See "Providers" below.
 providers: []
 
-# Each pass re-reads every kubeconfig, which is what keeps registrations working
-# after a certificate rotation.
+# How long before a settled cluster is looked at again. NOT how quickly a new one
+# is registered: that follows the namespace event. This bounds credential
+# freshness after a certificate rotation.
 interval: 60s
 
 # Log what would change without writing anything. Useful the first time you point
@@ -246,7 +252,7 @@ flowchart LR
         KC["Secret: k3k-sandbox-kubeconfig<br/>written by the provisioner"]
     end
 
-    REG(["argocd-cluster-registrar"])
+    REG(["argocd-cluster-registrar<br/>controller"])
 
     subgraph argo["namespace: argocd"]
         CS["Secret: cluster-sandbox<br/>secret-type=cluster<br/>flux=true"]
@@ -254,7 +260,7 @@ flowchart LR
 
     APPSET["ApplicationSet<br/>cluster generator"]
 
-    NS -->|"1. discover by label"| REG
+    NS -->|"1. watch by label"| REG
     KC -->|"2. read kubeconfig"| REG
     REG -->|"3. create or update, never take over"| CS
     REG -.->|"4. delete once the namespace is gone<br/>demote once the cluster is renamed"| CS
@@ -265,8 +271,9 @@ The provisioner writes the kubeconfig. The registrar reshapes its credentials
 into ArgoCD's format, copies across any prefixed labels from the namespace, and
 writes the result into `argocd`.
 
-Each pass is a full reconcile rather than an event diff. It is easier to reason
-about, and refreshing credentials comes for free:
+Registration and removal follow namespace events, so they happen about as fast as
+the API server delivers one. Every cluster is then revisited on a timer as well,
+which is what keeps credentials fresh across a certificate rotation:
 
 ```mermaid
 stateDiagram-v2
@@ -276,7 +283,7 @@ stateDiagram-v2
     Waiting --> Waiting: provisioner still booting
     Waiting --> Refused: name held by another namespace
     Refused --> Registered: the holder goes away
-    Registered --> Registered: kubeconfig re-read every interval<br/>(survives cert rotation)
+    Registered --> Registered: kubeconfig re-read every interval<br/>(requeue; survives cert rotation)
     Registered --> Demoted: cluster label renamed<br/>hidden from ArgoCD, kept intact
     Demoted --> Registered: rename reverted
     Registered --> [*]: source namespace deleted<br/>cluster Secret removed
@@ -295,14 +302,73 @@ finds clusters by that one label, so the stale entry disappears at once while
 nothing is destroyed. Change the label back and the registration returns intact,
 so a mistaken rename costs nothing.
 
-RBAC is split by scope. Reads are cluster-wide (`namespaces` get/list, `secrets`
-list) because discovery is label-driven and the sources sit in one namespace per
-child. Every **write** is a namespaced `Role` bound to
+RBAC is split by scope. Reads are cluster-wide (`namespaces` get/list/watch,
+`secrets` get/list) because discovery is label-driven and the sources sit in one
+namespace per child. Every **write** is a namespaced `Role` bound to
 `targetNamespace` alone, since that is the only place this ever creates, updates
 or deletes anything. Granting `secrets` write across the whole cluster would be a
-privilege-escalation path in exchange for nothing.
+privilege-escalation path in exchange for nothing. Note `watch` is granted on
+namespaces only: see Architecture below for why the kubeconfig `Secret`s are read
+rather than watched.
 
 ## Operating
+
+### Operational surface
+
+A controller, so: `/healthz` and `/readyz` on `:8081` by default, tunable under
+`probes`. Readiness means the manager is running, not that this replica holds the
+lease, so a standby stays Ready.
+
+Metrics are **not** served. Enabling them would mean either an unauthenticated
+port or pulling in the API server authn/authz stack, and there is nothing here
+worth either yet.
+
+`leaderElection` is off by default and needs `leases` and `events` in
+`targetNamespace`. The lease is named for `labelPrefix` and `managedBy`, not for
+the release, because those are what decide whether two installs collide at all --
+so two releases that would fight for the same `Secret`s contend for the same
+lease, and two that never would are left alone.
+
+`interval` is a **requeue** period, not a poll. Registration and removal follow
+namespace events; the interval only bounds how stale a credential can get.
+
+### Running it without installing anything
+
+`--once` performs a single sweep and exits. It never builds a manager, never
+takes a lease, and falls back to your own kubeconfig, so it is safe to point at a
+live cluster from a laptop:
+
+```bash
+argocd-cluster-registrar --once --dry-run --debug
+```
+
+That prints every decision it would make, including refusals, without writing
+anything. It is the quickest way to see what this would do to an existing
+cluster, and the easiest way to reproduce a decision the running controller made
+without disturbing it. `--dry-run` also disables leader election, so a pre-flight
+check can never take the running instance offline.
+
+### Architecture
+
+Two decisions here are deliberate and look like oversights.
+
+**Only namespaces are watched.** Not the provisioner-written kubeconfig
+`Secret`s, even though watching them would spot a credential rotation sooner.
+k3k regenerates the child's keypair on *every one of its own reconciles*, so
+that `Secret` changes far more often than the credential meaningfully does. The
+interval is what keeps that from becoming a write per k3k reconcile against a
+credential-bearing `Secret` in the ArgoCD namespace, each of which invalidates
+ArgoCD's own cluster cache. Such a watch could not be narrowed either: the
+provisioner owns that `Secret`, so it carries none of our labels, which is the
+same reason discovery is driven by the namespace in the first place.
+
+**Nothing is read through the controller's cache.** Every read goes direct. The
+namespace existence proof in particular must not be cached, because a
+label-filtered cache reports an object that stops matching the selector as a
+deletion -- so a cached `NotFound` cannot tell a deleted namespace from one that
+merely lost a label, and deregistering on the second would be catastrophic. The
+cache is configured to error rather than silently start an informer for anything
+unexpected, and no `Secret` is ever held in it.
 
 ### Who is allowed to set these labels
 

@@ -87,9 +87,9 @@ func resolveProviders(cmd *cobra.Command) ([]registrar.Provider, error) {
 
 var rootCmd = &cobra.Command{
 	Use:     "cluster-registrar",
-	Short:   "Register child Kubernetes clusters with ArgoCD",
+	Short:   "Kubernetes controller that registers child clusters with ArgoCD",
 	Version: version + " (" + commit + ") " + date,
-	Long: `Reconciles child-cluster kubeconfig Secrets into ArgoCD cluster Secrets.
+	Long: `A controller that reconciles child-cluster kubeconfig Secrets into ArgoCD cluster Secrets.
 
 Discovery is namespace-driven: any namespace labelled
 ` + registrar.ManagedByLabel(registrar.DefaultLabelPrefix) + `=<value> is inspected for a Secret
