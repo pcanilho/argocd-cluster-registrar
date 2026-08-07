@@ -1273,13 +1273,27 @@ func (r *Registrar) deleteOrphan(ctx context.Context, s *coreV1.Secret, nsName s
 			slog.String("secret", s.Name), slog.String("namespace", nsName))
 		return nil
 	}
-	err := r.client.CoreV1().Secrets(r.cfg.TargetNamespace).Delete(ctx, s.Name, metaV1.DeleteOptions{})
+	// Preconditioned on the Secret's own UID. Under the poll loop the gap between
+	// the existence proof and this call was microseconds and single-threaded; under
+	// a watch it is event latency plus a requeue, so a delete decided in one
+	// reconcile can otherwise land on a Secret a later one has already recreated --
+	// deregistering a cluster that is genuinely live.
+	err := r.client.CoreV1().Secrets(r.cfg.TargetNamespace).Delete(ctx, s.Name, metaV1.DeleteOptions{
+		Preconditions: &metaV1.Preconditions{UID: &s.UID},
+	})
 	switch {
 	case err == nil:
 		r.log.Info("deregistered cluster (source namespace gone)",
 			slog.String("secret", s.Name), slog.String("namespace", nsName))
 		return nil
 	case apiErrors.IsNotFound(err):
+		return nil
+	case apiErrors.IsConflict(err):
+		// The Secret was replaced between the read and the delete, so it is no
+		// longer the object the proof was about. Leave it; the next reconcile sees
+		// the new one and decides again.
+		r.log.Info("cluster secret changed identity before deletion; leaving it",
+			slog.String("secret", s.Name), slog.String("namespace", nsName))
 		return nil
 	default:
 		// Keep going. One Secret held up by a finalizer or an admission webhook

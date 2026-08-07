@@ -927,6 +927,37 @@ func TestAuditReportsSecretsThatCanNeverBeCollected(t *testing.T) {
 	}
 }
 
+// Under a watch the gap between proving a namespace gone and deleting its
+// registration is event latency plus a requeue, not microseconds. If the Secret is
+// recreated in that window the delete must not land on the new object, which is
+// what the UID precondition is for. The fake clientset does not enforce
+// preconditions, so this asserts the request carries one.
+func TestOrphanDeleteIsPreconditionedOnTheSecretUID(t *testing.T) {
+	orphan := registeredSecret("gone", "k3k-gone")
+	orphan.UID = types.UID("uid-cluster-gone")
+
+	r, c := newTestRegistrar(orphan)
+	var gotUID types.UID
+	var sawDelete bool
+	c.PrependReactor("delete", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		sawDelete = true
+		if pre := action.(k8stesting.DeleteActionImpl).DeleteOptions.Preconditions; pre != nil && pre.UID != nil {
+			gotUID = *pre.UID
+		}
+		return false, nil, nil
+	})
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !sawDelete {
+		t.Fatal("the orphaned registration was never deleted")
+	}
+	if gotUID != orphan.UID {
+		t.Errorf("delete precondition UID = %q, want %q", gotUID, orphan.UID)
+	}
+}
+
 func TestConfigValidate(t *testing.T) {
 	for name, mutate := range map[string]func(*Config){
 		"empty target namespace": func(c *Config) { c.TargetNamespace = "" },
