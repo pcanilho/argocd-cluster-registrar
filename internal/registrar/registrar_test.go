@@ -962,6 +962,70 @@ func TestOrphanDeleteIsPreconditionedOnTheSecretUID(t *testing.T) {
 	}
 }
 
+// Deletion used to take up to a full interval to happen, which was often long
+// enough for a human to notice a mistaken label edit. It is now near-instant, so
+// there is an escape hatch.
+func TestPruneDisabledSurvivesBothRemovalPaths(t *testing.T) {
+	t.Run("deletion", func(t *testing.T) {
+		pinned := registeredSecret("gone", "k3k-gone")
+		pinned.Labels[PruneLabel(testPrefix)] = PruneDisabled
+		r, c := newTestRegistrar(pinned)
+
+		if err := r.Reconcile(context.Background()); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		if !secretExists(t, c, "cluster-gone") {
+			t.Error("an opted-out registration was deleted when its namespace went away")
+		}
+	})
+
+	t.Run("demotion", func(t *testing.T) {
+		pinned := registeredSecret("a", "k3k-x")
+		pinned.Labels[PruneLabel(testPrefix)] = PruneDisabled
+		r, c := newTestRegistrar(managedNS("k3k-x", "a2"),
+			kubeconfigSecret("k3k-x", "k3k-x-kubeconfig"), pinned)
+
+		if err := r.Reconcile(context.Background()); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		got := getSecret(t, c, "cluster-a")
+		if got.Labels[argoSecretTypeLabel] != argoSecretTypeValue {
+			t.Error("an opted-out registration was demoted on rename")
+		}
+	})
+}
+
+// A typo must fail safe towards normal collection, not silently pin a
+// registration in place forever.
+func TestPruneOnlyRecognisesDisabled(t *testing.T) {
+	pinned := registeredSecret("gone", "k3k-gone")
+	pinned.Labels[PruneLabel(testPrefix)] = "false"
+	r, c := newTestRegistrar(pinned)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if secretExists(t, c, "cluster-gone") {
+		t.Error(`prune="false" was treated as an opt-out; only "disabled" may be`)
+	}
+}
+
+// The opt-out belongs to whoever owns the ArgoCD namespace. A tenant setting it
+// on their own namespace must not be able to pin a registration that outlives
+// their cluster.
+func TestPruneCannotBePropagatedFromTheSourceNamespace(t *testing.T) {
+	ns := managedNS("k3k-a", "a")
+	ns.Labels[PruneLabel(testPrefix)] = PruneDisabled
+	r, c := newTestRegistrar(ns, kubeconfigSecret(testNS, "k3k-a-kubeconfig"))
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if v, ok := getSecret(t, c, "cluster-a").Labels[PruneLabel(testPrefix)]; ok {
+		t.Errorf("prune=%q was copied off the source namespace", v)
+	}
+}
+
 func TestConfigValidate(t *testing.T) {
 	for name, mutate := range map[string]func(*Config){
 		"empty target namespace": func(c *Config) { c.TargetNamespace = "" },

@@ -77,6 +77,21 @@ const (
 	// staleSinceFormat is that basic form, e.g. 20260807T143000Z.
 	staleSinceFormat = "20060102T150405Z"
 
+	// SuffixPrune opts a single registration out of removal. Set it to
+	// PruneDisabled on the cluster Secret and neither deletion nor demotion will
+	// touch it.
+	//
+	// It exists because reconciliation is event-driven: a mistaken label edit used
+	// to take up to a full interval to become a deletion, which was often long
+	// enough for a human to notice, and now it does not. Every comparable tool
+	// ships an escape hatch for the same reason.
+	SuffixPrune = "prune"
+
+	// PruneDisabled is the only value SuffixPrune recognises. Anything else is
+	// ignored, so a typo fails safe towards normal collection rather than
+	// silently pinning a registration forever.
+	PruneDisabled = "disabled"
+
 	// argoSecretTypeLabel is what makes ArgoCD treat a Secret as a cluster. It is
 	// a label key, not a credential; gosec G101 matches on the identifier holding
 	// "Secret" next to a string literal.
@@ -105,6 +120,9 @@ func SupersededByLabel(prefix string) string { return prefix + SuffixSupersededB
 // StaleSinceLabel is the stale-since label key for a given prefix.
 func StaleSinceLabel(prefix string) string { return prefix + SuffixStaleSince }
 
+// PruneLabel is the prune opt-out label key for a given prefix.
+func PruneLabel(prefix string) string { return prefix + SuffixPrune }
+
 // ProviderLabel is the matched-provider label key for a given prefix.
 func ProviderLabel(prefix string) string { return prefix + SuffixProvider }
 
@@ -124,6 +142,11 @@ var reservedSuffixes = []string{
 	SuffixOrphanedSecretType,
 	SuffixSupersededBy,
 	SuffixStaleSince,
+	// Reserved so it cannot be propagated off a source namespace. The opt-out is
+	// for whoever owns the ArgoCD namespace; letting a tenant set it on their own
+	// namespace would let them pin a registration in place after their cluster
+	// was gone, which is the immortal-registration problem this list exists for.
+	SuffixPrune,
 }
 
 // Provider is one provisioner's kubeconfig Secret shape.
@@ -416,6 +439,7 @@ func (r *Registrar) sourceNamespaceUIDLabel() string {
 func (r *Registrar) orphanedSecretTypeLabel() string {
 	return OrphanedSecretTypeLabel(r.cfg.LabelPrefix)
 }
+func (r *Registrar) pruneLabel() string        { return PruneLabel(r.cfg.LabelPrefix) }
 func (r *Registrar) supersededByLabel() string { return SupersededByLabel(r.cfg.LabelPrefix) }
 func (r *Registrar) staleSinceLabel() string   { return StaleSinceLabel(r.cfg.LabelPrefix) }
 
@@ -1226,6 +1250,17 @@ func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, 
 		s := &secrets.Items[i]
 
 		if s.Name == applied {
+			continue
+		}
+
+		// Opted out. Checked before BOTH removal paths, so it covers demotion as
+		// well as deletion -- demotion is reversible, but it still takes a cluster
+		// out of ArgoCD's sight, which is exactly what someone pinning a
+		// registration is asking not to happen.
+		if s.Labels[r.pruneLabel()] == PruneDisabled {
+			r.log.Info("registration is opted out of collection; leaving it",
+				slog.String("secret", s.Name), slog.String("namespace", nsName),
+				slog.String("label", r.pruneLabel()))
 			continue
 		}
 
