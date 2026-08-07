@@ -1143,6 +1143,9 @@ func TestConfigValidate(t *testing.T) {
 			c.Providers[0].Name = strings.Repeat("a", 64)
 		},
 		"prefix without slash": func(c *Config) { c.LabelPrefix = "example.com" },
+		// Negative would expire every demoted registration on sight, since
+		// time.Since is always greater than a negative duration.
+		"negative demoted TTL": func(c *Config) { c.DemotedTTL = -time.Second },
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := testConfig()

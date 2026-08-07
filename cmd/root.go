@@ -37,6 +37,7 @@ var (
 	secretNamePattern string
 	secretKey         string
 	labelPrefix       string
+	demotedTTL        time.Duration
 
 	leaderElect            bool
 	leaderElectionID       string
@@ -127,6 +128,7 @@ func buildOptions(cmd *cobra.Command) (options, error) {
 		Providers:       providers,
 		LabelPrefix:     labelPrefix,
 		DryRun:          dryRun,
+		DemotedTTL:      demotedTTL,
 	}
 	if err := cfg.Validate(); err != nil {
 		return options{}, err
@@ -145,6 +147,15 @@ func buildOptions(cmd *cobra.Command) (options, error) {
 		// the real one waits.
 		warnings = append(warnings, "--dry-run disables leader election")
 		elect = false
+	}
+
+	if demotedTTL > 0 && demotedTTL < interval {
+		// A demoted registration is only revisited when its namespace is
+		// requeued, so nothing can expire faster than the interval and a smaller
+		// TTL reads as a promise the loop cannot keep.
+		warnings = append(warnings, fmt.Sprintf(
+			"--demoted-ttl %s is shorter than --interval %s, so expiry cannot happen sooner than %s",
+			demotedTTL, interval, interval))
 	}
 
 	return options{
@@ -292,4 +303,8 @@ func registerFlags(f *pflag.FlagSet) {
 	// unauthenticated port on every install that never asked for one.
 	f.StringVar(&metricsBindAddress, "metrics-bind-address", "0",
 		`address serving Prometheus metrics; "0" disables it, which is the default`)
+	// Off by default. Demotion is the reversible half of removal, so putting a
+	// clock on it also puts a clock on how long a mistaken rename can be undone.
+	f.DurationVar(&demotedTTL, "demoted-ttl", 0,
+		"delete a demoted registration once it has been superseded this long; 0 keeps it indefinitely")
 }

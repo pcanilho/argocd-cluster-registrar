@@ -75,6 +75,16 @@ secretKey: ""
 # ArgoCD is holding the old one. Lowering it no longer speeds anything else up.
 interval: 60s
 
+# Delete a demoted registration once it has been superseded this long. 0 keeps
+# it indefinitely, which is the behaviour before 0.5.0.
+#
+# A rename hides the old registration from ArgoCD rather than deleting it, so
+# reverting the rename restores it. The debris accumulates until its namespace
+# is deleted; this bounds that, at the cost of bounding how long a revert works.
+# Expiry only happens while the source namespace is alive and registered under
+# another name, and no sooner than `interval`.
+demotedTTL: 0s
+
 # Log intended changes without writing. Worth using when first pointing this at
 # an existing cluster, to confirm the GC selector matches only what you expect.
 dryRun: false

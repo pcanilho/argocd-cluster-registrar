@@ -7,28 +7,15 @@ import (
 
 // Metrics for the outcomes a log line alone cannot be alerted on.
 //
-// WHY THESE ARE PACKAGE-LEVEL rather than a field on Registrar, which is how the
-// logger is threaded: controller-runtime's Registry is a process global and
-// MustRegister PANICS on a duplicate. One Registrar per process makes an instance
-// field buy nothing, and the test binary builds dozens of them by struct literal,
-// so registering in a constructor would panic on the second one and a field left
-// nil would panic in production on whichever path forgot to guard it.
+// Package-level, not a Registrar field: the Registry is a process global and
+// MustRegister panics on a duplicate, so registering per instance would panic on
+// the second Registrar the test binary builds.
 //
-// WHY THE LABELS ARE ALL CONSTANTS. Every label value below comes from a closed
-// set fixed at compile time. Nothing here is a cluster name, a namespace or
-// anything else read off an object a tenant can create. That is deliberate on the
-// conflict path especially, which is the one path that exists because somebody
-// may be acting in bad faith: labelling by cluster name would let anyone able to
-// label a namespace mint unbounded series in the monitoring system.
-//
-// WHY THERE IS NO PER-CONFLICT GAUGE. A gauge keyed on the contested name and the
-// two namespaces would answer "which cluster is contested right now", and it is
-// tempting. It cannot be cleared. When the losing claimant's namespace is
-// deleted, ReconcileOne takes the NotFound branch and never reaches apply, so
-// nothing is left to zero the series and it alerts forever on a conflict that no
-// longer exists. The identity lives in the log line, which carries the cluster,
-// both namespaces and the reason. The metric's job is to make that line worth
-// looking for.
+// Every label value below is a compile-time constant. Nothing here is a cluster
+// name or a namespace, which on the conflict path would be attacker-chosen
+// cardinality. Which cluster is contested stays in the log line, and so does the
+// reason a per-conflict gauge is absent: it could never be cleared, since a
+// deleted claimant namespace never reaches the code that would zero it.
 var (
 	conflictsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "argocd_cluster_registrar_conflicts_total",

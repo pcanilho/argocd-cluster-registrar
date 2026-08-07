@@ -317,6 +317,13 @@ type Config struct {
 
 	// DryRun logs what would change without writing anything.
 	DryRun bool
+
+	// DemotedTTL is how long a demoted registration is kept before it is deleted
+	// outright. Zero, the default, keeps them indefinitely.
+	//
+	// Bounds how far rename debris accumulates, at the price of bounding how long
+	// a mistaken rename can still be reverted. Hence opt-in.
+	DemotedTTL time.Duration
 }
 
 // Registrar reconciles child-cluster kubeconfigs into ArgoCD cluster Secrets.
@@ -433,6 +440,10 @@ func (c Config) Validate() error {
 			return fmt.Errorf("provider %q: secret name pattern %q is not a valid glob: %w",
 				p.Name, p.SecretNamePattern, err)
 		}
+	}
+	// Negative is a typo, not "disabled", and would expire everything on sight.
+	if c.DemotedTTL < 0 {
+		return fmt.Errorf("--demoted-ttl must not be negative, got %s", c.DemotedTTL)
 	}
 	if p := c.LabelPrefix; p != "" && !strings.HasSuffix(p, "/") {
 		// Without the slash the keys become nonsense like "example.commanaged-by"
@@ -1424,10 +1435,21 @@ func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, 
 		}
 
 		if s.Labels[r.orphanedSecretTypeLabel()] != "" {
-			// Already demoted on an earlier pass. Nothing to do, and nothing
-			// worth repeating every reconcile.
-			r.log.Debug("superseded registration is already demoted",
-				slog.String("secret", s.Name), slog.String("supersededBy", applied))
+			// Demoted on an earlier pass. Kept until it outlives the TTL, if one is
+			// set. Below the applied == "" guard on purpose: a terminating namespace
+			// can still come back, which a demotion survives and a delete does not.
+			// No error return: every uncertain answer is "keep it", so there is
+			// nothing a caller could do differently.
+			if !r.demotedTTLExpired(s) {
+				r.log.Debug("superseded registration is already demoted",
+					slog.String("secret", s.Name), slog.String("supersededBy", applied))
+				continue
+			}
+			if err := r.deleteExpired(ctx, s); err != nil {
+				errs = append(errs, err.Error())
+				continue
+			}
+			remaining--
 			continue
 		}
 
@@ -1448,6 +1470,72 @@ func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, 
 		return remaining, fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
 	return remaining, nil
+}
+
+// demotedTTLExpired reports whether a demoted registration has outlived
+// Config.DemotedTTL.
+//
+// Every uncertain answer is "no", as with collectStaleUID's missing UID. Note
+// time.Parse returns the ZERO time on failure, so an ignored error here would
+// age every demoted registration by two millennia and delete the fleet.
+func (r *Registrar) demotedTTLExpired(s *coreV1.Secret) bool {
+	if r.cfg.DemotedTTL <= 0 {
+		return false
+	}
+	stamp := s.Labels[r.staleSinceLabel()]
+	if stamp == "" {
+		// Demoted before the label existed, or by hand.
+		r.log.Debug("demoted registration carries no stale-since stamp; it will not expire",
+			slog.String("secret", s.Name), slog.String("label", r.staleSinceLabel()))
+		return false
+	}
+	since, err := time.Parse(staleSinceFormat, stamp)
+	if err != nil {
+		// Warn: keeping it is safe, but indistinguishable from a broken TTL.
+		r.log.Warn("demoted registration has an unreadable stale-since stamp; it will not expire",
+			slog.String("secret", s.Name), slog.String("staleSince", stamp),
+			slog.Any("error", err))
+		return false
+	}
+	// A future stamp gives a negative age, so clock skew needs no special case.
+	return time.Since(since) > r.cfg.DemotedTTL
+}
+
+// deleteExpired removes a demoted registration that has outlived its TTL.
+//
+// Not deleteOrphan: different proof, so a different message, and stricter
+// preconditions. UID *and* resourceVersion, because the race here is a REVERTED
+// rename, and a revert goes through apply's read-modify-write, which preserves
+// the UID. Only the resourceVersion moves.
+func (r *Registrar) deleteExpired(ctx context.Context, s *coreV1.Secret) error {
+	if r.cfg.DryRun {
+		r.log.Info("[dry-run] would delete expired demoted cluster secret",
+			slog.String("secret", s.Name), slog.String("staleSince", s.Labels[r.staleSinceLabel()]))
+		return nil
+	}
+	rv := s.ResourceVersion
+	err := r.client.CoreV1().Secrets(r.cfg.TargetNamespace).Delete(ctx, s.Name, metaV1.DeleteOptions{
+		Preconditions: &metaV1.Preconditions{UID: &s.UID, ResourceVersion: &rv},
+	})
+	switch {
+	case err == nil:
+		r.log.Info("deleted a demoted registration that outlived its TTL",
+			slog.String("secret", s.Name), slog.String("cluster", s.Labels[r.clusterLabel()]),
+			slog.String("staleSince", s.Labels[r.staleSinceLabel()]),
+			slog.Duration("ttl", r.cfg.DemotedTTL))
+		return nil
+	case apiErrors.IsNotFound(err):
+		return nil
+	case apiErrors.IsConflict(err):
+		// Written between the read and the delete, most likely a reverted rename
+		// restoring it. Leave it; the next pass reads the new state and decides
+		// again.
+		r.log.Info("demoted registration changed before its TTL delete; leaving it",
+			slog.String("secret", s.Name))
+		return nil
+	default:
+		return fmt.Errorf("delete expired %s: %w", s.Name, err)
+	}
 }
 
 // collectStaleUID removes registrations whose recorded source namespace has been

@@ -131,6 +131,7 @@ jobs:
           helm lint "$chart" --set metrics.enabled=true
           helm lint "$chart" --set metrics.enabled=true --set metrics.service.enabled=true
           helm lint "$chart" --set metrics.enabled=true --set probes.enabled=false
+          helm lint "$chart" --set demotedTTL=720h
 
       # Two active replicas do not corrupt each other, but they do the work twice
       # and rewrite each other's provider label when configured differently.
@@ -218,6 +219,24 @@ jobs:
             echo "::error::default install should defer to the binary's own default"
             grep -- '--' <<<"$out"; exit 1
           fi
+
+      # `0s` is a truthy string in a Go template and `0` is a falsy int, so a
+      # conditional here renders opposite results for the same intent. The flag is
+      # emitted unconditionally; this pins that.
+      - name: demotedTTL renders the same disabled value however it is spelled
+        run: |
+          set -euo pipefail
+          chart=deploy/charts/argocd-cluster-registrar
+          for v in "" "--set demotedTTL=0" "--set demotedTTL=0s"; do
+            got=$(helm template t "$chart" $v | grep -o -- '--demoted-ttl=[^"]*')
+            if [ "$got" != "--demoted-ttl=0s" ]; then
+              echo "::error::demotedTTL ${v:-<default>} rendered ${got}, want --demoted-ttl=0s"
+              exit 1
+            fi
+          done
+          helm template t "$chart" --set demotedTTL=720h \
+            | grep -q -- '--demoted-ttl=720h' || {
+            echo "::error::a configured demotedTTL did not reach the pod"; exit 1; }
 
       # An empty --metrics-bind-address means ":8080" to controller-runtime, not
       # "off", so the default install must emit no such flag at all rather than an

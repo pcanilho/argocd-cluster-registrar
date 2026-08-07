@@ -112,6 +112,9 @@ dryRun: false
 # Verbose logging.
 debug: false
 
+# Expire demoted registrations after this long. 0s keeps them. See "Operating".
+demotedTTL: 0s
+
 # Prometheus metrics. Off by default, unauthenticated when on. See "Operating".
 metrics:
   enabled: false
@@ -300,6 +303,7 @@ stateDiagram-v2
     Pinned --> Registered: label removed
     Registered --> [*]: source namespace deleted<br/>cluster Secret removed
     Demoted --> [*]: source namespace deleted
+    Demoted --> [*]: demotedTTL elapsed (opt-in)
 ```
 
 Cluster `Secret`s that carry the ownership label but whose source namespace has
@@ -316,6 +320,13 @@ nothing is destroyed. Change the label back and the registration returns intact,
 so a mistaken rename costs nothing. It also keeps the old cluster name reserved,
 which is what makes that revert possible; delete it if a different namespace
 should take that name.
+
+Demoted registrations otherwise accumulate until their namespace is deleted. Set
+`demotedTTL` to expire them, which also frees the name they hold. It is `0s`
+(never) by default, since the TTL is equally a deadline on reverting a rename.
+Expiry only reaches a namespace that is alive and registered under another name,
+never one that is terminating or undiscoverable, and never sooner than
+`interval`. `prune: disabled` exempts a registration from this too.
 
 RBAC is split by scope. Reads are cluster-wide (`namespaces` get/list/watch,
 `secrets` **list only**) because discovery is label-driven and the sources sit in

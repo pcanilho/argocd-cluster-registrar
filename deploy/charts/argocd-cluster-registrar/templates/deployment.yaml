@@ -81,6 +81,9 @@ spec:
             - "--secret-key={{ required "secretKey is required when secretNamePattern is set" .Values.secretKey }}"
             {{- end }}
             - "--interval={{ .Values.interval }}"
+            {{- /* Always emitted: `0s` is a truthy string but `0` is a falsy int, so
+                   a conditional would render opposite results for the same intent. */}}
+            - "--demoted-ttl={{ .Values.demotedTTL | default "0s" }}"
             {{- if .Values.leaderElection.enabled }}
             - --leader-elect
             - "--leader-election-id={{ include "app.leaderElectionID" . }}"
