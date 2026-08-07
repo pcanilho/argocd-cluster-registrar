@@ -414,63 +414,162 @@ func restConfig() (*rest.Config, error) {
 	return cfg, nil
 }
 
-// Reconcile performs one full pass: every discovered child is registered or
-// updated, and every owned Secret without a live source is removed.
+// ReconcileOne reconciles everything keyed on a single source namespace: the
+// registration that namespace should have, and every registration recorded
+// against it.
 //
-// It is deliberately a full reconcile rather than an event-driven diff. Besides
-// being far simpler to reason about, it re-reads each kubeconfig every pass,
-// which is what keeps registrations valid across a k3s server restart -- those
-// rotate the client certificate, and a stale Secret breaks every Application
-// targeting that cluster with an authentication error rather than a visible one.
-func (r *Registrar) Reconcile(ctx context.Context) error {
-	desired, unresolved, err := r.discover(ctx)
-	if err != nil {
-		return err
+// This is the unit both drivers work in. The sweep below calls it once per key;
+// the controller calls it per event. It returns only an error, never a requeue
+// result, so that a driver cannot forget to schedule the next visit -- that
+// decision belongs to the driver, in one place.
+//
+// The namespace read is the pass's single source of truth about existence, and it
+// must not come from a cache. Against a label-filtered cache the apiserver emits a
+// synthetic Deleted when an object stops matching the selector, so a cached
+// NotFound cannot tell "the namespace was deleted" from "someone removed the
+// managed-by label" -- and the second must never deregister anything.
+func (r *Registrar) ReconcileOne(ctx context.Context, nsName string) error {
+	ns, err := r.client.CoreV1().Namespaces().Get(ctx, nsName, metaV1.GetOptions{})
+	switch {
+	case apiErrors.IsNotFound(err):
+		// The proof. This is the only path that may delete.
+		return r.collectOne(ctx, nsName, false, "")
+	case err != nil:
+		// Nothing is proven, so nothing may be collected.
+		return fmt.Errorf("confirm namespace %s: %w", nsName, err)
 	}
 
-	// Only the children that were actually written may vouch for their Secret.
-	// Passing `desired` here instead would let a REFUSED claimant keep the
-	// winner's registration marked live: once the winner's namespace was deleted,
-	// the loser would go on being refused, the Secret would go on looking claimed,
-	// and it would strand forever pointing at a dead cluster.
-	applied := make([]child, 0, len(desired))
-	var errs []string
-	for _, d := range desired {
-		err := r.apply(ctx, d)
-		var conflict *conflictError
-		switch {
-		case err == nil:
-			applied = append(applied, d)
+	// A namespace being torn down still reads back; registering from it would
+	// re-create a Secret that collection is about to remove. Deliberately NOT
+	// treated as unevaluable: see the applied == "" guard in collectOne, which
+	// this is the sole caller reaching.
+	if ns.DeletionTimestamp != nil {
+		r.log.Debug("skipping terminating namespace", slog.String("namespace", ns.Name))
+		return r.collectOne(ctx, nsName, true, "")
+	}
 
-		case errors.As(err, &conflict):
+	c, ok := r.discoverOne(ctx, ns)
+	if !ok {
+		// Could not be evaluated. Skip collection entirely rather than concluding
+		// its registrations are orphaned.
+		return nil
+	}
+
+	if err := r.apply(ctx, c); err != nil {
+		var conflict *conflictError
+		if errors.As(err, &conflict) {
 			// Not a failure, so it must not fail the pass: a contested name
 			// persists until a human fixes it, and counting it would mark every
 			// pass failed forever. Logged at Error all the same -- a silently
 			// resolved conflict over a credential-bearing Secret is the hazard.
-			r.log.Error("refused to register cluster", slog.String("cluster", d.cluster),
-				slog.String("namespace", d.namespace), slog.Any("reason", err))
-			unresolved[d.namespace] = true
+			//
+			// Skip collection: a refused claimant vouches for nothing, and its own
+			// earlier registrations must not be read as superseded.
+			r.log.Error("refused to register cluster", slog.String("cluster", c.cluster),
+				slog.String("namespace", c.namespace), slog.Any("reason", err))
+			return nil
+		}
+		r.log.Error("failed to register cluster",
+			slog.String("cluster", c.cluster), slog.Any("error", err))
+		return fmt.Errorf("%s: %w", c.cluster, err)
+	}
 
-		default:
-			// One bad child must not stop the others, or a single broken cluster
-			// would stall registration for the whole fleet.
-			errs = append(errs, fmt.Sprintf("%s: %v", d.cluster, err))
-			r.log.Error("failed to register cluster", slog.String("cluster", d.cluster), slog.Any("error", err))
-			unresolved[d.namespace] = true
+	return r.collectOne(ctx, nsName, true, secretName(c.cluster))
+}
+
+// AuditUnrouted reports owned Secrets that record no source namespace.
+//
+// Nothing can collect them: every collection path selects on
+// <prefix>source-namespace=<name>, and they match no value of it. Nor can any
+// event route to them, since the key they would map to is empty. So they are
+// invisible unless something goes looking, which is what this does.
+//
+// The population is not historical. No released version ever wrote the ownership
+// label without also writing the source, so a Secret in this state got there by
+// someone stripping the label off it by hand.
+func (r *Registrar) AuditUnrouted(ctx context.Context) error {
+	selector := fmt.Sprintf("%s=%s", r.managedByLabel(), r.cfg.ManagedByValue)
+	secrets, err := r.client.CoreV1().Secrets(r.cfg.TargetNamespace).
+		List(ctx, metaV1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return fmt.Errorf("list cluster secrets (%s): %w", selector, err)
+	}
+	for i := range secrets.Items {
+		s := &secrets.Items[i]
+		if s.Labels[r.sourceNamespaceLabel()] != "" {
+			continue
+		}
+		r.log.Warn("owned cluster secret records no source namespace; it can never be collected",
+			slog.String("secret", s.Name), slog.String("label", r.sourceNamespaceLabel()),
+			slog.String("fix", "restore the label, or delete the secret if the cluster is gone"))
+	}
+	return nil
+}
+
+// reconcileKeys is every source namespace worth visiting: those currently
+// labelled for us, plus those recorded on a registration we own.
+//
+// The second half is what lets a sweep collect anything at all. A namespace that
+// has been deleted no longer lists, so without reading its name back off the
+// Secret it left behind, nothing would ever revisit it.
+func (r *Registrar) reconcileKeys(ctx context.Context) ([]string, error) {
+	keys := map[string]bool{}
+
+	nsSelector := fmt.Sprintf("%s=%s", r.managedByLabel(), r.cfg.ManagedByValue)
+	namespaces, err := r.client.CoreV1().Namespaces().List(ctx, metaV1.ListOptions{LabelSelector: nsSelector})
+	if err != nil {
+		return nil, fmt.Errorf("list namespaces (%s): %w", nsSelector, err)
+	}
+	for i := range namespaces.Items {
+		keys[namespaces.Items[i].Name] = true
+	}
+
+	secrets, err := r.client.CoreV1().Secrets(r.cfg.TargetNamespace).
+		List(ctx, metaV1.ListOptions{LabelSelector: nsSelector})
+	if err != nil {
+		return nil, fmt.Errorf("list cluster secrets (%s): %w", nsSelector, err)
+	}
+	for i := range secrets.Items {
+		if src := secrets.Items[i].Labels[r.sourceNamespaceLabel()]; src != "" {
+			keys[src] = true
 		}
 	}
 
-	// `applied` omits namespaces that could not be evaluated, could not be
-	// written, or were refused, so absence from it never means "deleted". Rather
-	// than skipping GC entirely -- which let one stuck namespace keep every dead
-	// registration alive -- those namespaces are passed down in `unresolved` and
-	// excluded individually. Every other cluster is still collected normally.
-	if len(unresolved) > 0 {
-		r.log.Warn("some managed namespaces produced no confirmed registration; theirs are exempt from garbage collection this pass",
-			slog.Int("count", len(unresolved)))
+	out := make([]string, 0, len(keys))
+	for k := range keys {
+		out = append(out, k)
 	}
-	if err := r.collect(ctx, applied, unresolved); err != nil {
-		errs = append(errs, fmt.Sprintf("gc: %v", err))
+	// Stable ordering keeps logs diffable between passes. Nothing may depend on
+	// it: which claimant wins a contested name is decided by claimContestedName,
+	// on the namespace's creation timestamp, precisely so that it does not vary
+	// with the order a driver happens to present namespaces in.
+	sort.Strings(out)
+	return out, nil
+}
+
+// Reconcile performs one full sweep over every key. It is what --once runs, and
+// what the poll loop ran before the controller existed.
+//
+// Re-reading each kubeconfig is what keeps registrations valid across a k3s
+// server restart -- those rotate the child's client certificate, and a stale
+// Secret breaks every Application targeting that cluster with an authentication
+// error rather than a visible one.
+func (r *Registrar) Reconcile(ctx context.Context) error {
+	keys, err := r.reconcileKeys(ctx)
+	if err != nil {
+		return err
+	}
+
+	var errs []string
+	for _, k := range keys {
+		// One bad namespace must not stop the others, or a single broken cluster
+		// would stall the whole fleet.
+		if err := r.ReconcileOne(ctx, k); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	if err := r.AuditUnrouted(ctx); err != nil {
+		errs = append(errs, fmt.Sprintf("audit: %v", err))
 	}
 
 	if len(errs) > 0 {
@@ -514,149 +613,101 @@ func conflictf(format string, a ...any) error {
 	return &conflictError{fmt.Errorf(format, a...)}
 }
 
-// discover returns the clusters that should be registered, and the set of
-// managed namespaces whose registration state could not be established this pass.
+// discoverOne evaluates a single managed namespace. The bool reports whether a
+// registration could be established; false means "not this time", never "gone".
 //
-// That set is load-bearing: callers must not treat "absent from the result" as
-// "deleted" for a namespace listed in it. A namespace that could not be read is
-// omitted from the result and recorded there instead.
-//
-// It is a set rather than the single bool this used to be, because one
-// unevaluable namespace used to disable garbage collection for the entire fleet.
-// A cluster stuck without a kubeconfig -- which every k3k child is for its first
-// ninety seconds, and a permanently broken one is forever -- would silently keep
-// every other cluster's dead registration alive.
-//
-// Reconcile ADDS to the set afterwards, for namespaces whose apply failed or was
-// refused. Both are cases where this pass did not establish what the namespace
-// owns, which is the same thing the discovery-time entries mean, so garbage
-// collection must leave their registrations alone either way.
-func (r *Registrar) discover(ctx context.Context) ([]child, map[string]bool, error) {
-	selector := fmt.Sprintf("%s=%s", r.managedByLabel(), r.cfg.ManagedByValue)
-	namespaces, err := r.client.CoreV1().Namespaces().List(ctx, metaV1.ListOptions{LabelSelector: selector})
+// That distinction is the whole safety story. Every false return below is a state
+// a healthy cluster passes through -- a k3k child has no kubeconfig at all for its
+// first ninety seconds, and a half-written one does not parse -- so treating any
+// of them as a deletion would deregister live clusters. The caller must skip
+// garbage collection entirely for a namespace that returns false, rather than
+// concluding its registrations are orphaned.
+func (r *Registrar) discoverOne(ctx context.Context, ns *coreV1.Namespace) (child, bool) {
+	name := ns.Labels[r.clusterLabel()]
+	if name == "" {
+		r.log.Warn("namespace is managed but has no cluster label; skipping",
+			slog.String("namespace", ns.Name), slog.String("label", r.clusterLabel()))
+		return child{}, false
+	}
+
+	// The name becomes a Secret name, so it must be a valid DNS-1123 subdomain.
+	// Label values legally allow uppercase, "_" and ".", none of which are, and
+	// the apiserver would otherwise reject the write on every pass forever.
+	if errs := validation.IsDNS1123Subdomain(secretName(name)); len(errs) > 0 {
+		r.log.Error("cluster name does not yield a valid Secret name; skipping",
+			slog.String("namespace", ns.Name), slog.String("cluster", name),
+			slog.String("reason", strings.Join(errs, "; ")))
+		return child{}, false
+	}
+
+	// Two namespaces may claim one cluster name. That is NOT resolved here:
+	// discovery is per-namespace and cannot see the other claimant. apply()
+	// settles it -- see claimContestedName.
+	//
+	// Note the name is not claimed until apply() succeeds. Claiming it here,
+	// before the kubeconfig lookup below, used to mean a namespace that never
+	// produced a usable kubeconfig still poisoned a healthy namespace claiming
+	// the same name, and neither ever registered.
+	candidates, err := r.findKubeconfigCandidates(ctx, ns.Name)
 	if err != nil {
-		return nil, nil, fmt.Errorf("list namespaces (%s): %w", selector, err)
+		var apiErr *apiFailure
+		if errors.As(err, &apiErr) {
+			// A genuine API failure, NOT "the provisioner has not written it
+			// yet". Logging this as routine is how a fleet-wide deregistration
+			// used to look reassuring in the logs.
+			r.log.Error("could not read secrets in managed namespace",
+				slog.String("namespace", ns.Name), slog.String("cluster", name), slog.Any("error", err))
+			return child{}, false
+		}
+		// Entirely normal between the Cluster CR being created and its server
+		// becoming ready -- k3k only writes the kubeconfig once the API is up,
+		// and reports ProvisioningFailed for roughly the first ninety seconds
+		// while it does.
+		r.log.Info("no kubeconfig secret yet; will retry",
+			slog.String("namespace", ns.Name), slog.String("cluster", name), slog.Any("reason", err))
+		return child{}, false
 	}
 
-	unresolved := map[string]bool{}
-	var out []child
-	for i := range namespaces.Items {
-		ns := &namespaces.Items[i]
-
-		// A namespace being torn down still lists; registering from it would
-		// re-create a Secret that GC just removed.
-		if ns.DeletionTimestamp != nil {
-			r.log.Debug("skipping terminating namespace", slog.String("namespace", ns.Name))
+	// Try candidates in order. A shape match is not a usable kubeconfig: it may
+	// be half-written, or carry an exec credential that cannot be copied into an
+	// ArgoCD Secret, and in both cases the next candidate may be fine.
+	var (
+		server, config string
+		provider       string
+		parseErrs      []string
+	)
+	for _, c := range candidates {
+		s, cfg, perr := parseKubeconfig(c.secret.Data[c.key])
+		if perr != nil {
+			parseErrs = append(parseErrs, fmt.Sprintf("%s[%s]: %v", c.secret.Name, c.key, perr))
 			continue
 		}
-
-		name := ns.Labels[r.clusterLabel()]
-		if name == "" {
-			r.log.Warn("namespace is managed but has no cluster label; skipping",
-				slog.String("namespace", ns.Name), slog.String("label", r.clusterLabel()))
-			unresolved[ns.Name] = true
-			continue
+		server, config, provider = s, cfg, c.provider
+		if len(parseErrs) > 0 {
+			r.log.Debug("skipped unusable kubeconfig candidates before this one",
+				slog.String("namespace", ns.Name), slog.String("using", c.secret.Name),
+				slog.Any("skipped", parseErrs))
 		}
-
-		// The name becomes a Secret name, so it must be a valid DNS-1123
-		// subdomain. Label values legally allow uppercase, "_" and ".", none of
-		// which are, and the apiserver would otherwise reject the write on every
-		// pass forever.
-		if errs := validation.IsDNS1123Subdomain(secretName(name)); len(errs) > 0 {
-			r.log.Error("cluster name does not yield a valid Secret name; skipping",
-				slog.String("namespace", ns.Name), slog.String("cluster", name),
-				slog.String("reason", strings.Join(errs, "; ")))
-			unresolved[ns.Name] = true
-			continue
-		}
-
-		// Two namespaces may claim one cluster name. That is NOT resolved here any
-		// more: discovery is per-namespace, and deciding it here needed the whole
-		// namespace list at once, which the eventual per-namespace reconcile
-		// cannot have. apply() settles it instead -- see claimContestedName.
-		//
-		// Removing it also fixed a quieter bug. The name used to be claimed here,
-		// BEFORE the kubeconfig lookup below, so a namespace that never produced a
-		// usable kubeconfig still poisoned a healthy namespace claiming the same
-		// name, and neither ever registered.
-		candidates, err := r.findKubeconfigCandidates(ctx, ns.Name)
-		if err != nil {
-			var apiErr *apiFailure
-			if errors.As(err, &apiErr) {
-				// A genuine API failure, NOT "the provisioner has not written it
-				// yet". Logging this as routine is how a fleet-wide deregistration
-				// used to look reassuring in the logs.
-				r.log.Error("could not read secrets in managed namespace",
-					slog.String("namespace", ns.Name), slog.String("cluster", name), slog.Any("error", err))
-				unresolved[ns.Name] = true
-				continue
-			}
-			// Entirely normal between the Cluster CR being created and its server
-			// becoming ready -- k3k only writes the kubeconfig once the API is up,
-			// and reports ProvisioningFailed for roughly the first ninety seconds
-			// while it does.
-			r.log.Info("no kubeconfig secret yet; will retry",
-				slog.String("namespace", ns.Name), slog.String("cluster", name), slog.Any("reason", err))
-			unresolved[ns.Name] = true
-			continue
-		}
-
-		// Try candidates in order. A shape match is not a usable kubeconfig: it
-		// may be half-written, or carry an exec credential that cannot be copied
-		// into an ArgoCD Secret, and in both cases the next candidate may be fine.
-		var (
-			server, config string
-			provider       string
-			parseErrs      []string
-		)
-		for _, c := range candidates {
-			s, cfg, perr := parseKubeconfig(c.secret.Data[c.key])
-			if perr != nil {
-				parseErrs = append(parseErrs, fmt.Sprintf("%s[%s]: %v", c.secret.Name, c.key, perr))
-				continue
-			}
-			server, config, provider = s, cfg, c.provider
-			if len(parseErrs) > 0 {
-				r.log.Debug("skipped unusable kubeconfig candidates before this one",
-					slog.String("namespace", ns.Name), slog.String("using", c.secret.Name),
-					slog.Any("skipped", parseErrs))
-			}
-			break
-		}
-		if provider == "" {
-			// Could be a half-written kubeconfig, so this must not look like a
-			// deletion either.
-			r.log.Warn("no usable kubeconfig; skipping",
-				slog.String("namespace", ns.Name), slog.String("cluster", name),
-				slog.Any("errors", parseErrs))
-			unresolved[ns.Name] = true
-			continue
-		}
-
-		out = append(out, child{
-			cluster:      name,
-			namespace:    ns.Name,
-			namespaceUID: ns.UID,
-			server:       server,
-			config:       config,
-			provider:     provider,
-			labels:       propagatedLabels(ns.Labels, r.cfg.LabelPrefix),
-		})
+		break
+	}
+	if provider == "" {
+		// Could be a half-written kubeconfig, so this must not look like a
+		// deletion either.
+		r.log.Warn("no usable kubeconfig; skipping",
+			slog.String("namespace", ns.Name), slog.String("cluster", name),
+			slog.Any("errors", parseErrs))
+		return child{}, false
 	}
 
-	// Stable ordering keeps logs diffable between passes. Two children can now
-	// share a cluster name, and sort.Slice is not stable, so the namespace breaks
-	// the tie -- for READABILITY only. Nothing may depend on this order: which
-	// claimant wins a contested name is decided by claimContestedName, on the
-	// namespace's creation timestamp, precisely so that it does not vary with the
-	// order a driver happens to present namespaces in.
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].cluster != out[j].cluster {
-			return out[i].cluster < out[j].cluster
-		}
-		return out[i].namespace < out[j].namespace
-	})
-	return out, unresolved, nil
+	return child{
+		cluster:      name,
+		namespace:    ns.Name,
+		namespaceUID: ns.UID,
+		server:       server,
+		config:       config,
+		provider:     provider,
+		labels:       propagatedLabels(ns.Labels, r.cfg.LabelPrefix),
+	}, true
 }
 
 // candidate is a Secret that matched some provider, together with the provider
@@ -1091,47 +1142,35 @@ func changed(existing, want *coreV1.Secret, labelPrefix string) bool {
 	return false
 }
 
-// collect deletes ArgoCD cluster Secrets this tool owns whose child no longer
-// exists. Without it a destroyed cluster leaves a permanently broken entry in
-// ArgoCD -- the original tool created Secrets but never removed them.
+// collectOne reconciles the registrations recorded against ONE source namespace.
 //
-// Deletion requires POSITIVE proof, not absence from `desired`. Each owned
-// Secret records the namespace it came from, and that namespace must return a
-// definite NotFound before anything is removed. Absence alone is not evidence:
-// a namespace can drop out of `desired` because an API call failed, because a
-// kubeconfig was half-written, or because a label was edited, and treating any
-// of those as "deleted" would deregister live clusters.
+// `exists` is the caller's proof about that namespace, obtained from a single
+// uncached read. `applied` is the Secret name this namespace successfully wrote
+// this pass, or "" if it wrote none.
 //
-// `applied` is what was actually written this pass, NOT everything discovered.
-// A registration that was refused, or whose write failed, vouches for nothing.
+// Deletion requires POSITIVE proof. A Secret is removed only when `exists` is
+// false, which the caller sets only on a definite NotFound. Absence from
+// `applied` is never evidence: a namespace can fail to produce a registration
+// because an API call failed, because a kubeconfig was half-written, or because
+// a label was edited, and treating any of those as "deleted" would deregister
+// live clusters. The caller must not call this at all for a namespace it could
+// not evaluate.
 //
-// `unresolved` names the namespaces this pass could not establish a registration
-// for -- unreadable at discovery, failed to apply, or refused. Their
-// registrations are skipped outright, before the existence check, so a namespace
-// that exists but could not be evaluated is never a deletion candidate at all.
-// The namespace Get below is still the proof that matters -- this is the first
-// line of defence, not a replacement for it.
-func (r *Registrar) collect(ctx context.Context, applied []child, unresolved map[string]bool) error {
-	live := map[string]bool{}
-	// moved maps a source namespace to the registration it holds NOW. One
-	// namespace carries one cluster label, so this is 1:1 by construction.
-	//
-	// This is not the cross-namespace coupling a per-namespace reconcile has to
-	// shed: it is only ever read as moved[srcNS] for the Secret's OWN recorded
-	// namespace, so it decomposes cleanly. Do not delete it as a blocker.
-	moved := make(map[string]string, len(applied))
-	for _, d := range applied {
-		live[secretName(d.cluster)] = true
-		moved[d.namespace] = secretName(d.cluster)
-	}
-
-	// Selected on ownership ALONE, deliberately. Selecting on secret-type as well
+// `applied` is at most one Secret because a namespace carries exactly one cluster
+// label. The set can still hold several Secrets, though: a rename leaves the old
+// registration behind, demoted, still recorded against this namespace. That is
+// why the selector matches a set and not a single name -- handling only one would
+// leak every superseded registration the moment its namespace was deleted.
+func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, applied string) error {
+	// Selected on ownership and source ALONE. Selecting on secret-type as well
 	// would hide already-demoted registrations, which still need collecting once
 	// their namespace finally goes away. managed-by is the ownership marker; the
 	// ArgoCD label is incidental to us.
-	selector := fmt.Sprintf("%s=%s", r.managedByLabel(), r.cfg.ManagedByValue)
+	selector := fmt.Sprintf("%s=%s,%s=%s",
+		r.managedByLabel(), r.cfg.ManagedByValue, r.sourceNamespaceLabel(), nsName)
 
-	secrets, err := r.client.CoreV1().Secrets(r.cfg.TargetNamespace).List(ctx, metaV1.ListOptions{LabelSelector: selector})
+	secrets, err := r.client.CoreV1().Secrets(r.cfg.TargetNamespace).
+		List(ctx, metaV1.ListOptions{LabelSelector: selector})
 	if err != nil {
 		return fmt.Errorf("list cluster secrets (%s): %w", selector, err)
 	}
@@ -1139,80 +1178,81 @@ func (r *Registrar) collect(ctx context.Context, applied []child, unresolved map
 	var errs []string
 	for i := range secrets.Items {
 		s := &secrets.Items[i]
-		if live[s.Name] {
+
+		if s.Name == applied {
 			continue
 		}
 
-		srcNS := s.Labels[r.sourceNamespaceLabel()]
-		if srcNS == "" {
-			// Written by an older version, before the source was recorded. There
-			// is no way to prove the source is gone, so leave it alone and say so
-			// rather than guessing.
-			r.log.Warn("owned cluster secret has no source-namespace label; not deleting",
-				slog.String("secret", s.Name), slog.String("label", r.sourceNamespaceLabel()))
-			continue
-		}
-
-		if unresolved[srcNS] {
-			r.log.Debug("source namespace could not be evaluated this pass; not deleting",
-				slog.String("secret", s.Name), slog.String("namespace", srcNS))
-			continue
-		}
-
-		if _, err := r.client.CoreV1().Namespaces().Get(ctx, srcNS, metaV1.GetOptions{}); err == nil {
-			// The namespace is still there, so this is never a deletion. But it
-			// is not automatically a reason to keep the registration VISIBLE: if
-			// that namespace was fully evaluated this pass and registered under a
-			// different name, it has disclaimed this one and nothing will ever
-			// reclaim it. That is positive proof of a second kind, not an absence.
-			//
-			// Left alone, the stale Secret is not inert. apply() only runs over
-			// what was discovered, so it is never rewritten -- its kubeconfig
-			// freezes with a certificate good for about a year, and ArgoCD
-			// resolves two registrations sharing one server URL by taking
-			// whichever the informer index yields first.
-			if now, ok := moved[srcNS]; ok && now != s.Name {
-				if s.Labels[r.orphanedSecretTypeLabel()] != "" {
-					// Already demoted on an earlier pass. Nothing to do, and
-					// nothing worth saying every interval.
-					r.log.Debug("superseded registration is already demoted",
-						slog.String("secret", s.Name), slog.String("supersededBy", now))
-					continue
-				}
-				if err := r.demote(ctx, s, now); err != nil {
-					errs = append(errs, err.Error())
-				}
-				continue
+		if !exists {
+			if err := r.deleteOrphan(ctx, s, nsName); err != nil {
+				errs = append(errs, err.Error())
 			}
+			continue
+		}
+
+		// The namespace is still there, so nothing here is a deletion.
+		//
+		// This guard is load-bearing and must not be simplified away. A namespace
+		// that is TERMINATING is skipped by the caller without being marked
+		// unevaluable, so it reaches here with applied == "". Demoting on that
+		// would hide a live registration the instant its namespace began to
+		// terminate, moments before it was going to be deleted properly -- and if
+		// a finalizer then aborted the deletion, it would stay hidden.
+		//
+		// Outside that case, "the namespace was fully evaluated" implies
+		// applied != "": every other way discoverOne can fail makes the caller
+		// skip garbage collection for this namespace entirely.
+		if applied == "" {
 			r.log.Warn("source namespace still exists but produced no registration; not deleting",
-				slog.String("secret", s.Name), slog.String("namespace", srcNS))
-			continue
-		} else if !apiErrors.IsNotFound(err) {
-			errs = append(errs, fmt.Sprintf("%s: confirm namespace %s: %v", s.Name, srcNS, err))
+				slog.String("secret", s.Name), slog.String("namespace", nsName))
 			continue
 		}
 
-		if r.cfg.DryRun {
-			r.log.Info("[dry-run] would delete orphaned cluster secret",
-				slog.String("secret", s.Name), slog.String("namespace", srcNS))
+		if s.Labels[r.orphanedSecretTypeLabel()] != "" {
+			// Already demoted on an earlier pass. Nothing to do, and nothing
+			// worth repeating every reconcile.
+			r.log.Debug("superseded registration is already demoted",
+				slog.String("secret", s.Name), slog.String("supersededBy", applied))
 			continue
 		}
-		if err := r.client.CoreV1().Secrets(r.cfg.TargetNamespace).Delete(ctx, s.Name, metaV1.DeleteOptions{}); err != nil {
-			if apiErrors.IsNotFound(err) {
-				continue
-			}
-			// Keep going. One Secret held up by a finalizer or an admission
-			// webhook must not stall GC for the whole fleet, which is the same
-			// reasoning the apply loop uses.
-			errs = append(errs, fmt.Sprintf("delete %s: %v", s.Name, err))
-			continue
+
+		// The namespace registered under a DIFFERENT name, so it has disclaimed
+		// this one and nothing will ever reclaim it. Positive proof of a second
+		// kind, not an absence.
+		//
+		// Left alone, the stale Secret is not inert: it is never rewritten, so its
+		// kubeconfig freezes with a certificate good for about a year, and ArgoCD
+		// resolves two registrations sharing one server URL by taking whichever
+		// its informer index yields first.
+		if err := r.demote(ctx, s, applied); err != nil {
+			errs = append(errs, err.Error())
 		}
-		r.log.Info("deregistered cluster (source namespace gone)",
-			slog.String("secret", s.Name), slog.String("namespace", srcNS))
 	}
 
 	if len(errs) > 0 {
 		return fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+// deleteOrphan removes a registration whose source namespace is provably gone.
+func (r *Registrar) deleteOrphan(ctx context.Context, s *coreV1.Secret, nsName string) error {
+	if r.cfg.DryRun {
+		r.log.Info("[dry-run] would delete orphaned cluster secret",
+			slog.String("secret", s.Name), slog.String("namespace", nsName))
+		return nil
+	}
+	err := r.client.CoreV1().Secrets(r.cfg.TargetNamespace).Delete(ctx, s.Name, metaV1.DeleteOptions{})
+	switch {
+	case err == nil:
+		r.log.Info("deregistered cluster (source namespace gone)",
+			slog.String("secret", s.Name), slog.String("namespace", nsName))
+		return nil
+	case apiErrors.IsNotFound(err):
+		return nil
+	default:
+		// Keep going. One Secret held up by a finalizer or an admission webhook
+		// must not stall collection for the rest.
+		return fmt.Errorf("delete %s: %w", s.Name, err)
+	}
 }

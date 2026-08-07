@@ -127,6 +127,17 @@ func getSecret(t *testing.T, c *fake.Clientset, name string) *coreV1.Secret {
 	return s
 }
 
+// discoverNS fetches a namespace and evaluates it, which is what ReconcileOne
+// does between proving the namespace exists and applying the result.
+func discoverNS(t *testing.T, r *Registrar, name string) (child, bool) {
+	t.Helper()
+	ns, err := r.client.CoreV1().Namespaces().Get(context.Background(), name, metaV1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get namespace %s: %v", name, err)
+	}
+	return r.discoverOne(context.Background(), ns)
+}
+
 // The catastrophe this guard exists for: a transient API error must never be
 // read as "the cluster was deleted". Before the fix, one failing List emptied
 // `desired` and collect() deregistered the whole fleet, while logging the
@@ -164,8 +175,8 @@ func TestCollectRequiresProofTheNamespaceIsGone(t *testing.T) {
 	}}
 	r, c := newTestRegistrar(unlabelled, registeredSecret("a", "k3k-a"))
 
-	if err := r.collect(context.Background(), nil, nil); err != nil {
-		t.Fatalf("collect: %v", err)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
 	}
 	if !secretExists(t, c, "cluster-a") {
 		t.Error("cluster-a deleted while its source namespace still exists")
@@ -174,8 +185,8 @@ func TestCollectRequiresProofTheNamespaceIsGone(t *testing.T) {
 
 func TestCollectDeletesWhenNamespaceIsActuallyGone(t *testing.T) {
 	r, c := newTestRegistrar(registeredSecret("gone", "k3k-gone"))
-	if err := r.collect(context.Background(), nil, nil); err != nil {
-		t.Fatalf("collect: %v", err)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
 	}
 	if secretExists(t, c, "cluster-gone") {
 		t.Error("cluster-gone should have been deleted once its namespace was NotFound")
@@ -191,8 +202,8 @@ func TestCollectNeverTouchesUnlabelledSecrets(t *testing.T) {
 		Labels:    map[string]string{argoSecretTypeLabel: argoSecretTypeValue},
 	}}
 	r, c := newTestRegistrar(hand)
-	if err := r.collect(context.Background(), nil, nil); err != nil {
-		t.Fatalf("collect: %v", err)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
 	}
 	if !secretExists(t, c, "cluster-handmade") {
 		t.Error("a hand-registered cluster Secret was deleted")
@@ -209,7 +220,7 @@ func TestCollectContinuesPastDeleteErrors(t *testing.T) {
 		return false, nil, nil
 	})
 
-	if err := r.collect(context.Background(), nil, nil); err == nil {
+	if err := r.Reconcile(context.Background()); err == nil {
 		t.Error("expected the forbidden delete to be reported")
 	}
 	if secretExists(t, c, "cluster-b") {
@@ -348,15 +359,12 @@ func TestKamajiViaCAPIRegistersOnce(t *testing.T) {
 	)
 	r.cfg.Providers = mustPresets(t, "kamaji", "capi")
 
-	children, _, err := r.discover(context.Background())
-	if err != nil {
-		t.Fatalf("discover: %v", err)
+	ch, ok := discoverNS(t, r, "tenant-b")
+	if !ok {
+		t.Fatal("one physical cluster produced no registration")
 	}
-	if len(children) != 1 {
-		t.Fatalf("one physical cluster produced %d registrations: %+v", len(children), children)
-	}
-	if children[0].provider != "kamaji" {
-		t.Errorf("provider = %q, want kamaji (declared first)", children[0].provider)
+	if ch.provider != "kamaji" {
+		t.Errorf("provider = %q, want kamaji (declared first)", ch.provider)
 	}
 
 	if err := r.Reconcile(context.Background()); err != nil {
@@ -387,15 +395,12 @@ func TestPrefersUsableCandidateOverExecCredential(t *testing.T) {
 	)
 	r.cfg.Providers = mustPresets(t, "capi")
 
-	children, _, err := r.discover(context.Background())
-	if err != nil {
-		t.Fatalf("discover: %v", err)
+	ch, ok := discoverNS(t, r, "capi-c")
+	if !ok {
+		t.Fatal("expected one registration, got none")
 	}
-	if len(children) != 1 {
-		t.Fatalf("expected one registration, got %d: %+v", len(children), children)
-	}
-	if children[0].server != "https://192.168.1.196:6443" {
-		t.Errorf("registered the exec-credential kubeconfig: server = %q", children[0].server)
+	if ch.server != "https://192.168.1.196:6443" {
+		t.Errorf("registered the exec-credential kubeconfig: server = %q", ch.server)
 	}
 }
 
@@ -813,8 +818,8 @@ func TestDemotedSecretIsStillCollectedWhenNamespaceGone(t *testing.T) {
 	demoted.Labels[SupersededByLabel(testPrefix)] = "cluster-a2"
 
 	r, c := newTestRegistrar(demoted)
-	if err := r.collect(context.Background(), nil, nil); err != nil {
-		t.Fatalf("collect: %v", err)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
 	}
 	if secretExists(t, c, "cluster-a") {
 		t.Error("a demoted registration was not collected once its namespace was gone")
@@ -844,6 +849,81 @@ func TestDemotionIsNotRepeated(t *testing.T) {
 	}
 	if got := getSecret(t, c, "cluster-a").Labels[StaleSinceLabel(testPrefix)]; got != first {
 		t.Errorf("stale-since was rewritten: %q then %q", first, got)
+	}
+}
+
+// A terminating namespace is the one case that reaches collection having produced
+// no registration WITHOUT being marked unevaluable. Its live Secret must be left
+// exactly as it is: not re-registered, and above all not demoted. Demoting here
+// would hide a working cluster moments before its namespace finished going away,
+// and would leave it hidden for good if a finalizer then aborted the deletion.
+func TestTerminatingNamespaceIsNeitherRegisteredNorCollected(t *testing.T) {
+	ns := managedNS("k3k-x", "a")
+	now := metaV1.Now()
+	ns.DeletionTimestamp = &now
+	ns.Finalizers = []string{"kubernetes.io/test"}
+
+	r, c := newTestRegistrar(ns, kubeconfigSecret("k3k-x", "k3k-x-kubeconfig"),
+		registeredSecret("a", "k3k-x"))
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	got := getSecret(t, c, "cluster-a")
+	if got.Labels[argoSecretTypeLabel] != argoSecretTypeValue {
+		t.Error("a terminating namespace demoted its own live registration")
+	}
+	for _, l := range []string{
+		OrphanedSecretTypeLabel(testPrefix),
+		SupersededByLabel(testPrefix),
+		StaleSinceLabel(testPrefix),
+	} {
+		if _, ok := got.Labels[l]; ok {
+			t.Errorf("registration was demoted while its namespace was terminating (%s)", l)
+		}
+	}
+}
+
+// The sweep has to revisit namespaces that no longer exist, or nothing would ever
+// be collected. Their names are recoverable only from the registrations they left
+// behind.
+func TestSweepVisitsNamespacesKnownOnlyFromTheirRegistrations(t *testing.T) {
+	r, _ := newTestRegistrar(registeredSecret("gone", "k3k-gone"), managedNS("k3k-live", "live"))
+
+	keys, err := r.reconcileKeys(context.Background())
+	if err != nil {
+		t.Fatalf("reconcileKeys: %v", err)
+	}
+	want := map[string]bool{"k3k-gone": true, "k3k-live": true}
+	if len(keys) != len(want) {
+		t.Fatalf("keys = %v, want %v", keys, want)
+	}
+	for _, k := range keys {
+		if !want[k] {
+			t.Errorf("unexpected key %q", k)
+		}
+	}
+}
+
+// An owned Secret whose source-namespace label was stripped matches no collection
+// selector and routes to no key, so it is invisible unless something goes looking.
+func TestAuditReportsSecretsThatCanNeverBeCollected(t *testing.T) {
+	stranded := registeredSecret("a", "k3k-a")
+	delete(stranded.Labels, SourceNamespaceLabel(testPrefix))
+
+	var buf strings.Builder
+	r, c := newTestRegistrar(stranded)
+	r.log = slog.New(slog.NewTextHandler(&buf, nil))
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !secretExists(t, c, "cluster-a") {
+		t.Fatal("an unroutable Secret was deleted; it must never be, there is no proof")
+	}
+	if !strings.Contains(buf.String(), "records no source namespace") {
+		t.Errorf("the audit said nothing about it:\n%s", buf.String())
 	}
 }
 
@@ -892,14 +972,7 @@ func TestDiscoverSkipsInvalidClusterNames(t *testing.T) {
 		managedNS("k3k-bad", "Prod_Cluster"),
 		kubeconfigSecret("k3k-bad", "k3k-bad-kubeconfig"),
 	)
-	children, unresolved, err := r.discover(context.Background())
-	if err != nil {
-		t.Fatalf("discover: %v", err)
-	}
-	if len(children) != 0 {
-		t.Errorf("expected the invalid name to be skipped, got %+v", children)
-	}
-	if !unresolved["k3k-bad"] {
-		t.Error("a skipped namespace must be recorded as unresolved so its registration is exempt from GC")
+	if _, ok := discoverNS(t, r, "k3k-bad"); ok {
+		t.Error("expected the invalid cluster name to be skipped")
 	}
 }
