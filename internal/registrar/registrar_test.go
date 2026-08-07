@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 
 	coreV1 "k8s.io/api/core/v1"
@@ -23,13 +24,27 @@ const (
 )
 
 func testConfig() Config {
+	k3k, _ := Preset("k3k")
 	return Config{
-		TargetNamespace:   "argocd",
-		ManagedByValue:    testManagedBy,
-		SecretNamePattern: "k3k-*-kubeconfig",
-		SecretKey:         "kubeconfig.yaml",
-		LabelPrefix:       testPrefix,
+		TargetNamespace: "argocd",
+		ManagedByValue:  testManagedBy,
+		Providers:       []Provider{k3k},
+		LabelPrefix:     testPrefix,
 	}
+}
+
+// mustPresets is a shorthand for building a provider list in tests.
+func mustPresets(t *testing.T, names ...string) []Provider {
+	t.Helper()
+	out := make([]Provider, 0, len(names))
+	for _, n := range names {
+		p, ok := Preset(n)
+		if !ok {
+			t.Fatalf("unknown preset %q", n)
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 func newTestRegistrar(objs ...runtime.Object) (*Registrar, *fake.Clientset) {
@@ -121,7 +136,7 @@ func TestCollectRequiresProofTheNamespaceIsGone(t *testing.T) {
 	}}
 	r, c := newTestRegistrar(unlabelled, registeredSecret("a", "k3k-a"))
 
-	if err := r.collect(context.Background(), nil); err != nil {
+	if err := r.collect(context.Background(), nil, nil); err != nil {
 		t.Fatalf("collect: %v", err)
 	}
 	if !secretExists(t, c, "cluster-a") {
@@ -131,7 +146,7 @@ func TestCollectRequiresProofTheNamespaceIsGone(t *testing.T) {
 
 func TestCollectDeletesWhenNamespaceIsActuallyGone(t *testing.T) {
 	r, c := newTestRegistrar(registeredSecret("gone", "k3k-gone"))
-	if err := r.collect(context.Background(), nil); err != nil {
+	if err := r.collect(context.Background(), nil, nil); err != nil {
 		t.Fatalf("collect: %v", err)
 	}
 	if secretExists(t, c, "cluster-gone") {
@@ -148,7 +163,7 @@ func TestCollectNeverTouchesUnlabelledSecrets(t *testing.T) {
 		Labels:    map[string]string{argoSecretTypeLabel: argoSecretTypeValue},
 	}}
 	r, c := newTestRegistrar(hand)
-	if err := r.collect(context.Background(), nil); err != nil {
+	if err := r.collect(context.Background(), nil, nil); err != nil {
 		t.Fatalf("collect: %v", err)
 	}
 	if !secretExists(t, c, "cluster-handmade") {
@@ -166,7 +181,7 @@ func TestCollectContinuesPastDeleteErrors(t *testing.T) {
 		return false, nil, nil
 	})
 
-	if err := r.collect(context.Background(), nil); err == nil {
+	if err := r.collect(context.Background(), nil, nil); err == nil {
 		t.Error("expected the forbidden delete to be reported")
 	}
 	if secretExists(t, c, "cluster-b") {
@@ -225,15 +240,176 @@ func TestFindKubeconfigSecretSkipsDecoy(t *testing.T) {
 		Data:       map[string][]byte{"config": []byte(vclusterKubeconfig)},
 	}
 	r, _ := newTestRegistrar(decoy, wanted)
-	r.cfg.SecretNamePattern = "vc-*"
-	r.cfg.SecretKey = "config"
+	r.cfg.Providers = mustPresets(t, "vcluster")
 
-	got, err := r.findKubeconfigSecret(context.Background(), "ns")
+	got, err := r.findKubeconfigCandidates(context.Background(), "ns")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got.Name != "vc-x" {
-		t.Errorf("picked %q, want vc-x (the decoy sorts first)", got.Name)
+	if len(got) != 1 {
+		t.Fatalf("expected exactly one candidate, got %d: %+v", len(got), got)
+	}
+	if got[0].secret.Name != "vc-x" {
+		t.Errorf("picked %q, want vc-x (these names put the decoy first)", got[0].secret.Name)
+	}
+}
+
+func secretWith(ns, name, key, body string) *coreV1.Secret {
+	return &coreV1.Secret{
+		ObjectMeta: metaV1.ObjectMeta{Name: name, Namespace: ns},
+		Data:       map[string][]byte{key: []byte(body)},
+	}
+}
+
+// Two provisioners under ONE registrar is the whole point of 0.3.0: before it,
+// a second shape needed a second Deployment, and two Deployments sharing a
+// managed-by value garbage collect each other's Secrets.
+func TestMultipleProvidersRegisterSideBySide(t *testing.T) {
+	r, c := newTestRegistrar(
+		managedNS("k3k-a", "a"), kubeconfigSecret("k3k-a", "k3k-a-kubeconfig"),
+		managedNS("tenant-b", "b"), secretWith("tenant-b", "b-admin-kubeconfig", "admin.conf", kamajiKubeconfig),
+	)
+	r.cfg.Providers = mustPresets(t, "k3k", "kamaji")
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	for cluster, wantProvider := range map[string]string{"a": "k3k", "b": "kamaji"} {
+		got, err := c.CoreV1().Secrets("argocd").Get(context.Background(), secretName(cluster), metaV1.GetOptions{})
+		if err != nil {
+			t.Fatalf("cluster-%s was not registered: %v", cluster, err)
+		}
+		if got.Labels[ProviderLabel(testPrefix)] != wantProvider {
+			t.Errorf("cluster-%s provider label = %q, want %q",
+				cluster, got.Labels[ProviderLabel(testPrefix)], wantProvider)
+		}
+	}
+}
+
+// Deleting one child must collect exactly that registration. Cross-provider GC
+// is the way this change could destroy data, so it is asserted directly.
+func TestGarbageCollectionIsPerClusterAcrossProviders(t *testing.T) {
+	r, c := newTestRegistrar(
+		managedNS("k3k-a", "a"), kubeconfigSecret("k3k-a", "k3k-a-kubeconfig"), registeredSecret("a", "k3k-a"),
+		// b's namespace is gone; only its registration remains.
+		registeredSecret("b", "tenant-b"),
+	)
+	r.cfg.Providers = mustPresets(t, "k3k", "kamaji")
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !secretExists(t, c, "cluster-a") {
+		t.Error("cluster-a was collected although its namespace is still present")
+	}
+	if secretExists(t, c, "cluster-b") {
+		t.Error("cluster-b should have been collected once its namespace was gone")
+	}
+}
+
+// Driving Kamaji through its Cluster API control-plane provider produces TWO
+// Secrets for one physical cluster: Kamaji's own `<tcp>-admin-kubeconfig`, and a
+// CAPI-shaped `<cluster>-kubeconfig` copied from it. With both presets enabled
+// they both match, and registering each would put one cluster into ArgoCD twice.
+func TestKamajiViaCAPIRegistersOnce(t *testing.T) {
+	r, c := newTestRegistrar(
+		managedNS("tenant-b", "b"),
+		secretWith("tenant-b", "b-admin-kubeconfig", "admin.conf", kamajiKubeconfig),
+		secretWith("tenant-b", "b-kubeconfig", "value", capiKubeconfig),
+	)
+	r.cfg.Providers = mustPresets(t, "kamaji", "capi")
+
+	children, _, err := r.discover(context.Background())
+	if err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if len(children) != 1 {
+		t.Fatalf("one physical cluster produced %d registrations: %+v", len(children), children)
+	}
+	if children[0].provider != "kamaji" {
+		t.Errorf("provider = %q, want kamaji (declared first)", children[0].provider)
+	}
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	list, err := c.CoreV1().Secrets("argocd").List(context.Background(), metaV1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list.Items) != 1 {
+		t.Errorf("expected exactly one cluster Secret, got %d", len(list.Items))
+	}
+}
+
+// A Secret can match the shape and still be unusable. CAPA's EKS path writes
+// `<cluster>-user-kubeconfig` with an exec credential, which satisfies the CAPI
+// glob and the `value` key but cannot be copied into an ArgoCD Secret.
+//
+// In the real EKS layout `c-kubeconfig` happens to sort before
+// `c-user-kubeconfig`, so picking the first match would work by luck. The unusable
+// Secret here is named to sort FIRST, so this passes only if a failed parse
+// genuinely falls through to the next candidate.
+func TestPrefersUsableCandidateOverExecCredential(t *testing.T) {
+	r, _ := newTestRegistrar(
+		managedNS("capi-c", "c"),
+		secretWith("capi-c", "aaa-kubeconfig", "value", execKubeconfig),
+		secretWith("capi-c", "c-kubeconfig", "value", capiKubeconfig),
+	)
+	r.cfg.Providers = mustPresets(t, "capi")
+
+	children, _, err := r.discover(context.Background())
+	if err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if len(children) != 1 {
+		t.Fatalf("expected one registration, got %d: %+v", len(children), children)
+	}
+	if children[0].server != "https://192.168.1.196:6443" {
+		t.Errorf("registered the exec-credential kubeconfig: server = %q", children[0].server)
+	}
+}
+
+// A k3k Cluster reports ProvisioningFailed with `invalid character '<'` for
+// roughly its first ninety seconds, so a Secret can exist holding content that
+// does not parse. That window must never look like a deletion.
+func TestUnparseableKubeconfigDoesNotDeregister(t *testing.T) {
+	r, c := newTestRegistrar(
+		managedNS("k3k-a", "a"),
+		secretWith("k3k-a", "k3k-a-kubeconfig", "kubeconfig.yaml", "<html>not a kubeconfig</html>"),
+		registeredSecret("a", "k3k-a"),
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Logf("reconcile reported: %v", err)
+	}
+	if !secretExists(t, c, "cluster-a") {
+		t.Error("a half-written kubeconfig deregistered a live cluster")
+	}
+}
+
+// One namespace stuck without a usable kubeconfig used to disable garbage
+// collection for the entire fleet, so every other cluster's dead registration
+// stayed in ArgoCD indefinitely.
+func TestUnresolvedNamespaceDoesNotBlockCollectionOfOthers(t *testing.T) {
+	r, c := newTestRegistrar(
+		// Permanently stuck: matches the glob, never parses.
+		managedNS("k3k-stuck", "stuck"),
+		secretWith("k3k-stuck", "k3k-stuck-kubeconfig", "kubeconfig.yaml", "<html>"),
+		registeredSecret("stuck", "k3k-stuck"),
+		// Genuinely gone, and unrelated to the stuck one.
+		registeredSecret("gone", "k3k-gone"),
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Logf("reconcile reported: %v", err)
+	}
+	if !secretExists(t, c, "cluster-stuck") {
+		t.Error("the stuck cluster must be exempt from GC, not collected")
+	}
+	if secretExists(t, c, "cluster-gone") {
+		t.Error("an unrelated stuck namespace blocked collection of a genuinely deleted cluster")
 	}
 }
 
@@ -241,9 +417,26 @@ func TestConfigValidate(t *testing.T) {
 	for name, mutate := range map[string]func(*Config){
 		"empty target namespace": func(c *Config) { c.TargetNamespace = "" },
 		"empty managed-by":       func(c *Config) { c.ManagedByValue = "" },
-		"empty secret key":       func(c *Config) { c.SecretKey = "" },
-		"bad glob":               func(c *Config) { c.SecretNamePattern = "k3k-[" },
-		"prefix without slash":   func(c *Config) { c.LabelPrefix = "example.com" },
+		"no providers":           func(c *Config) { c.Providers = nil },
+		"empty provider name":    func(c *Config) { c.Providers[0].Name = "" },
+		"empty secret keys":      func(c *Config) { c.Providers[0].SecretKeys = nil },
+		"empty secret key":       func(c *Config) { c.Providers[0].SecretKeys = []string{""} },
+		// The code has always checked this; the test never did.
+		"empty pattern": func(c *Config) { c.Providers[0].SecretNamePattern = "" },
+		"bad glob":      func(c *Config) { c.Providers[0].SecretNamePattern = "k3k-[" },
+		"duplicate provider names": func(c *Config) {
+			c.Providers = append(c.Providers, c.Providers[0])
+		},
+		// The name is written verbatim as a label value on every cluster Secret
+		// this provider matches. Accepted here, it would be rejected by the
+		// apiserver on every apply, forever, per cluster.
+		"provider name is not a valid label value": func(c *Config) {
+			c.Providers[0].Name = "my tool"
+		},
+		"provider name too long for a label value": func(c *Config) {
+			c.Providers[0].Name = strings.Repeat("a", 64)
+		},
+		"prefix without slash": func(c *Config) { c.LabelPrefix = "example.com" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := testConfig()
@@ -265,14 +458,14 @@ func TestDiscoverSkipsInvalidClusterNames(t *testing.T) {
 		managedNS("k3k-bad", "Prod_Cluster"),
 		kubeconfigSecret("k3k-bad", "k3k-bad-kubeconfig"),
 	)
-	children, complete, err := r.discover(context.Background())
+	children, unresolved, err := r.discover(context.Background())
 	if err != nil {
 		t.Fatalf("discover: %v", err)
 	}
 	if len(children) != 0 {
 		t.Errorf("expected the invalid name to be skipped, got %+v", children)
 	}
-	if complete {
-		t.Error("a skipped namespace must mark the pass incomplete so GC is suppressed")
+	if !unresolved["k3k-bad"] {
+		t.Error("a skipped namespace must be recorded as unresolved so its registration is exempt from GC")
 	}
 }

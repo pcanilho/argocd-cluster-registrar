@@ -61,6 +61,98 @@ users:
     client-key-data: a2V5ZGF0YQ==
 `
 
+// Kamaji's standalone `<tcp>-admin-kubeconfig` Secret, key `admin.conf`. kubeadm
+// shapes it, so the names are the kubeadm ones rather than the cluster's.
+const kamajiKubeconfig = `apiVersion: v1
+kind: Config
+clusters:
+- name: tenant-00
+  cluster:
+    server: https://192.168.1.195:6443
+    certificate-authority-data: Y2FkYXRh
+users:
+- name: kubernetes-admin
+  user:
+    client-certificate-data: Y2VydGRhdGE=
+    client-key-data: a2V5ZGF0YQ==
+contexts:
+- name: kubernetes-admin@tenant-00
+  context:
+    cluster: tenant-00
+    user: kubernetes-admin
+current-context: kubernetes-admin@tenant-00
+`
+
+// The Cluster API contract shape: Secret `<cluster>-kubeconfig`, key `value`.
+// CAPI emits multiple entries with an explicit current-context, which is exactly
+// the case resolve() refuses to guess about.
+const capiKubeconfig = `apiVersion: v1
+kind: Config
+clusters:
+- name: capi-child
+  cluster:
+    server: https://192.168.1.196:6443
+    certificate-authority-data: Y2FkYXRh
+users:
+- name: capi-child-admin
+  user:
+    client-certificate-data: Y2VydGRhdGE=
+    client-key-data: a2V5ZGF0YQ==
+contexts:
+- name: capi-child-admin@capi-child
+  context:
+    cluster: capi-child
+    user: capi-child-admin
+current-context: capi-child-admin@capi-child
+`
+
+// CAPA's EKS path writes a SECOND `<cluster>-user-kubeconfig` carrying an exec
+// credential. It satisfies the CAPI glob and the `value` key, but cannot be
+// copied into an ArgoCD Secret at all.
+const execKubeconfig = `apiVersion: v1
+kind: Config
+clusters:
+- name: managed
+  cluster:
+    server: https://example.eks.amazonaws.com
+    certificate-authority-data: Y2FkYXRh
+users:
+- name: managed
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1beta1
+      command: aws-iam-authenticator
+current-context: managed
+contexts:
+- name: managed
+  context:
+    cluster: managed
+    user: managed
+`
+
+func TestParseKubeconfigKamajiShape(t *testing.T) {
+	server, _, err := parseKubeconfig([]byte(kamajiKubeconfig))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if server != "https://192.168.1.195:6443" {
+		t.Errorf("server = %q", server)
+	}
+}
+
+func TestParseKubeconfigCAPIShape(t *testing.T) {
+	server, config, err := parseKubeconfig([]byte(capiKubeconfig))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if server != "https://192.168.1.196:6443" {
+		t.Errorf("server = %q", server)
+	}
+	if !strings.Contains(config, "certData") {
+		t.Errorf("expected client certs in the config blob, got %s", config)
+	}
+}
+
 func TestParseKubeconfigClientCerts(t *testing.T) {
 	server, config, err := parseKubeconfig([]byte(k3kKubeconfig))
 	if err != nil {
@@ -157,6 +249,33 @@ func TestPropagatedLabels(t *testing.T) {
 	}
 }
 
+// The source namespace is tenant-controlled and apply() copies these labels OVER
+// the ones it just computed, so anything not withheld here can be spoofed.
+//
+// `source-namespace` is the sharp one: it is the pointer garbage collection
+// follows to prove a source is gone. A namespace claiming
+// `<prefix>source-namespace: kube-system` would aim that proof at a namespace
+// that never disappears, and its registration could then never be collected.
+func TestPropagatedLabelsWithholdsReservedLabels(t *testing.T) {
+	const p = "example.com/"
+	got := propagatedLabels(map[string]string{
+		ManagedByLabel(p):        "reg",
+		ClusterLabel(p):          "c1",
+		SourceNamespaceLabel(p):  "kube-system",
+		ProviderLabel(p):         "not-really",
+		"example.com/legitimate": "yes",
+	}, p)
+
+	for _, reserved := range reservedSuffixes {
+		if _, ok := got[p+reserved]; ok {
+			t.Errorf("%q was propagated from the namespace and can therefore be spoofed", p+reserved)
+		}
+	}
+	if got["example.com/legitimate"] != "yes" {
+		t.Errorf("ordinary prefixed labels must still propagate, got %v", got)
+	}
+}
+
 // A custom --label-prefix must be honoured on both read and filter, otherwise the
 // tool only works for whoever picked the default.
 func TestPropagatedLabelsHonoursCustomPrefix(t *testing.T) {
@@ -173,8 +292,8 @@ func TestPropagatedLabelsHonoursCustomPrefix(t *testing.T) {
 }
 
 // vcluster writes both `vc-<name>` (the kubeconfig) and `vc-config-<name>` (its
-// own config) so a `vc-*` glob matches both, and the decoy sorts FIRST. Matching
-// on name alone picked the decoy and skipped the namespace entirely.
+// own config) so a `vc-*` glob matches both. Matching on name alone picked the
+// decoy and skipped the namespace entirely.
 func TestParseKubeconfigVclusterShape(t *testing.T) {
 	server, config, err := parseKubeconfig([]byte(vclusterKubeconfig))
 	if err != nil {

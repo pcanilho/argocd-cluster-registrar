@@ -5,6 +5,90 @@ All notable changes to **argocd-cluster-registrar** are documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-08-07
+
+Serves more than one provisioner at a time. Until now `Config` held a single
+secret-name pattern and a single key, so an instance could register k3k **or**
+vcluster and never both. The obvious workaround, a second Deployment, is a
+trap: two instances sharing a `managedBy` value garbage collect each other's
+Secrets.
+
+Adds Kamaji and the Cluster API contract alongside the existing two, and fixes
+two pre-existing defects found while making room for them.
+
+Backwards compatible: a `0.2.x` values file keeps working unchanged. `providers`
+ships **empty** so that a values file which sets only the deprecated
+`secretNamePattern`/`secretKey` still takes the legacy path. Setting both forms is
+now a chart-render failure rather than a silent preference for one.
+
+### Added
+
+- `providers`, a list of provisioner shapes tried in precedence order, replacing
+  the single `secretNamePattern`/`secretKey` pair. Presets ship for `k3k`,
+  `vcluster`, `kamaji` and `capi`; a custom shape can be given in full as
+  `{name, secretNamePattern, secretKeys}`.
+- **Kamaji**: `*-admin-kubeconfig`, keys `admin.conf` or `admin.svc`. Two keys,
+  because Kamaji switches to `admin.svc` when its control plane advertises a
+  service address. Verified against Kamaji v1.0.0: a real `TenantControlPlane`
+  registered, and the resulting credentials authenticated to the tenant API server
+  with full x509 verification. The same `Secret` also carries `super-admin.conf`,
+  which is deliberately not preferred.
+- **Cluster API**: `*-kubeconfig`, key `value`. A mandatory control-plane contract
+  rather than a convention, so the one entry covers any CAPI cluster whatever the
+  infrastructure provider, plus standalone k0smotron, which adopts the same shape.
+  Scoped to self-managed control planes: CAPA/CAPZ/CAPG hand out exec credentials,
+  which cannot become an ArgoCD Secret at all, or ~15-minute tokens, which can and
+  then quietly expire.
+- `<labelPrefix>provider` on each cluster Secret, recording which provider
+  matched, so an ApplicationSet can select by provisioner. This makes the first
+  pass after upgrade rewrite every existing registration: the label is new,
+  nothing else about them changes.
+- Candidate fallthrough. A Secret matching a provider's shape but failing to parse
+  no longer poisons the namespace; the next candidate is tried. That is what makes
+  CAPA's `<cluster>-user-kubeconfig` decoy harmless, rather than leaving the
+  outcome to depend on `k` sorting before `u`.
+- Validation for duplicate provider names, and a test for the empty-pattern case
+  the code has always checked but nothing exercised.
+
+### Fixed
+
+- **Garbage collection is no longer suppressed fleet-wide by one bad namespace.**
+  Any managed namespace without a usable kubeconfig cleared a single `complete`
+  flag, which skipped `collect()` entirely, so one permanently broken namespace
+  kept every other cluster's dead registration in ArgoCD indefinitely. Every k3k
+  child hits this for its first ~90 seconds, during which GC was off for the whole
+  fleet. Unevaluable namespaces are now exempted individually, and everything else
+  is collected normally.
+
+  One consequence worth knowing: if a cluster **moves namespaces**, the old
+  namespace is provably gone while the new one is still unresolved, so the
+  registration is now deleted and re-created a pass or two later. Applications
+  targeting it can go briefly Unknown. Under the old fleet-wide flag there was no
+  gap, because nothing was collected at all.
+- **Reserved labels can no longer be spoofed from a source namespace.** Propagated
+  labels are copied over the ones the tool computes, and `source-namespace` was
+  not withheld, so a namespace labelling itself
+  `<prefix>source-namespace: kube-system` produced a registration whose GC proof
+  pointed at a namespace that never disappears, making it permanently
+  uncollectable. All reserved suffixes are now withheld.
+
+### Changed
+
+- `--secret-name-pattern` and `--secret-key` are deprecated in favour of
+  `--provider`, and kept as a single-provider shorthand. They cannot be combined
+  with `--provider`; the binary rejects that rather than silently preferring one.
+  The chart renders one form or the other, never both. Passing both is
+  indistinguishable from meaning both, which is how a stale values file ends up
+  quietly ignoring `providers`.
+- The tagline, chart description, image description and `--help` text no longer
+  enumerate k3k and vcluster, which stopped being accurate at four provisioners.
+  The chart `keywords` still name them, deliberately, since that is what people
+  search for. The provisioner table carries the specifics and keeps an honest
+  `Status` column: `tested` means run against the real thing, `assumed` means
+  taken from upstream source but not exercised here.
+- README's RBAC section corrected. It claimed Secret writes were cluster-scoped;
+  they have been a namespaced Role bound to `targetNamespace` since 0.2.0.
+
 ## [0.2.0] - 2026-08-06
 
 Renames the project from `vcluster-argocd-exporter` and rewrites it as a

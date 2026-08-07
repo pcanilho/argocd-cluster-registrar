@@ -1,6 +1,6 @@
 apiVersion: v2
 name: argocd-cluster-registrar
-description: Registers k3k and vcluster child clusters with ArgoCD, and removes them when they are deleted
+description: Registers the clusters you run inside your cluster with ArgoCD, and removes them again when they are deleted
 
 type: application
 version: 0.2.0
@@ -14,9 +14,13 @@ icon: https://raw.githubusercontent.com/pcanilho/argocd-cluster-registrar/main/d
 keywords:
   - argocd
   - gitops
+  - multi-cluster
+  - multi-tenancy
+  - virtual-cluster
+  - cluster-api
   - k3k
   - vcluster
-  - multi-cluster
+  - kamaji
   - kubernetes
 
 maintainers:

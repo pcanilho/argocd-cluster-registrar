@@ -12,15 +12,44 @@ labelPrefix: argocd-cluster-registrar/
 # pointed at the same value would fight over the same Secrets; give each its own.
 managedBy: cluster-registrar
 
-# Glob matching the kubeconfig Secret inside a watched namespace, and the key
-# within it. Defaults suit k3k, which names it `k3k-<cluster>-kubeconfig` with the
-# kubeconfig under `kubeconfig.yaml`.
+# Provisioners to look for, in precedence order. Order matters, because the
+# patterns legitimately overlap: `capi` matches `*-kubeconfig`, which includes
+# k3k's Secret. Correctness comes from the key, not the name.
 #
-# Matching by name rather than label is deliberate: the provisioner creates that
-# Secret, so it carries none of our labels. Adjust these two for a different
-# provisioner -- CAPI uses `<cluster>-kubeconfig` with the key `value`.
-secretNamePattern: "k3k-*-kubeconfig"
-secretKey: kubeconfig.yaml
+# Built-in presets: k3k, vcluster, kamaji, capi. A custom shape can be spelled
+# out in full instead:
+#
+#   providers:
+#     - k3k
+#     - name: mytool
+#       secretNamePattern: "mytool-*-kubeconfig"
+#       secretKeys: [kubeconfig]
+#
+# Matching by name rather than by label is deliberate: the provisioner creates
+# that Secret, so it carries none of our labels and there is nowhere to add them.
+#
+# On `capi`: it is the MANDATORY Cluster API control-plane contract
+# (`<cluster>-kubeconfig`, key `value`), so one entry covers any CAPI cluster
+# whatever the infrastructure provider, plus standalone k0smotron. It does not
+# usefully cover managed cloud control planes -- CAPA/CAPZ/CAPG hand out exec
+# credentials, which cannot be copied into an ArgoCD cluster Secret at all, or
+# short-lived tokens, which can but then expire.
+#
+# EMPTY BY DEFAULT, and that is load-bearing rather than an oversight. Helm
+# coalesces chart defaults into every user's values, so a non-empty default here
+# would be indistinguishable from a deliberate setting: a 0.2.x values file that
+# sets only `secretNamePattern`/`secretKey` and never mentions `providers` would
+# still take the branch below and have those two silently ignored. Leaving this
+# empty lets the binary supply the default instead, where it can tell "unset"
+# from "set to k3k". Unset, the binary uses `k3k`.
+providers: []
+
+# Superseded by `providers`, kept so a 0.2.x values file keeps working unchanged.
+# Set BOTH or neither. If `providers` is also set the chart fails rather than
+# guessing, because preferring either one silently is how an upgrade quietly
+# stops registering anything.
+secretNamePattern: ""
+secretKey: ""
 
 # How often to reconcile. Each pass re-reads every kubeconfig, which is what
 # keeps registrations valid across a k3s server restart -- those rotate the client

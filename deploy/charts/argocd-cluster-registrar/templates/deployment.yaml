@@ -48,8 +48,31 @@ spec:
             - "--target-namespace={{ .Values.targetNamespace }}"
             - "--label-prefix={{ .Values.labelPrefix }}"
             - "--managed-by={{ .Values.managedBy }}"
-            - "--secret-name-pattern={{ .Values.secretNamePattern }}"
-            - "--secret-key={{ .Values.secretKey }}"
+            {{- /*
+              Emit EITHER the provider list OR the pre-0.3.0 scalars, never both.
+
+              Setting both is a hard failure rather than a silent preference. Once
+              two ways to say the same thing exist, quietly honouring one of them
+              is how an upgrade ends up looking healthy while registering nothing:
+              the operator sees their values in git, and the pod is hunting for
+              something else entirely. `providers` is empty by default precisely so
+              that "set" can be told apart from "defaulted" here.
+            */}}
+            {{- if and .Values.providers (or .Values.secretNamePattern .Values.secretKey) }}
+            {{- fail "providers and secretNamePattern/secretKey are mutually exclusive. secretNamePattern/secretKey are deprecated; express them as a providers entry instead, e.g. providers: [{name: custom, secretNamePattern: 'vc-*', secretKeys: [config]}]" }}
+            {{- end }}
+            {{- if .Values.providers }}
+            {{- range .Values.providers }}
+            {{- if kindIs "string" . }}
+            - "--provider={{ . }}"
+            {{- else }}
+            - "--provider={{ .name }}={{ .secretNamePattern }}={{ join "," .secretKeys }}"
+            {{- end }}
+            {{- end }}
+            {{- else if or .Values.secretNamePattern .Values.secretKey }}
+            - "--secret-name-pattern={{ required "secretNamePattern is required when secretKey is set" .Values.secretNamePattern }}"
+            - "--secret-key={{ required "secretKey is required when secretNamePattern is set" .Values.secretKey }}"
+            {{- end }}
             - "--interval={{ .Values.interval }}"
             {{- if .Values.dryRun }}
             - --dry-run
