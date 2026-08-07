@@ -30,6 +30,11 @@ const (
 	testSourceNS = "k3k-src"
 	// keyConfig is the ArgoCD cluster Secret's credential key.
 	keyConfig = "config"
+
+	// Kamaji's two kubeconfig keys. Named because the multi-key tests repeat them
+	// and because which of the two wins is itself the assertion.
+	keyAdminConf = "admin.conf"
+	keyAdminSvc  = "admin.svc"
 	// testNS is the source namespace most fixtures use.
 	testNS = "k3k-a"
 	// k3kServer is the endpoint inside the k3k kubeconfig fixture.
@@ -310,7 +315,7 @@ func secretWith(ns, name, key, body string) *coreV1.Secret {
 func TestMultipleProvidersRegisterSideBySide(t *testing.T) {
 	r, c := newTestRegistrar(
 		managedNS(testNS, "a"), kubeconfigSecret(testNS, "k3k-a-kubeconfig"),
-		managedNS("tenant-b", "b"), secretWith("tenant-b", "b-admin-kubeconfig", "admin.conf", kamajiKubeconfig),
+		managedNS("tenant-b", "b"), secretWith("tenant-b", "b-admin-kubeconfig", keyAdminConf, kamajiKubeconfig),
 	)
 	r.cfg.Providers = mustPresets(t, "k3k", "kamaji")
 
@@ -355,10 +360,15 @@ func TestGarbageCollectionIsPerClusterAcrossProviders(t *testing.T) {
 // Secrets for one physical cluster: Kamaji's own `<tcp>-admin-kubeconfig`, and a
 // CAPI-shaped `<cluster>-kubeconfig` copied from it. With both presets enabled
 // they both match, and registering each would put one cluster into ArgoCD twice.
+//
+// What this pins is PROVIDER PRECEDENCE. Read it as a guard on the candidate
+// count and you will overrate it: capi's `value` key is absent from the Kamaji
+// Secret, so no change to how keys become candidates can make it fail. The
+// per-Secret `claimed` rule is what it actually holds in place.
 func TestKamajiViaCAPIRegistersOnce(t *testing.T) {
 	r, c := newTestRegistrar(
 		managedNS("tenant-b", "b"),
-		secretWith("tenant-b", "b-admin-kubeconfig", "admin.conf", kamajiKubeconfig),
+		secretWith("tenant-b", "b-admin-kubeconfig", keyAdminConf, kamajiKubeconfig),
 		secretWith("tenant-b", "b-kubeconfig", "value", capiKubeconfig),
 	)
 	r.cfg.Providers = mustPresets(t, "kamaji", "capi")
@@ -1149,5 +1159,128 @@ func TestDiscoverSkipsInvalidClusterNames(t *testing.T) {
 	)
 	if _, ok := discoverNS(t, r, "k3k-bad"); ok {
 		t.Error("expected the invalid cluster name to be skipped")
+	}
+}
+
+// secretWithKeys builds a Secret carrying several keys at once, which is the
+// shape Kamaji actually writes and which no fixture covered before.
+func secretWithKeys(ns, name string, kv map[string]string) *coreV1.Secret {
+	data := make(map[string][]byte, len(kv))
+	for k, v := range kv {
+		data[k] = []byte(v)
+	}
+	return &coreV1.Secret{
+		ObjectMeta: metaV1.ObjectMeta{Name: name, Namespace: ns},
+		Data:       data,
+	}
+}
+
+// Every key a provider declares that is actually present becomes its own
+// candidate, in declared order.
+//
+// Stopping at the first present key made Provider.SecretKeys' "tried in order"
+// a claim the code did not honour: with both Kamaji keys present there was only
+// ever one candidate, so the second could not be reached however broken the
+// first was.
+func TestOneSecretYieldsOneCandidatePerPresentKey(t *testing.T) {
+	r, _ := newTestRegistrar(
+		managedNS("tenant-c", "c"),
+		secretWithKeys("tenant-c", "c-admin-kubeconfig", map[string]string{
+			keyAdminConf: kamajiKubeconfig,
+			keyAdminSvc:  kamajiSvcKubeconfig,
+		}),
+	)
+	r.cfg.Providers = mustPresets(t, "kamaji")
+
+	got, err := r.findKubeconfigCandidates(context.Background(), "tenant-c")
+	if err != nil {
+		t.Fatalf("find candidates: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d candidates, want one per present key", len(got))
+	}
+	// Declared order, not map order: Secret.Data is a map, so iterating it rather
+	// than SecretKeys would pass or fail at random.
+	if got[0].key != keyAdminConf || got[1].key != keyAdminSvc {
+		t.Errorf("keys = %q then %q, want admin.conf then admin.svc (the declared order)",
+			got[0].key, got[1].key)
+	}
+	if got[0].secret != got[1].secret {
+		t.Error("the two candidates should share one Secret, not copy it")
+	}
+}
+
+// An unusable first key must fall through to the next, exactly as an unusable
+// first Secret already does.
+//
+// This is the bug B1 names: Kamaji writes admin.conf and admin.svc together, so
+// a half-written admin.conf left the namespace unregistered indefinitely even
+// though a perfectly good kubeconfig sat beside it.
+func TestEveryPresentKeyOnOneSecretIsTriedInOrder(t *testing.T) {
+	r, _ := newTestRegistrar(
+		managedNS("tenant-d", "d"),
+		secretWithKeys("tenant-d", "d-admin-kubeconfig", map[string]string{
+			keyAdminConf: "<html>not a kubeconfig</html>",
+			keyAdminSvc:  kamajiSvcKubeconfig,
+		}),
+	)
+	r.cfg.Providers = mustPresets(t, "kamaji")
+
+	ch, ok := discoverNS(t, r, "tenant-d")
+	if !ok {
+		t.Fatal("a usable admin.svc beside a broken admin.conf produced no registration")
+	}
+	// The exact address, not merely "no error": asserting the fallthrough reached
+	// the SECOND key is the whole point, and the two fixtures differ only here.
+	if ch.server != "https://tenant-00.kamaji.svc:6443" {
+		t.Errorf("server = %q, want admin.svc's address", ch.server)
+	}
+}
+
+// Several candidates, still one registration.
+//
+// Candidate count and registration count are different things: discoverOne stops
+// at the first candidate that parses. Both keys are valid here and point at
+// DIFFERENT servers, so a bug that kept going would be visible as the wrong
+// address rather than as a second Secret.
+func TestTwoKeysOnOneSecretStillRegisterOneCluster(t *testing.T) {
+	r, c := newTestRegistrar(
+		managedNS("tenant-e", "e"),
+		secretWithKeys("tenant-e", "e-admin-kubeconfig", map[string]string{
+			keyAdminConf: kamajiKubeconfig,
+			keyAdminSvc:  kamajiSvcKubeconfig,
+		}),
+	)
+	r.cfg.Providers = mustPresets(t, "kamaji")
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	list, err := c.CoreV1().Secrets(testTargetNS).List(context.Background(), metaV1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list.Items) != 1 {
+		t.Fatalf("two keys on one Secret produced %d registrations, want 1", len(list.Items))
+	}
+	// secretValue, not Data: the fake does not merge StringData the way a real
+	// apiserver does, so a freshly CREATED Secret reads empty out of Data alone.
+	if got := secretValue(&list.Items[0], "server"); got != "https://192.168.1.195:6443" {
+		t.Errorf("server = %q, want admin.conf's address; the first key that parses wins", got)
+	}
+}
+
+// A repeated key is a typo in a values file. Every present key is now its own
+// candidate, so a duplicate would parse the same bytes twice and report the same
+// failure twice while the operator learned nothing.
+func TestDuplicateSecretKeysInOneProviderAreRejected(t *testing.T) {
+	cfg := testConfig()
+	cfg.Providers = []Provider{{
+		Name:              "mytool",
+		SecretNamePattern: "mytool-*",
+		SecretKeys:        []string{keyAdminConf, keyAdminSvc, keyAdminConf},
+	}}
+	if err := cfg.Validate(); err == nil {
+		t.Error("a duplicated secret key was accepted")
 	}
 }

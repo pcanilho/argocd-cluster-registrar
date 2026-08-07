@@ -173,10 +173,19 @@ type Provider struct {
 	// there instead.
 	SecretNamePattern string
 
-	// SecretKeys are the keys that may hold the kubeconfig, tried in order. A
-	// list rather than a single key because one provisioner can legitimately use
-	// either: Kamaji writes `admin.conf`, or `admin.svc` when its control plane
-	// advertises a service address.
+	// SecretKeys are the keys that may hold the kubeconfig. A list rather than a
+	// single key because one provisioner can legitimately use either: Kamaji
+	// writes `admin.conf`, or `admin.svc` when its control plane advertises a
+	// service address.
+	//
+	// Tried in order, and "tried" means parsed: every key present becomes its own
+	// candidate, so a first key that is half-written or carries a credential we
+	// cannot copy falls through to the next rather than failing the namespace.
+	// The first key that yields a USABLE kubeconfig wins, so where several parse
+	// -- which is the normal Kamaji case, both of its keys being well-formed --
+	// the order declared here is the order that decides.
+	//
+	// Duplicates are rejected by Validate rather than ignored here.
 	SecretKeys []string
 }
 
@@ -203,9 +212,13 @@ var presets = map[string]Provider{
 		SecretNamePattern: "vc-*",
 		SecretKeys:        []string{"config"},
 	},
-	// Kamaji's standalone shape. Note that driving Kamaji through its Cluster API
-	// control-plane provider ALSO produces a second, CAPI-shaped Secret for the
-	// same physical cluster -- see the note on candidate ordering in discover.
+	// Kamaji's standalone shape. Both keys are normally present and both normally
+	// parse, so `admin.conf` wins on order; `admin.svc` is reached when the first
+	// is unusable, or by declaring it first in a custom entry.
+	//
+	// Note that driving Kamaji through its Cluster API control-plane provider ALSO
+	// produces a second, CAPI-shaped Secret for the same physical cluster -- see
+	// the note on candidate ordering in discover.
 	"kamaji": { // #nosec G101 -- see above
 		Name:              "kamaji",
 		SecretNamePattern: "*-admin-kubeconfig",
@@ -400,10 +413,19 @@ func (c Config) Validate() error {
 		if len(p.SecretKeys) == 0 {
 			return fmt.Errorf("provider %q: at least one secret key must be set", p.Name)
 		}
+		seenKey := make(map[string]bool, len(p.SecretKeys))
 		for _, k := range p.SecretKeys {
 			if k == "" {
 				return fmt.Errorf("provider %q: secret key must not be empty", p.Name)
 			}
+			// Rejected rather than quietly ignored, matching the duplicate-name rule
+			// above. Every present key now becomes its own candidate, so a repeated
+			// key would parse the same bytes twice and report the same failure twice
+			// -- and the operator would never learn their values file has a typo.
+			if seenKey[k] {
+				return fmt.Errorf("provider %q: duplicate secret key %q", p.Name, k)
+			}
+			seenKey[k] = true
 		}
 		// A malformed glob is a permanent fault. It used to surface once per
 		// namespace per pass, disguised as "no kubeconfig secret yet".
@@ -754,6 +776,9 @@ func (r *Registrar) discoverOne(ctx context.Context, ns *coreV1.Namespace) (chil
 	// Try candidates in order. A shape match is not a usable kubeconfig: it may
 	// be half-written, or carry an exec credential that cannot be copied into an
 	// ArgoCD Secret, and in both cases the next candidate may be fine.
+	//
+	// Two candidates may be the same Secret under different keys, which is why the
+	// parse errors below are labelled `name[key]` rather than by name alone.
 	var (
 		server, config string
 		provider       string
@@ -801,9 +826,10 @@ type candidate struct {
 	key      string
 }
 
-// findKubeconfigCandidates returns every Secret in ns that matches a configured
-// provider's glob AND carries one of that provider's keys, in the order they
-// should be tried: providers in configured precedence order, then Secret name.
+// findKubeconfigCandidates returns every (Secret, key) pair in ns where the
+// Secret matches a configured provider's glob AND carries that key, in the order
+// they should be tried: providers in configured precedence order, then Secret
+// name, then the order the provider declares its keys.
 //
 // Both conditions matter. A name-only match picks the wrong object whenever a
 // provisioner writes more than one Secret under the same prefix: vcluster's
@@ -813,12 +839,19 @@ type candidate struct {
 // the two happen to sort.
 //
 // A LIST rather than a single answer, because matching the shape is not the same
-// as being usable. Cluster API's contract is satisfied by managed-cloud
-// providers too, and CAPA's EKS path writes a second `<cluster>-user-kubeconfig`
-// -- same glob, same `value` key -- holding an `exec` credential that cannot be
-// copied into an ArgoCD Secret at all. Returning candidates lets the caller fall
-// through to the next one on a parse failure, instead of relying on `k` sorting
-// before `u`.
+// as being usable. That holds at both levels.
+//
+// Across Secrets: Cluster API's contract is satisfied by managed-cloud providers
+// too, and CAPA's EKS path writes a second `<cluster>-user-kubeconfig` -- same
+// glob, same `value` key -- holding an `exec` credential that cannot be copied
+// into an ArgoCD Secret at all. Returning candidates lets the caller fall through
+// to the next one on a parse failure, instead of relying on `k` sorting before
+// `u`.
+//
+// Within one Secret: Kamaji writes `admin.conf` and `admin.svc` side by side, so
+// emitting only the first present key made the second unreachable however broken
+// the first was. Both levels use the same mechanism, because a parse failure is
+// how an unusable candidate announces itself either way.
 func (r *Registrar) findKubeconfigCandidates(ctx context.Context, ns string) ([]candidate, error) {
 	secrets, err := r.client.CoreV1().Secrets(ns).List(ctx, metaV1.ListOptions{})
 	if err != nil {
@@ -860,21 +893,32 @@ func (r *Registrar) findKubeconfigCandidates(ctx context.Context, ns string) ([]
 				continue
 			}
 
-			key := ""
+			// One candidate per key PRESENT, not merely the first one. Kamaji ships
+			// `admin.conf` and `admin.svc` together, so stopping at the first meant
+			// a half-written `admin.conf` put `admin.svc` out of reach and stranded
+			// the namespace -- while Provider.SecretKeys claimed its keys were
+			// "tried in order". They now are.
+			//
+			// Several candidates may therefore share one *coreV1.Secret pointer into
+			// secrets.Items. Read-only, and the caller tells them apart by key.
+			found := 0
 			for _, k := range p.SecretKeys {
-				if _, has := s.Data[k]; has {
-					key = k
-					break
+				if _, has := s.Data[k]; !has {
+					continue
 				}
+				found++
+				out = append(out, candidate{secret: s, provider: p.Name, key: k})
 			}
-			if key == "" {
+			if found == 0 {
 				namedButKeyless = append(namedButKeyless,
 					fmt.Sprintf("%s (provider %s)", s.Name, p.Name))
 				continue
 			}
 
+			// Claimed per SECRET, not per key, and that is what keeps one physical
+			// cluster registered once: a later provider must not re-offer this
+			// object under a key of its own.
 			claimed[s.Name] = true
-			out = append(out, candidate{secret: s, provider: p.Name, key: key})
 		}
 	}
 

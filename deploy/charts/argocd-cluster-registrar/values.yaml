@@ -25,6 +25,12 @@ managedBy: cluster-registrar
 # patterns legitimately overlap: `capi` matches `*-kubeconfig`, which includes
 # k3k's Secret. Correctness comes from the key, not the name.
 #
+# `secretKeys` is ordered too. Every declared key present on a Secret is tried in
+# turn and the first that parses wins, so a half-written or otherwise unusable key
+# falls through to the next rather than stranding the namespace. Put the key you
+# prefer first: Kamaji's `admin.conf` and `admin.svc` both normally parse, so the
+# declared order is what decides between them.
+#
 # Built-in presets: k3k, vcluster, kamaji, capi. A custom shape can be spelled
 # out in full instead:
 #

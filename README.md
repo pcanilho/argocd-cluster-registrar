@@ -164,16 +164,20 @@ The matched provider is recorded on the cluster `Secret` as
 
 #### Per-provider notes
 
-**Order matters.** The globs overlap on purpose: `capi`'s `*-kubeconfig` also
-matches k3k's `k3k-<cluster>-kubeconfig`. Correctness comes from the key, not the
-name, and where two providers could both claim a `Secret` the one declared first
-wins. Put the more specific provider first. `capi` is the loosest shipped.
+**Order matters,** for providers and for keys. The globs overlap on purpose:
+`capi`'s `*-kubeconfig` also matches k3k's `k3k-<cluster>-kubeconfig`. Correctness
+comes from the key, not the name, and where two providers could both claim a
+`Secret` the one declared first wins. Put the more specific provider first. `capi`
+is the loosest shipped. Within one `Secret`, every declared key that is present is
+tried in turn and the first that parses wins, so an unusable key falls through to
+the next instead of stranding the namespace.
 
-**Kamaji** normally writes both `admin.conf` and `admin.svc`. Only the first key
-present is tried, so `admin.conf` wins; reorder them in a custom entry if you need
-the other. Running Kamaji through its Cluster API control-plane provider produces
-a second, CAPI-shaped `Secret` for the same cluster, so with both presets enabled
-the one declared first decides which is used.
+**Kamaji** normally writes both `admin.conf` and `admin.svc`, and both normally
+parse, so `admin.conf` wins on order and `admin.svc` is reached only when the
+first is unusable. Declare `admin.svc` first in a custom entry to prefer the
+service address. Running Kamaji through its Cluster API control-plane provider
+produces a second, CAPI-shaped `Secret` for the same cluster, so with both presets
+enabled the one declared first decides which is used.
 
 **`capi`** is the mandatory control-plane contract, so it covers any CAPI cluster
 whatever the infrastructure provider, plus standalone k0smotron. It does **not**
