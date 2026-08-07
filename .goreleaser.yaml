@@ -36,6 +36,13 @@ archives:
 snapshot:
   version_template: "{{.Tag}}-next"
 
+# One SPDX document per archive. The images already carry one: ko generates it
+# natively (kos.sbom defaults to spdx), which is why only the archives were
+# uncovered. goreleaser has no built-in generator and shells out to syft, so the
+# release workflow installs it.
+sboms:
+  - artifacts: archive
+
 checksum:
   name_template: "{{.ProjectName}}_{{.Version}}_SHA256SUMS"
   algorithm: sha256

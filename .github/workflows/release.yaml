@@ -37,6 +37,13 @@ jobs:
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3
 
+      # goreleaser has no SBOM generator of its own; it shells out to syft, and
+      # fails the release if it is missing. The images do not need this: ko
+      # generates their SPDX document natively, which is why only the binary
+      # archives were uncovered.
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0.24.0
+
       # Release notes come from CHANGELOG.md rather than from commit subjects,
       # so they are written deliberately and reviewed before tagging. A tag with
       # no matching section fails here instead of publishing an empty release.

@@ -121,6 +121,10 @@ served or deleted unless you ask for it.
   using the chart. Set the flag explicitly to override. Only affects installs with
   `leaderElection` enabled, which is off by default.
 
+- **An SPDX SBOM ships alongside each binary archive.** The images already had
+  one, generated natively by ko, so only the archives were uncovered. Verified by
+  a local snapshot build: eight documents, 57 packages each.
+
 - **Errors are printed once.** `main` wrapped every failure in a second message on
   a second stream in a different format, while cobra had already printed it, and
   the wording was inherited from `vcluster-argocd-exporter` so a flag validation
