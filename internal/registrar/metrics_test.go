@@ -188,10 +188,29 @@ func TestDemotedRegistrationsAreCounted(t *testing.T) {
 		t.Fatalf("audit: %v", err)
 	}
 
-	if got := testutil.ToFloat64(registrations.WithLabelValues(stateDemoted)); got != 3 {
+	if got := registrationsIn(t, stateDemoted); got != 3 {
 		t.Errorf("registrations{state=demoted} = %v, want 3", got)
 	}
-	if got := testutil.ToFloat64(registrations.WithLabelValues(stateActive)); got != 1 {
+	if got := registrationsIn(t, stateActive); got != 1 {
 		t.Errorf("registrations{state=active} = %v, want 1", got)
 	}
+	// These fixtures carry no certData, so they must land in `none` rather than
+	// be quietly counted as healthy.
+	if got := testutil.ToFloat64(registrations.WithLabelValues(stateActive, expiryNone)); got != 1 {
+		t.Errorf("registrations{state=active,credential_expiry=none} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(registrations.WithLabelValues(stateActive, expiryOK)); got != 0 {
+		t.Errorf("a registration with no certificate was counted as ok")
+	}
+}
+
+// registrationsIn sums a state across every expiry bucket, which is what the
+// gauge meant before it gained the second dimension.
+func registrationsIn(t *testing.T, state string) float64 {
+	t.Helper()
+	var total float64
+	for _, bucket := range expiryBuckets {
+		total += testutil.ToFloat64(registrations.WithLabelValues(state, bucket))
+	}
+	return total
 }

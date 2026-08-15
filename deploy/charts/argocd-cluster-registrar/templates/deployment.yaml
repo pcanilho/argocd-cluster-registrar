@@ -82,7 +82,7 @@ spec:
             {{- if kindIs "string" . }}
             - "--provider={{ . }}"
             {{- else }}
-            - "--provider={{ .name }}={{ .secretNamePattern }}={{ join "," .secretKeys }}"
+            - "--provider={{ .name }}={{ .secretNamePattern }}={{ join "," .secretKeys }}{{ if .allowExec }}=exec{{ end }}"
             {{- end }}
             {{- end }}
             {{- else if or .Values.secretNamePattern .Values.secretKey }}
@@ -93,6 +93,9 @@ spec:
             {{- /* Always emitted: `0s` is a truthy string but `0` is a falsy int, so
                    a conditional would render opposite results for the same intent. */}}
             - "--demoted-ttl={{ .Values.demotedTTL | default "0s" }}"
+            {{- if .Values.execCredentials }}
+            - --exec-credentials
+            {{- end }}
             {{- if .Values.leaderElection.enabled }}
             - --leader-elect
             - "--leader-election-id={{ include "app.leaderElectionID" . }}"

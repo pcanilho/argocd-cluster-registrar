@@ -7,15 +7,10 @@ import (
 
 // Metrics for the outcomes a log line alone cannot be alerted on.
 //
-// Package-level, not a Registrar field: the Registry is a process global and
-// MustRegister panics on a duplicate, so registering per instance would panic on
-// the second Registrar the test binary builds.
-//
-// Every label value below is a compile-time constant. Nothing here is a cluster
-// name or a namespace, which on the conflict path would be attacker-chosen
-// cardinality. Which cluster is contested stays in the log line, and so does the
-// reason a per-conflict gauge is absent: it could never be cleared, since a
-// deleted claimant namespace never reaches the code that would zero it.
+// Package-level because the Registry is a process global and MustRegister panics
+// on a duplicate. Every label value is a compile-time constant: a cluster or
+// namespace name would be attacker-chosen cardinality on the conflict path, so
+// which cluster is contested stays in the log line.
 var (
 	conflictsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "argocd_cluster_registrar_conflicts_total",
@@ -27,14 +22,12 @@ var (
 		Help: "Owned cluster Secrets recording no source namespace that were adopted by a matching namespace.",
 	})
 
-	// registrations is a gauge rather than a counter because the question is "are
-	// demoted registrations piling up", which is a level and not a rate. It is set
-	// from the audit pass, which already lists every owned Secret, so it costs no
-	// extra API call.
+	// A gauge, not a counter: "are demoted registrations piling up" is a level.
+	// Set from the audit pass, which already lists every owned Secret.
 	registrations = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "argocd_cluster_registrar_registrations",
 		Help: "Cluster registrations this instance owns, by state.",
-	}, []string{"state"})
+	}, []string{"state", "credential_expiry"})
 
 	unroutedSecrets = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "argocd_cluster_registrar_unrouted_secrets",
@@ -49,6 +42,29 @@ const (
 	stateDemoted = "demoted"
 )
 
+// The expiry buckets. These are not cumulative: each registration lands in
+// exactly one, so `expired|lt_24h` is a sum and an alert can say how many.
+const (
+	expiryExpired = "expired"
+	expiryLt24h   = "lt_24h"
+	expiryLt7d    = "lt_7d"
+	expiryLt30d   = "lt_30d"
+	expiryOK      = "ok"
+	// expiryNone is a registration with no client certificate to read: a bearer
+	// token, which carries no expiry we can see. Present so the metric cannot lie
+	// by omission -- these are not healthy, they are unmeasured.
+	expiryNone = "none"
+	// expiryUnreadable is a certificate or config blob that will not decode.
+	expiryUnreadable = "unreadable"
+	// expiryAbsent is a registration with no config at all. Nothing is broken.
+	expiryAbsent = "absent"
+)
+
+var expiryBuckets = []string{
+	expiryExpired, expiryLt24h, expiryLt7d, expiryLt30d,
+	expiryOK, expiryNone, expiryUnreadable, expiryAbsent,
+}
+
 // conflictReasons is every value the reason label can take. One list, so that
 // publishing them at zero and asserting on them cannot drift apart.
 var conflictReasons = []string{
@@ -57,19 +73,22 @@ var conflictReasons = []string{
 	conflictIncumbent,
 	conflictContestedName,
 	conflictCreateRace,
+	conflictServerCollision,
 }
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(
 		conflictsTotal, adoptionsTotal, registrations, unroutedSecrets)
 
-	// Published at zero from the start. A counter that has never been incremented
-	// is absent from /metrics entirely, and an absent series makes
-	// `increase(...[15m]) > 0` silently unevaluable rather than false, so an alert
-	// written against it never fires and never says why.
+	// A counter never incremented is absent from /metrics entirely, which makes
+	// `increase(...[15m]) > 0` unevaluable rather than false, so an alert written
+	// against it never fires and never says why.
 	for _, reason := range conflictReasons {
 		conflictsTotal.WithLabelValues(reason)
 	}
-	registrations.WithLabelValues(stateActive)
-	registrations.WithLabelValues(stateDemoted)
+	for _, state := range []string{stateActive, stateDemoted} {
+		for _, bucket := range expiryBuckets {
+			registrations.WithLabelValues(state, bucket)
+		}
+	}
 }

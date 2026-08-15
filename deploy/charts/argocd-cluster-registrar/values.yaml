@@ -3,8 +3,12 @@
 # own namespace, so this is effectively always "argocd".
 targetNamespace: argocd
 
-# Prefix for the labels read off the source namespace and copied onto the ArgoCD
-# cluster Secret. Override it to fit an existing labelling convention.
+# Prefix for the labels AND annotations read off the source namespace and copied
+# onto the ArgoCD cluster Secret. Override it to fit an existing convention.
+#
+# Annotations carry what a label value cannot: a URL, a list, anything over 63
+# bytes. The ApplicationSet cluster generator exposes both, but selects on labels
+# only. Values over 4KiB are skipped.
 labelPrefix: argocd-cluster-registrar/
 
 # Value of the `<labelPrefix>managed-by` label that identifies both the namespaces
@@ -31,26 +35,33 @@ managedBy: cluster-registrar
 # prefer first: Kamaji's `admin.conf` and `admin.svc` both normally parse, so the
 # declared order is what decides between them.
 #
-# Built-in presets: k3k, vcluster, kamaji, capi. A custom shape can be spelled
-# out in full instead:
+# Built-in presets: k3k, vcluster, kamaji, capi, capa-eks, capz-aks. A custom
+# shape can be spelled out in full instead:
 #
 #   providers:
 #     - k3k
 #     - name: mytool
 #       secretNamePattern: "mytool-*-kubeconfig"
 #       secretKeys: [kubeconfig]
+#       # Optional. Permits translating an exec credential found in this shape,
+#       # and only takes effect with execCredentials: true below. Set it only on
+#       # shapes that are exec-bearing by construction.
+#       allowExec: false
 #
 # Matching by name rather than by label is deliberate: the provisioner creates
 # that Secret, so it carries none of our labels and there is nowhere to add them.
 #
 # On `capi`: it is the MANDATORY Cluster API control-plane contract
 # (`<cluster>-kubeconfig`, key `value`), so one entry covers any CAPI cluster
-# whatever the infrastructure provider, plus standalone k0smotron. It does not
-# usefully cover managed cloud control planes -- CAPA/CAPZ/CAPG hand out exec
-# credentials, which cannot be copied into an ArgoCD cluster Secret at all, or
-# short-lived tokens, which can but then expire.
+# whatever the infrastructure provider, plus standalone k0smotron.
 #
-# EMPTY BY DEFAULT, and that is load-bearing rather than an oversight. Helm
+# Managed cloud control planes need `capa-eks` or `capz-aks` as well, plus
+# `execCredentials: true`, and the managed preset must be declared FIRST.
+# CAPA and CAPZ write two Secrets: the CAPI-contract one holds a token good for
+# about 15 minutes, the other an exec credential that gets translated into
+# ArgoCD's own argocd-k8s-auth configuration and does not expire that way.
+#
+# empty BY DEFAULT, and that is load-bearing rather than an oversight. Helm
 # coalesces chart defaults into every user's values, so a non-empty default here
 # would be indistinguishable from a deliberate setting: a 0.2.x values file that
 # sets only `secretNamePattern`/`secretKey` and never mentions `providers` would
@@ -58,6 +69,16 @@ managedBy: cluster-registrar
 # empty lets the binary supply the default instead, where it can tell "unset"
 # from "set to k3k". Unset, the binary uses `k3k`.
 providers: []
+
+# Translate exec credential plugins (EKS, AKS) into ArgoCD's argocd-k8s-auth
+# configuration. Off by default, and only affects providers that allow it.
+#
+# A translated registration makes ArgoCD authenticate as itself, with its own
+# IRSA or workload identity, rather than with a credential from the source
+# namespace. Access is then governed on the cloud side against ArgoCD's
+# principal, which this tool neither sees nor revokes when the namespace is
+# deleted. Turn it on only if that is what you want.
+execCredentials: false
 
 # Superseded by `providers`, kept so a 0.2.x values file keeps working unchanged.
 # Set BOTH or neither. If `providers` is also set the chart fails rather than
@@ -68,7 +89,7 @@ secretKey: ""
 
 # How long before a settled cluster is looked at again.
 #
-# This is NOT how quickly a new cluster is registered or a deleted one removed:
+# This is not how quickly a new cluster is registered or a deleted one removed:
 # both are driven by namespace events now and happen as fast as the apiserver
 # delivers one. What this bounds is credential freshness -- a k3s server restart
 # rotates the child's client certificate, and until the registration is re-read
@@ -116,7 +137,8 @@ probes:
     periodSeconds: 10
 
 # Prometheus metrics. Four series, all counts of this instance's own decisions:
-# registrations refused and why, orphans adopted, registrations owned by state,
+# registrations refused and why, orphans adopted, registrations owned by state
+# and remaining credential lifetime,
 # and owned Secrets that no reconcile key can reach.
 #
 # OFF by default, and served UNAUTHENTICATED when on. Protecting the endpoint
@@ -176,3 +198,46 @@ resources:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# A ValidatingAdmissionPolicy constraining who may set the two labels that
+# authorize a registration. Off by default.
+#
+# This is the enforcement point the README's security section describes. The
+# labels are policy input, not decoration, and Kubernetes cannot gate a label key
+# through RBAC alone: whoever can CREATE a namespace sets its labels at creation.
+# Needs Kubernetes 1.30 or later, where ValidatingAdmissionPolicy went GA.
+admissionPolicy:
+  enabled: false
+
+  # Warn and Audit first. Watch the audit log, then set ["Deny", "Audit"]. The
+  # policies themselves need no edit; only this list changes.
+  validationActions: ["Warn", "Audit"]
+
+  # Governs CEL evaluation errors, not a validation returning false. Under Fail,
+  # a null-guard slip in a policy denies every namespace write, which is the
+  # second reason to start on Warn.
+  failurePolicy: Fail
+
+  # Who may set <labelPrefix>managed-by. At least one of these is required when
+  # the policy is enabled: with neither, nothing may set the label and every
+  # namespace carrying it is refused. The chart fails the render rather than
+  # letting that reach a cluster.
+  #
+  #   authorizedGroups: ["cluster-admins", "platform"]
+  #   authorizedUsers:  ["system:serviceaccount:argocd:argocd-application-controller"]
+  #
+  # Remember a controller-created namespace authenticates as its ServiceAccount,
+  # never as the human who merged the change, so any controller that labels
+  # namespaces needs listing here.
+  #
+  # Kubernetes' authorizer CEL library allows a neater indirection -- grant a verb
+  # on a resource nothing serves, and onboarding becomes a ClusterRoleBinding
+  # rather than an edit to this file. It is deliberately not used: the method
+  # chain could not be verified here, and an unverified expression has no place
+  # in a security control. Worth revisiting against a live cluster.
+  authorizedGroups: []
+  authorizedUsers: []
+
+  # Also require <labelPrefix>cluster to equal the namespace name, so a namespace
+  # cannot claim a cluster name unrelated to itself.
+  clusterNameMustMatchNamespace: false

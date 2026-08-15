@@ -61,6 +61,10 @@ kos:
     repositories:
       - ghcr.io/pcanilho/argocd-cluster-registrar
     main: .
+    # goreleaser does not read .ko.yaml; it has its own key and defaults to
+    # cgr.dev/chainguard/static, whose free tier serves `latest` only. Without
+    # this the released image and the one CI builds have different bases.
+    base_image: gcr.io/distroless/static:nonroot
     platforms:
       - linux/amd64
       - linux/arm64

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -219,6 +220,8 @@ func TestEveryFlagReachesTheOptionItConfigures(t *testing.T) {
 			func(o options) string { return o.ctrl.LeaderElectionID }},
 		{"--leader-elect", "true",
 			func(o options) string { return fmt.Sprint(o.ctrl.LeaderElection) }},
+		{"--exec-credentials", "true",
+			func(o options) string { return fmt.Sprint(o.cfg.ExecCredentials) }},
 		{"--target-namespace=somewhere-else", "somewhere-else",
 			func(o options) string { return o.cfg.TargetNamespace }},
 		{"--managed-by=some-other-value", "some-other-value",
@@ -227,6 +230,8 @@ func TestEveryFlagReachesTheOptionItConfigures(t *testing.T) {
 			func(o options) string { return o.cfg.LabelPrefix }},
 		{"--dry-run", "true",
 			func(o options) string { return fmt.Sprint(o.cfg.DryRun) }},
+		{"--demoted-ttl=72h", "72h0m0s",
+			func(o options) string { return o.cfg.DemotedTTL.String() }},
 	} {
 		t.Run(tc.arg, func(t *testing.T) {
 			if d := tc.got(base); d == tc.want {
@@ -330,5 +335,49 @@ func TestAnUnsetLeaseNameIsDerivedNotConstant(t *testing.T) {
 func TestAnExplicitlyEmptyLeaseNameIsRejected(t *testing.T) {
 	if _, err := buildOptions(parseFlags(t, "--leader-election-id=")); err == nil {
 		t.Error("an empty lease name was accepted; the manager would fail to start")
+	}
+}
+
+// Both halves of the exec gate must be on. A half-on configuration is a silent
+// no-op in one direction and a silent refusal in the other, so each gets a
+// warning rather than nothing.
+func TestExecCredentialGateMismatchWarns(t *testing.T) {
+	for name, tc := range map[string]struct {
+		args []string
+		want string
+	}{
+		"flag without an allowing provider": {
+			[]string{"--exec-credentials", "--provider=capi"},
+			"no configured provider allows it",
+		},
+		"allowing provider without the flag": {
+			[]string{"--provider=capa-eks"},
+			"--exec-credentials is off",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			opts, err := buildOptions(parseFlags(t, tc.args...))
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			if !slices.ContainsFunc(opts.warnings, func(w string) bool {
+				return strings.Contains(w, tc.want)
+			}) {
+				t.Errorf("no warning matching %q; got %v", tc.want, opts.warnings)
+			}
+		})
+	}
+}
+
+// Both on together is the supported configuration and must warn about neither.
+func TestExecCredentialGateFullyOnIsQuiet(t *testing.T) {
+	opts, err := buildOptions(parseFlags(t, "--exec-credentials", "--provider=capa-eks"))
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	for _, w := range opts.warnings {
+		if strings.Contains(w, "exec") {
+			t.Errorf("a correct configuration warned: %q", w)
+		}
 	}
 }

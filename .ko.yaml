@@ -1,3 +1,8 @@
+# Pinned, because ko's own default is cgr.dev/chainguard/static, whose free tier
+# serves `latest` only. That is an unpinnable moving target in a build that sets
+# mod_timestamp, ko_data_creation_time and -trimpath for reproducibility.
+defaultBaseImage: gcr.io/distroless/static:nonroot
+
 defaultPlatforms:
   - linux/arm64
   - linux/amd64

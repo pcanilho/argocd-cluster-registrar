@@ -5,6 +5,156 @@ All notable changes to **argocd-cluster-registrar** are documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-08-14
+
+### Security
+
+- **Discovery no longer trusts a Secret on its name alone.** Candidates are now
+  ordered by provenance -- the provisioner's `Secret.Type` and a controller
+  `ownerReference` -- before name, so a Secret planted in a watched namespace
+  loses to the one its provisioner wrote even when it sorts earlier
+  (`k3k-aaa-kubeconfig` precedes `k3k-real-kubeconfig`). A candidate with neither
+  signal is logged at Debug, not Warn: a provisioner that sets no
+  `ownerReference` would otherwise log per namespace per interval forever. Run
+  with `--debug` to audit it. This raises the bar rather than closing the hole:
+  anyone who can write Secrets in a watched namespace still decides what that
+  namespace publishes, and constraining who may label a namespace remains the
+  real control.
+- **Two live registrations may no longer share a server URL.** ArgoCD identifies
+  a cluster by its address and resolves a collision by informer-index order, so a
+  second namespace could previously claim an address production already held.
+  Refused now, on the same incumbency rule as the cluster name, and counted as
+  `conflicts_total{reason="server_collision"}`.
+- **`insecure-skip-tls-verify` is logged**, at Debug, for the same reason. It was
+  copied through silently before, and it disables the CA pinning several other
+  guarantees rest on.
+- **`https://kubernetes.default.svc` is refused as a child's server.** ArgoCD
+  special-cases that value to its own in-cluster config and ignores `caData`,
+  `certData` and `keyData` entirely, so such a registration silently points at
+  the management cluster and looks healthy.
+
+### Added
+
+- **Exec credentials are translated for managed control planes**, behind two
+  independent opt-ins that are both off by default: a new `execCredentials` value
+  and a per-provider allowance carried by the new `capa-eks` and `capz-aks`
+  presets. `aws-iam-authenticator`, `aws eks get-token` and `kubelogin` become
+  ArgoCD's `awsAuthConfig` or `execProviderConfig`; anything else is still
+  refused; `heptio-authenticator-aws` is accepted as the legacy spelling of
+  `aws-iam-authenticator`. The emitted command is always `argocd-k8s-auth`,
+  never the source's,
+  and only the target's identity is carried -- never the caller's. This removes
+  the ~15-minute expiry that made CAPA's EKS registrations depend on `interval`.
+- **Prefixed annotations propagate**, alongside labels and with the same reserved
+  exclusions. The ApplicationSet cluster generator reads them as
+  `{{metadata.annotations.*}}`, and unlike a label value they can hold a URL, a
+  list, or anything over 63 bytes. Values over 4KiB are skipped and logged.
+- **`registrations` gained a `credential_expiry` dimension**, read from the
+  client certificate in the registration ArgoCD is holding: `expired`, `lt_24h`,
+  `lt_7d`, `lt_30d`, `ok`, `none`, `absent` or `unreadable`. Bearer-token clusters
+  land in `none` rather than being counted as healthy, and `absent` is kept
+  distinct from `unreadable` because a registration with no config yet is not a
+  damaged one.
+- **`proxy-url` is carried** into ArgoCD's `config.proxyUrl` instead of being
+  dropped in silence. `argocd cluster add` still ignores it. Refused when the
+  URL embeds credentials, uses a scheme ArgoCD rejects, or accompanies
+  `insecure-skip-tls-verify`.
+
+- **The `ValidatingAdmissionPolicy` the README recommends now ships**, off by
+  default under `admissionPolicy`. One policy constrains who may set
+  `<prefix>managed-by`, an optional second requires `<prefix>cluster` to equal the
+  namespace name. Kubernetes 1.30 or later. It ships as `Warn` and `Audit`, and
+  enabling it with an empty allowlist fails the render rather than refusing every
+  namespace in the cluster.
+
+### Changed
+
+- A cluster's address changing is now logged at Warn. ArgoCD keeps watching the
+  old one until its application controller restarts
+  ([argo-cd#14410](https://github.com/argoproj/argo-cd/issues/14410)); the
+  registration is still updated in place rather than replaced, because
+  delete-and-recreate is not atomic and would discard ArgoCD's own keys.
+- `--label-prefix` now refuses any prefix reaching the `argocd.argoproj.io/`
+  domain, not just the one that could reach `secret-type`.
+- Code comments lost 318 lines of release archaeology, prior-art citation and bug
+  narration with no behaviour change. That material belongs in this file.
+
+### Build
+
+- **`sigstore/cosign-installer` is pinned to `@v4.1.2`, and the signature format
+  changes with it.** The previous `@v3` floated to cosign v2.5.2, which is what
+  v0.5.0 signed with. The v4 line installs cosign v3.0.6, where the protobuf
+  bundle is the default format. **If you verify release signatures, check your
+  command still works**; older `cosign verify` invocations may need updating.
+  Pinned rather than floating so this never changes again by accident.
+- **The image base is pinned** to `gcr.io/distroless/static:nonroot`, in both
+  `.ko.yaml` (which CI reads) and `.goreleaser.yaml`'s `kos.base_image` (which the
+  release reads; goreleaser does not read `.ko.yaml`). The previous default was
+  `cgr.dev/chainguard/static`, whose free tier serves `latest` only, which is an
+  unpinnable moving target in a build that otherwise sets `mod_timestamp`,
+  `ko_data_creation_time` and `-trimpath`. **The published image's base layers
+  change**; update any image-policy allowlist or scanner baseline keyed on the
+  base registry.
+- **Every CI action is on its latest release**: `actions/checkout` v7,
+  `actions/setup-go` v7, `ko-build/setup-ko` v0.10, alongside the cosign bump
+  above. `securego/gosec` stays SHA-pinned, already at v2.28.0.
+- The kind fixtures carry a real certificate rather than a placeholder, so the
+  expiry metric is exercised against something it can actually decode.
+
+### Migrating from 0.5.x
+
+`helm upgrade` is enough. No value changes meaning and no RBAC changes. What is
+worth knowing before you do it:
+
+1. **Audit any dashboard or alert that references `..._registrations`.** It gained
+   a `credential_expiry` label, so a bare `registrations{state="active"}` now
+   returns one series per bucket instead of one series. `sum(...)` and
+   `sum by (state) (...)` are unaffected, but a threshold alert written against
+   the bare selector now compares **per bucket** and may quietly stop firing, and
+   a single-value panel will show an arbitrary bucket. This is the only change
+   here that can fail silently in a way you would not notice.
+
+2. **If you verify release signatures, re-check your command.** Signing moved
+   from cosign v2 to v3, whose default bundle format differs. See *Build* above.
+
+3. **A kubeconfig carrying `proxy-url` now routes ArgoCD through that proxy.**
+   0.5.x dropped the field silently, so a registration that works today because
+   ArgoCD reaches the cluster directly will start using the proxy. If the proxy is
+   unreachable from the ArgoCD pod, that cluster's Applications go to `Unknown`.
+   Remove `proxy-url` from the kubeconfig if it was vestigial.
+
+4. **A kubeconfig with both a static credential and an `exec` block now
+   registers**, using the static credential. 0.5.x refused it outright, so a
+   namespace that was being skipped may gain a cluster in ArgoCD.
+
+5. **`https://kubernetes.default.svc` is refused**, in every spelling including
+   the `:443` and `.cluster.local` forms. Such a registration was always pointing
+   ArgoCD at itself rather than at the child, because ArgoCD special-cases that
+   address and ignores the CA and credentials next to it. The existing Secret is
+   left alone but stops being refreshed; give the cluster a real address.
+
+6. **No two cluster `Secret`s may share a `server` address.** ArgoCD identifies a
+   cluster by its address, so duplicates were already resolved arbitrarily. The
+   incumbent can be any ArgoCD cluster `Secret`, including a hand-written one or
+   one from another registrar instance, not only a registration this tool owns.
+   Refusals are logged at error and counted as
+   `conflicts_total{reason="server_collision"}`. The check runs on creation and
+   when an address moves, so existing pairs keep working until one is recreated.
+   To scope one cluster several ways, use a single registration with ArgoCD's
+   `namespaces` key, or `AppProject` destination service accounts.
+
+7. **Where a namespace holds several matching `Secret`s, which one wins can
+   change.** Candidates are now ordered by how much they look like their
+   provisioner wrote them (a matching `Secret` type, a controller
+   `ownerReference`) before falling back to name order.
+
+8. **The published image base changed.** See *Build* above.
+
+9. **A server address ending in `/` is now stored without it**, matching how
+   ArgoCD normalises it. Such a registration logs `cluster address changed` once
+   on the first reconcile after the upgrade and is then rewritten in place. The
+   warning is expected and does not repeat.
+
 ## [0.5.0] - 2026-08-07
 
 Closes the four things 0.4.0 deliberately left open: metrics, a TTL for demoted

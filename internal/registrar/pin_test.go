@@ -3,6 +3,9 @@ package registrar
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
 	"strings"
 	"testing"
 
@@ -156,7 +159,8 @@ contexts:
     user: u
 current-context: u@c
 `
-	_, cfg, err := parseKubeconfig([]byte(kc))
+	pk, err := parseKubeconfig([]byte(kc), false)
+	cfg := pk.config
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -176,11 +180,49 @@ current-context: u@c
 // A kubeconfig without it must not gain an empty field, which ArgoCD would read
 // as a server name of "".
 func TestNoTLSServerNameEmitsNoServerName(t *testing.T) {
-	_, cfg, err := parseKubeconfig([]byte(k3kKubeconfig))
+	pk, err := parseKubeconfig([]byte(k3kKubeconfig), false)
+	cfg := pk.config
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 	if strings.Contains(cfg, "serverName") {
 		t.Errorf("config carries an empty serverName: %s", cfg)
+	}
+}
+
+// PresetNames feeds --help and the "no ArgoCD equivalent" error, so a preset
+// added without a name here is invisible to a user reading either.
+func TestPresetNamesListsEveryPresetSorted(t *testing.T) {
+	got := PresetNames()
+	if len(got) != len(presets) {
+		t.Fatalf("PresetNames returned %d of %d presets: %v", len(got), len(presets), got)
+	}
+	for _, n := range got {
+		if _, ok := presets[n]; !ok {
+			t.Errorf("PresetNames returned %q, which is not a preset", n)
+		}
+	}
+	if !sort.StringsAreSorted(got) {
+		t.Errorf("PresetNames is unsorted, so help text order is nondeterministic: %v", got)
+	}
+}
+
+// Both types carry a cause, and Unwrap is the only route to it: errors.As
+// matches the wrapper itself without ever calling Unwrap, so nothing else in the
+// package exercises these. Without this a broken Unwrap is invisible until a
+// caller tries errors.Is against something the cause wraps.
+func TestBothErrorTypesExposeTheirCause(t *testing.T) {
+	cause := errors.New("the underlying failure")
+
+	conflict := &conflictError{
+		reason: conflictIncumbent,
+		err:    fmt.Errorf("claim refused: %w", cause),
+	}
+	if !errors.Is(conflict, cause) {
+		t.Error("conflictError hides its cause; errors.Is cannot reach it")
+	}
+
+	if !errors.Is(&apiFailure{fmt.Errorf("list secrets: %w", cause)}, cause) {
+		t.Error("apiFailure hides its cause; errors.Is cannot reach it")
 	}
 }

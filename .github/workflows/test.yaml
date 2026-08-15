@@ -154,6 +154,19 @@ jobs:
           helm lint "$chart" --set metrics.enabled=true --set metrics.service.enabled=true
           helm lint "$chart" --set metrics.enabled=true --set probes.enabled=false
           helm lint "$chart" --set demotedTTL=720h
+          # This release: the exec gate and the admission policy.
+          helm lint "$chart" --set execCredentials=true --set 'providers[0]=capa-eks'
+          helm lint "$chart" \
+            --set 'providers[0].name=mine' \
+            --set 'providers[0].secretNamePattern=*-user-kubeconfig' \
+            --set 'providers[0].secretKeys={value}' \
+            --set 'providers[0].allowExec=true' \
+            --set execCredentials=true
+          helm lint "$chart" --set admissionPolicy.enabled=true \
+            --set 'admissionPolicy.authorizedGroups={cluster-admins}'
+          helm lint "$chart" --set admissionPolicy.enabled=true \
+            --set 'admissionPolicy.authorizedUsers={system:serviceaccount:argocd:x}' \
+            --set admissionPolicy.clusterNameMustMatchNamespace=true
 
       # Two active replicas do not corrupt each other, but they do the work twice
       # and rewrite each other's provider label when configured differently.
@@ -166,6 +179,32 @@ jobs:
           if helm template t "$chart" --set replicaCount=2 >/dev/null 2>&1; then
             echo "::error::chart rendered 2 replicas without leader election"
             exit 1
+          fi
+
+      # An admission policy that permits nobody would refuse every namespace
+      # carrying the ownership label, which is a cluster-wide outage delivered by
+      # a chart default. It must fail the render instead.
+      - name: An admission policy with no allowlist fails the render
+        run: |
+          set -euo pipefail
+          chart=deploy/charts/argocd-cluster-registrar
+          if helm template t "$chart" --set admissionPolicy.enabled=true >/dev/null 2>&1; then
+            echo "::error::the admission policy rendered with an empty allowlist"
+            exit 1
+          fi
+
+      # The exec gate is two independent opt-ins and both default off. A default
+      # install emitting either half would change who ArgoCD authenticates as.
+      - name: A default install does not enable exec credentials or the policy
+        run: |
+          set -euo pipefail
+          chart=deploy/charts/argocd-cluster-registrar
+          out=$(helm template t "$chart")
+          if grep -q -- '--exec-credentials' <<<"$out"; then
+            echo "::error::a default install enabled exec credential translation"; exit 1
+          fi
+          if grep -q 'ValidatingAdmissionPolicy' <<<"$out"; then
+            echo "::error::a default install shipped an admission policy"; exit 1
           fi
 
       # Chart.yaml sat at 0.2.0 while the latest tag was v0.3.0 for two releases.
@@ -381,19 +420,28 @@ jobs:
           kubectl label namespace k3k-sandbox \
             argocd-cluster-registrar/managed-by=cluster-registrar \
             argocd-cluster-registrar/cluster=sandbox
-          cat <<'EOF' > /tmp/kubeconfig.yaml
+          # A real certificate, not a placeholder. The registrar decodes certData
+          # to bucket credential expiry, so `certdata` lands every fixture in
+          # `unreadable` and warns once per Secret per reconcile.
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -keyout /tmp/fx.key -out /tmp/fx.crt -days 400 -nodes \
+            -subj '/CN=system:admin/O=system:masters' 2>/dev/null
+          FX_CRT=$(base64 -w0 < /tmp/fx.crt)
+          FX_KEY=$(base64 -w0 < /tmp/fx.key)
+
+          cat <<EOF > /tmp/kubeconfig.yaml
           apiVersion: v1
           kind: Config
           clusters:
           - name: sandbox
             cluster:
               server: https://192.0.2.10
-              certificate-authority-data: Y2FkYXRh
+              certificate-authority-data: ${FX_CRT}
           users:
           - name: sandbox
             user:
-              client-certificate-data: Y2VydGRhdGE=
-              client-key-data: a2V5ZGF0YQ==
+              client-certificate-data: ${FX_CRT}
+              client-key-data: ${FX_KEY}
           EOF
           kubectl create secret generic k3k-sandbox-kubeconfig \
             -n k3k-sandbox --from-file=kubeconfig.yaml=/tmp/kubeconfig.yaml
@@ -404,19 +452,19 @@ jobs:
           kubectl label namespace capi-child \
             argocd-cluster-registrar/managed-by=cluster-registrar \
             argocd-cluster-registrar/cluster=capichild
-          cat <<'EOF' > /tmp/value
+          cat <<EOF > /tmp/value
           apiVersion: v1
           kind: Config
           clusters:
           - name: capichild
             cluster:
               server: https://192.0.2.20
-              certificate-authority-data: Y2FkYXRh
+              certificate-authority-data: ${FX_CRT}
           users:
           - name: capichild-admin
             user:
-              client-certificate-data: Y2VydGRhdGE=
-              client-key-data: a2V5ZGF0YQ==
+              client-certificate-data: ${FX_CRT}
+              client-key-data: ${FX_KEY}
           contexts:
           - name: capichild-admin@capichild
             context:
@@ -530,7 +578,7 @@ jobs:
       - name: It can read Secrets but never watch them
         run: |
           set -euo pipefail
-          # NOT `head -1`: every namespace has a `default` ServiceAccount and it
+          # not `head -1`: every namespace has a `default` ServiceAccount and it
           # sorts before ours, so that silently tested the wrong identity.
           name=$(kubectl get sa -n registrar -o name \
             | grep argocd-cluster-registrar | head -1 | cut -d/ -f2)
@@ -870,7 +918,7 @@ jobs:
           fi
           # Every other reason must be untouched, or a single mislabelled
           # increment site would go unnoticed.
-          for other in contested_name create_race not_managed orphan_cluster_mismatch; do
+          for other in contested_name create_race not_managed orphan_cluster_mismatch server_collision; do
             v=$(awk -v s="reason=\"$other\"" '$0 ~ s {print $2}' /tmp/metrics.txt | tail -1)
             if [ "$(printf '%.0f' "${v:-0}")" -ne 0 ]; then
               echo "::error::an incumbency refusal also counted under reason=${other}"
@@ -878,9 +926,21 @@ jobs:
               exit 1
             fi
           done
-          # The gauges come from the audit key, a different code path.
-          grep -q 'argocd_cluster_registrar_registrations{state="active"}' /tmp/metrics.txt || {
-            echo "::error::the registrations gauge was never set"; exit 1; }
+          # The gauges come from the audit key, a different code path. Matched per
+          # label, not as a literal series: Prometheus sorts label names, so adding
+          # one reorders every existing series and a literal grep stops matching.
+          active=$(awk '/^argocd_cluster_registrar_registrations\{/ && /state="active"/ {print}' /tmp/metrics.txt)
+          if [ -z "$active" ]; then
+            echo "::error::the registrations gauge was never set"
+            grep argocd_cluster_registrar /tmp/metrics.txt || true
+            exit 1
+          fi
+          # Dropping the dimension must fail here, not silently retire the alert.
+          if ! grep -q 'credential_expiry=' <<<"$active"; then
+            echo "::error::the registrations gauge lost its credential_expiry dimension"
+            printf '%s\n' "$active"
+            exit 1
+          fi
 
           kubectl delete namespace k3k-usurper k3k-holder --wait=true
 

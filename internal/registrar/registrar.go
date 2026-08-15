@@ -47,15 +47,10 @@ const (
 	SuffixSourceNamespace = "source-namespace"
 
 	// SuffixSourceNamespaceUID records that namespace's UID. Names are reusable
-	// and UIDs are not, so this is what tells "the same namespace" apart from "a
-	// new namespace wearing the old one's name".
-	//
-	// Written but not yet read. Two things want it: a delete precondition, so a
-	// garbage collection decided in one pass cannot land on a registration a
-	// later pass recreated; and the existence proof in collect(), which today
-	// looks the namespace up by name and so cannot tell a survivor from a
-	// replacement. Both are follow-ups; stamping it now means the data is
-	// already there when they land.
+	// and UIDs are not, so this tells "the same namespace" apart from "a new
+	// namespace wearing the old one's name". Read by collectStaleUID, and used as
+	// a delete precondition so a collection decided in one pass cannot land on a
+	// registration a later pass recreated.
 	SuffixSourceNamespaceUID = "source-namespace-uid"
 
 	// SuffixProvider records which configured provider matched, so a fleet is
@@ -79,14 +74,21 @@ const (
 	// staleSinceFormat is that basic form, e.g. 20260807T143000Z.
 	staleSinceFormat = "20060102T150405Z"
 
+	// SuffixProject is reserved by NAME only, for a future feature that may write
+	// ArgoCD's `project` key. Deliberately absent from reservedSuffixes: ArgoCD
+	// reads it from the Secret's Data, never from labels, so a prefixed label of
+	// this name is inert to ArgoCD and withholding it would only break an
+	// ApplicationSet selecting on it. A feature that did write it would be writing
+	// Data, where a label denylist has no reach anyway.
+	SuffixProject = "project"
+
+	// SuffixShard is reserved by name for the same reason, and on the same terms.
+	SuffixShard = "shard"
+
 	// SuffixPrune opts a single registration out of removal. Set it to
 	// PruneDisabled on the cluster Secret and neither deletion nor demotion will
-	// touch it.
-	//
-	// It exists because reconciliation is event-driven: a mistaken label edit used
-	// to take up to a full interval to become a deletion, which was often long
-	// enough for a human to notice, and now it does not. Every comparable tool
-	// ships an escape hatch for the same reason.
+	// touch it. Reconciliation is event-driven, so a mistaken label edit becomes a
+	// deletion immediately; this is the escape hatch.
 	SuffixPrune = "prune"
 
 	// PruneDisabled is the only value SuffixPrune recognises. Anything else is
@@ -99,6 +101,11 @@ const (
 	// "Secret" next to a string literal.
 	argoSecretTypeLabel = "argocd.argoproj.io/secret-type" // #nosec G101
 	argoSecretTypeValue = "cluster"
+
+	// argoDomain is every key ArgoCD reads off a cluster Secret: secret-type,
+	// skip-reconcile, refresh and the rest. Validate refuses a label prefix that
+	// could reach any of them.
+	argoDomain = "argocd.argoproj.io/"
 )
 
 // ManagedByLabel is the discovery and ownership label key for a given prefix.
@@ -128,13 +135,10 @@ func PruneLabel(prefix string) string { return prefix + SuffixPrune }
 // ProviderLabel is the matched-provider label key for a given prefix.
 func ProviderLabel(prefix string) string { return prefix + SuffixProvider }
 
-// reservedSuffixes are the labels this tool derives itself. They are written on
-// every cluster Secret from what we observed, never copied from the source
-// namespace -- otherwise a namespace could set them and lie about its own
-// registration. `source-namespace` is the dangerous one: it is the pointer
-// garbage collection follows to prove a source is gone, so a namespace labelling
-// itself `<prefix>source-namespace: kube-system` would aim that proof at a
-// namespace that never disappears and make its registration immortal.
+// reservedSuffixes are the labels this tool derives itself, never copied from
+// the source namespace: a namespace that could set them would lie about its own
+// registration. `source-namespace` is the dangerous one, being the pointer
+// garbage collection follows to prove a source is gone.
 var reservedSuffixes = []string{
 	SuffixManagedBy,
 	SuffixCluster,
@@ -153,56 +157,63 @@ var reservedSuffixes = []string{
 
 // Provider is one provisioner's kubeconfig Secret shape.
 //
-// The pattern and the keys travel together as a unit, and that pairing is
-// load-bearing rather than tidy: it is what tells a real kubeconfig apart from a
-// decoy sitting under the same prefix. vcluster's `vc-*` matches both `vc-<name>`
-// (key `config`) and `vc-config-<name>` (key `config.yaml`). Whether the decoy
-// sorts first depends on the names -- `vc-config-x` precedes `vc-x`, but
-// `vc-config-abc` follows `vc-abc` -- so the key is the only reliable
-// discriminator. Two independent lists of patterns and keys would lose that.
+// Pattern and keys travel together because the key is the reliable
+// discriminator: vcluster's `vc-*` matches both `vc-<name>` (key `config`) and
+// `vc-config-<name>` (key `config.yaml`), and which sorts first varies by name.
 type Provider struct {
 	// Name identifies the provider in logs and on the cluster Secret's provider
 	// label. It is not matched against anything.
 	Name string
 
 	// SecretNamePattern is a glob matched against Secret names within a
-	// discovered namespace, e.g. "k3k-*-kubeconfig".
-	//
-	// Matching by NAME rather than by label is not a stylistic choice: the
-	// provisioner creates that Secret itself (k3k gives it an ownerReference to
-	// the Cluster), so it carries none of our labels and there is nowhere to add
-	// them. The namespace is the nearest object we own, which is why intent lives
-	// there instead.
+	// discovered namespace, e.g. "k3k-*-kubeconfig". Matched by name because the
+	// provisioner owns that Secret and it carries none of our labels; the
+	// namespace is the nearest object we do own, so intent lives there.
 	SecretNamePattern string
 
-	// SecretKeys are the keys that may hold the kubeconfig. A list rather than a
-	// single key because one provisioner can legitimately use either: Kamaji
-	// writes `admin.conf`, or `admin.svc` when its control plane advertises a
-	// service address.
-	//
-	// Tried in order, and "tried" means parsed: every key present becomes its own
-	// candidate, so a first key that is half-written or carries a credential we
-	// cannot copy falls through to the next rather than failing the namespace.
-	// The first key that yields a USABLE kubeconfig wins, so where several parse
-	// -- which is the normal Kamaji case, both of its keys being well-formed --
-	// the order declared here is the order that decides.
-	//
-	// Duplicates are rejected by Validate rather than ignored here.
+	// SecretKeys are the keys that may hold the kubeconfig; Kamaji writes
+	// `admin.conf` and `admin.svc` side by side. Every key present becomes its own
+	// candidate and the first that parses wins, so an unusable key falls through
+	// rather than stranding the namespace. Duplicates are rejected by Validate.
 	SecretKeys []string
+
+	// SecretType the provisioner stamps on its kubeconfig Secret, where it sets a
+	// distinctive one. A preference, not a filter: not every provisioner sets one.
+	SecretType coreV1.SecretType
+
+	// AllowExec permits translating an exec credential found in this shape. Set
+	// only on shapes that are exec-bearing by construction, so the loose globs
+	// cannot pick one up by accident.
+	//
+	// Half the gate. Config.ExecCredentials is the other half, and both must be
+	// on: this says the SHAPE is exec-bearing, that says the ArgoCD deployment
+	// actually holds the cloud identity such a registration would authenticate as.
+	AllowExec bool
 }
 
-// presets are the provisioner shapes shipped with the tool, so that configuring
-// one is `providers: [k3k, capi]` rather than a glob a user has to get right.
+// provenance scores how much a Secret looks like its provisioner wrote it, so
+// that a hand-placed decoy loses to the real one whatever the names sort like.
+// Neither signal is unforgeable; a dangling ownerReference does at least get the
+// forgery garbage-collected.
+func provenance(s *coreV1.Secret, p Provider) int {
+	score := 0
+	if p.SecretType != "" && s.Type == p.SecretType {
+		score += 2
+	}
+	for i := range s.OwnerReferences {
+		if c := s.OwnerReferences[i].Controller; c != nil && *c {
+			score++
+			break
+		}
+	}
+	return score
+}
+
+// presets are the provisioner shapes shipped with the tool. See the provisioner
+// table in README.md, which distinguishes tested from assumed.
 //
-// All four have been run against the real thing; see the provisioner table in
-// README.md, which distinguishes tested from assumed and should be kept honest.
-//
-// Every entry carries `#nosec G101`. gosec matches that rule on identifiers like
-// `Secret*` sitting next to a string literal, which describes this map exactly --
-// but `SecretNamePattern` is a glob matched against Secret NAMES and `SecretKeys`
-// are map keys inside a Secret. Neither is a credential, and nothing here is ever
-// compared against one. The same false positive is already annotated on
-// argoSecretTypeLabel above.
+// Every entry carries `#nosec G101`: gosec matches on `Secret*` identifiers next
+// to a string literal, but these are name globs and data keys, not credentials.
 var presets = map[string]Provider{
 	"k3k": { // #nosec G101 -- a Secret name glob and a data key, not a credential
 		Name:              "k3k",
@@ -214,50 +225,52 @@ var presets = map[string]Provider{
 		SecretNamePattern: "vc-*",
 		SecretKeys:        []string{"config"},
 	},
-	// Kamaji's standalone shape. Both keys are normally present and both normally
-	// parse, so `admin.conf` wins on order; `admin.svc` is reached when the first
-	// is unusable, or by declaring it first in a custom entry.
-	//
-	// Note that driving Kamaji through its Cluster API control-plane provider ALSO
-	// produces a second, CAPI-shaped Secret for the same physical cluster -- see
-	// the note on candidate ordering in discover.
+	// Both keys are normally present and both parse, so `admin.conf` wins on
+	// order. Driving Kamaji through its CAPI control-plane provider also produces
+	// a second, CAPI-shaped Secret for the same cluster.
 	"kamaji": { // #nosec G101 -- see above
 		Name:              "kamaji",
 		SecretNamePattern: "*-admin-kubeconfig",
 		SecretKeys:        []string{"admin.conf", "admin.svc"},
 	},
-	// The Cluster API contract, which is mandatory for control-plane providers
-	// rather than merely conventional: the Secret must be `<cluster>-kubeconfig`
-	// in the Cluster's namespace with the kubeconfig under `value`. That makes
-	// this one entry cover every CAPI cluster whatever the infrastructure
-	// provider, including standalone k0smotron, which adopts the same shape.
-	//
-	// This is deliberately the loosest pattern shipped: `*-kubeconfig` also
-	// matches k3k's Secret and anything else in a managed namespace ending that
-	// way. Correctness comes from the key, not the name.
+	// CAPA's second Secret for a managed EKS cluster, exec-only by construction,
+	// which is why this and not `capi` may translate. Declare it BEFORE `capi` in
+	// --provider order: both satisfy `value`, and `<c>-kubeconfig` sorts first, so
+	// otherwise the 15-minute token wins.
+	"capa-eks": { // #nosec G101 -- see above
+		Name:              "capa-eks",
+		SecretNamePattern: "*-user-kubeconfig",
+		SecretKeys:        []string{"value"},
+		AllowExec:         true,
+	},
+	// CAPZ's AAD user kubeconfig. Note the suffix order: CAPZ appends "-user" to
+	// "<cluster>-kubeconfig", so this is not the CAPA spelling and `*-user-kubeconfig`
+	// does not match it.
+	"capz-aks": { // #nosec G101 -- see above
+		Name:              "capz-aks",
+		SecretNamePattern: "*-kubeconfig-user",
+		SecretKeys:        []string{"value"},
+		AllowExec:         true,
+	},
+	// The mandatory Cluster API control-plane contract, so one entry covers every
+	// CAPI cluster whatever the infrastructure provider, plus standalone
+	// k0smotron. The loosest pattern shipped; correctness comes from the key.
 	"capi": { // #nosec G101 -- see above
 		Name:              "capi",
 		SecretNamePattern: "*-kubeconfig",
 		SecretKeys:        []string{"value"},
+		// Mandated by the same contract as the name and key.
+		SecretType: "cluster.x-k8s.io/secret",
 	},
 }
 
 // LeaderElectionID derives the lease name from the two values that decide whether
-// two instances collide at all.
+// two instances collide: label-prefix and managed-by, not the release name.
+// Hashed because a label prefix contains "/", which an object name may not.
 //
-// NOT the release name, and not either value alone. Ownership is established
-// purely by label-prefix and managed-by, so two deployments differing only in
-// name contend for the same cluster Secrets and must contend for the same lease;
-// managed-by alone would over-serialise two installs that never meet.
-//
-// Hashed because labelPrefix contains a "/", which is illegal in an object name,
-// and managedBy is a label value, which permits characters a name does not.
-//
-// The chart computes the same thing in _helpers.tpl. The two must agree, or an
-// instance deployed from a plain manifest takes a different lease from a
-// chart-deployed one with identical configuration and both reconcile, which is
-// the state leader election exists to prevent. TestLeaderElectionIDMatchesTheChart
-// pins them together.
+// _helpers.tpl computes the same thing and the two must agree, or a
+// manifest-deployed instance and a chart-deployed one hold different leases and
+// both reconcile. TestLeaderElectionIDMatchesTheChart pins them together.
 func LeaderElectionID(labelPrefix, managedBy string) string {
 	sum := sha256.Sum256([]byte(labelPrefix + "|" + managedBy))
 	return "acr-" + hex.EncodeToString(sum[:])[:16]
@@ -280,7 +293,7 @@ func PresetNames() []string {
 }
 
 // ParseProvider reads one provider spec: either a preset name ("k3k"), or a
-// custom shape as "name=pattern=key[,key...]".
+// custom shape as "name=pattern=key[,key...][=exec]".
 func ParseProvider(spec string) (Provider, error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
@@ -298,9 +311,22 @@ func ParseProvider(spec string) (Provider, error) {
 	}
 
 	parts := strings.Split(spec, "=")
-	if len(parts) != 3 {
+	if len(parts) != 3 && len(parts) != 4 {
 		return Provider{}, fmt.Errorf(
-			"malformed provider spec %q: expected \"name=pattern=key[,key...]\"", spec)
+			"malformed provider spec %q: expected \"name=pattern=key[,key...][=exec]\"", spec)
+	}
+
+	// The optional 4th field is the per-provider half of the exec gate, so a
+	// custom shape can reach it too. Spelled out rather than a bare boolean,
+	// because "true" would not say what it enables.
+	allowExec := false
+	if len(parts) == 4 {
+		if strings.TrimSpace(parts[3]) != "exec" {
+			return Provider{}, fmt.Errorf(
+				"malformed provider spec %q: the 4th field must be exactly \"exec\", got %q",
+				spec, parts[3])
+		}
+		allowExec = true
 	}
 
 	var keys []string
@@ -316,13 +342,14 @@ func ParseProvider(spec string) (Provider, error) {
 		Name:              strings.TrimSpace(parts[0]),
 		SecretNamePattern: strings.TrimSpace(parts[1]),
 		SecretKeys:        keys,
+		AllowExec:         allowExec,
 	}, nil
 }
 
 // Config controls a single reconcile pass.
 type Config struct {
 	// TargetNamespace is where ArgoCD reads cluster Secrets from. ArgoCD only
-	// ever looks in its OWN namespace, so this is effectively always "argocd".
+	// ever looks in its own namespace, so this is effectively always "argocd".
 	TargetNamespace string
 
 	// ManagedByValue is the ownership marker. Namespaces labelled with it are
@@ -340,6 +367,14 @@ type Config struct {
 
 	// DryRun logs what would change without writing anything.
 	DryRun bool
+
+	// ExecCredentials permits translating exec credentials into ArgoCD's
+	// argocd-k8s-auth configuration, for providers that also set AllowExec.
+	//
+	// Off by default because it changes who ArgoCD is to the clusters registered
+	// this way: they authenticate with ArgoCD's own cloud identity rather than
+	// with a credential from the source namespace.
+	ExecCredentials bool
 
 	// DemotedTTL is how long a demoted registration is kept before it is deleted
 	// outright. Zero, the default, keeps them indefinitely.
@@ -383,13 +418,9 @@ func NewWithClient(log *slog.Logger, cfg Config, client kubernetes.Interface) *R
 }
 
 // ClientFor builds the clientset used for every read and write, with the request
-// timeout applied to a COPY of the config.
-//
-// The copy matters. rest.Config.Timeout becomes http.Client.Timeout, which the
-// client appends to watch requests as ?timeout=30s, so a manager sharing this
-// config would have every watch stream severed every thirty seconds and silently
-// re-established. Give the manager the untouched base and keep the timeout here,
-// where it protects exactly what it was added for.
+// timeout applied to a COPY of the config. rest.Config.Timeout becomes
+// http.Client.Timeout, which the client appends to watches as ?timeout=30s, so a
+// manager sharing this config would have every stream severed every 30s.
 func ClientFor(base *rest.Config) (kubernetes.Interface, error) {
 	cfg := rest.CopyConfig(base)
 	cfg.Timeout = clientTimeout
@@ -464,14 +495,18 @@ func (c Config) Validate() error {
 				p.Name, p.SecretNamePattern, err)
 		}
 	}
-	// A prefix that ArgoCD's own key falls under would let a source namespace
-	// propagate `argocd.argoproj.io/secret-type` -- it is not a reserved suffix,
-	// so nothing withholds it -- and the propagated labels are copied last, so it
-	// would override the key this tool sets. Absurd to configure on purpose, but
-	// the trust boundary should not depend on that.
-	if c.LabelPrefix != "" && strings.HasPrefix(argoSecretTypeLabel, c.LabelPrefix) {
-		return fmt.Errorf("--label-prefix %q would let a source namespace override %q",
-			c.LabelPrefix, argoSecretTypeLabel)
+	// A prefix ArgoCD's own keys fall under would let a source namespace propagate
+	// one: they are not reserved suffixes, and propagated keys are copied last.
+	// Checked against the domain rather than `secret-type` so it does not depend
+	// on which key happens to be shortest, now that annotations reach
+	// `skip-reconcile` and `refresh` too.
+	//
+	// Only this direction is reachable. A prefix BELOW the domain, such as
+	// `argocd.argoproj.io/skip-`, would need to end in "/" to get this far and
+	// would then yield a two-slash key that IsQualifiedName rejects below.
+	if c.LabelPrefix != "" && strings.HasPrefix(argoDomain, c.LabelPrefix) {
+		return fmt.Errorf("--label-prefix %q would let a source namespace override %s keys",
+			c.LabelPrefix, argoDomain)
 	}
 	// Negative is a typo, not "disabled", and would expire everything on sight.
 	if c.DemotedTTL < 0 {
@@ -517,16 +552,12 @@ func (r *Registrar) pruneLabel() string        { return PruneLabel(r.cfg.LabelPr
 func (r *Registrar) supersededByLabel() string { return SupersededByLabel(r.cfg.LabelPrefix) }
 func (r *Registrar) staleSinceLabel() string   { return StaleSinceLabel(r.cfg.LabelPrefix) }
 
-// clientTimeout bounds every ordinary API call. Without it a hung request inside
-// a reconcile blocks forever and the pod sits Running and Ready while doing
-// nothing at all; nothing else in the stack detects that, because the process has
-// not crashed.
-//
-// It is applied to the clientset's own copy of the config and nowhere else. A
-// watch must never carry it -- see ClientFor.
+// clientTimeout bounds every ordinary API call: a hung request would otherwise
+// leave the pod Running and Ready while doing nothing. Applied to the clientset's
+// own copy of the config and nowhere else, since a watch must never carry it.
 const clientTimeout = 30 * time.Second
 
-// BaseRestConfig is the ambient connection with NO timeout applied. Callers that
+// BaseRestConfig is the ambient connection with no timeout applied. Callers that
 // issue ordinary requests should go through ClientFor; anything that watches must
 // use this untouched.
 func BaseRestConfig() (*rest.Config, error) {
@@ -544,24 +575,17 @@ func BaseRestConfig() (*rest.Config, error) {
 }
 
 // ReconcileOne reconciles everything keyed on a single source namespace: the
-// registration that namespace should have, and every registration recorded
-// against it.
+// registration it should have, and every registration recorded against it. The
+// unit both the sweep and the controller work in.
 //
-// This is the unit both drivers work in. The sweep below calls it once per key;
-// the controller calls it per event. It returns only an error, never a requeue
-// result, so that a driver cannot forget to schedule the next visit -- that
-// decision belongs to the driver, in one place.
+// The namespace read is the single source of truth about existence and must not
+// come from a cache: against a label-filtered cache the apiserver emits a
+// synthetic Deleted when an object stops matching, so a cached NotFound cannot
+// tell deletion from a removed managed-by label.
 //
-// The namespace read is the pass's single source of truth about existence, and it
-// must not come from a cache. Against a label-filtered cache the apiserver emits a
-// synthetic Deleted when an object stops matching the selector, so a cached
-// NotFound cannot tell "the namespace was deleted" from "someone removed the
-// managed-by label" -- and the second must never deregister anything.
-// The bool reports that this key is DONE: the namespace is gone and it owns
-// nothing further, so there is no reason to visit it again. Anything else is
-// false, including the case where the namespace merely stopped being ours --
-// that key must stay in the queue, because the filtered cache has already
-// forgotten the namespace and will not report its eventual deletion.
+// The bool reports the key is done -- namespace gone, owning nothing further.
+// A namespace that merely stopped being ours is false, because the filtered
+// cache has forgotten it and will not report its eventual deletion.
 func (r *Registrar) ReconcileOne(ctx context.Context, nsName string) (bool, error) {
 	ns, err := r.client.CoreV1().Namespaces().Get(ctx, nsName, metaV1.GetOptions{})
 	switch {
@@ -574,15 +598,9 @@ func (r *Registrar) ReconcileOne(ctx context.Context, nsName string) (bool, erro
 		return false, fmt.Errorf("confirm namespace %s: %w", nsName, err)
 	}
 
-	// Still ours? Under a watch this is not redundant with discovery. A cache
-	// filtered on the ownership label reports an object that stops matching as a
-	// synthetic Delete, so removing the label enqueues the namespace exactly like
-	// deleting it would -- and the namespace itself is still there, cluster label
-	// and all. Without this check the next reconcile would happily re-register a
-	// namespace that had just been taken out of our scope.
-	//
-	// Not a deletion either: nothing here proves the cluster is gone, so its
-	// registrations are left exactly as they are.
+	// Still ours? Removing the label enqueues the namespace exactly like deleting
+	// it would, and the namespace is still there, cluster label and all. Not a
+	// deletion: nothing here proves the cluster is gone.
 	if ns.Labels[r.managedByLabel()] != r.cfg.ManagedByValue {
 		r.log.Warn("namespace no longer carries the ownership label; leaving its registrations alone",
 			slog.String("namespace", ns.Name), slog.String("label", r.managedByLabel()))
@@ -590,7 +608,7 @@ func (r *Registrar) ReconcileOne(ctx context.Context, nsName string) (bool, erro
 	}
 
 	// A namespace being torn down still reads back; registering from it would
-	// re-create a Secret that collection is about to remove. Deliberately NOT
+	// re-create a Secret that collection is about to remove. Deliberately not
 	// treated as unevaluable: see the applied == "" guard in collectOne, which
 	// this is the sole caller reaching.
 	if ns.DeletionTimestamp != nil {
@@ -615,21 +633,11 @@ func (r *Registrar) ReconcileOne(ctx context.Context, nsName string) (bool, erro
 	if err := r.apply(ctx, c); err != nil {
 		var conflict *conflictError
 		if errors.As(err, &conflict) {
-			// Not a failure, so it must not fail the pass: a contested name
-			// persists until a human fixes it, and counting it would mark every
-			// pass failed forever. Logged at Error all the same -- a silently
-			// resolved conflict over a credential-bearing Secret is the hazard.
-			//
-			// Skip collection: a refused claimant vouches for nothing, and its own
-			// earlier registrations must not be read as superseded.
-			//
-			// The reason is logged under "conflict", NOT "reason": that key is
-			// already taken by the error itself, and a TextHandler emits both
-			// rather than choosing, which would break anything already grepping
-			// the existing field.
-			// The one place every refusal passes through, whichever check produced
-			// it, which is why the counter lives here rather than at the five sites
-			// that construct the error.
+			// Not a failure: a contested name persists until a human fixes it, and
+			// counting it would fail every pass forever. Still logged at Error,
+			// because a silently resolved conflict over a credential-bearing Secret
+			// is the hazard. Collection is skipped -- a refused claimant vouches for
+			// nothing. The counter lives here because every refusal passes through.
 			conflictsTotal.WithLabelValues(conflict.reason).Inc()
 			r.log.Error("refused to register cluster", slog.String("cluster", c.cluster),
 				slog.String("namespace", c.namespace),
@@ -645,16 +653,10 @@ func (r *Registrar) ReconcileOne(ctx context.Context, nsName string) (bool, erro
 	return false, err
 }
 
-// AuditUnrouted reports owned Secrets that record no source namespace.
-//
-// Nothing can collect them: every collection path selects on
-// <prefix>source-namespace=<name>, and they match no value of it. Nor can any
-// event route to them, since the key they would map to is empty. So they are
-// invisible unless something goes looking, which is what this does.
-//
-// The population is not historical. No released version ever wrote the ownership
-// label without also writing the source, so a Secret in this state got there by
-// someone stripping the label off it by hand.
+// AuditUnrouted reports owned Secrets that record no source namespace. Nothing
+// can collect them -- every collection path selects on
+// <prefix>source-namespace=<name> -- and no event routes to them, since their key
+// would be empty. A Secret gets into this state by having the label stripped.
 func (r *Registrar) AuditUnrouted(ctx context.Context) error {
 	selector := fmt.Sprintf("%s=%s", r.managedByLabel(), r.cfg.ManagedByValue)
 	secrets, err := r.client.CoreV1().Secrets(r.cfg.TargetNamespace).
@@ -662,17 +664,45 @@ func (r *Registrar) AuditUnrouted(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list cluster secrets (%s): %w", selector, err)
 	}
-	// Counted while we are here. This LIST is the only place anything sees the
-	// whole owned population at once, so the gauges are free; taking them anywhere
-	// else would mean listing the ArgoCD namespace again for no other reason.
-	var active, demoted, unrouted int
+	// Counted while we are here: this LIST is the only place anything sees the
+	// whole owned population at once, so the gauges are free. It is also the only
+	// place that sees what ArgoCD is actually holding, which is what the expiry
+	// buckets need -- the source kubeconfig may have moved on.
+	//
+	// Recomputed from the full population every pass, so it self-clears; the
+	// per-conflict gauge PLAN.md rules out could not.
+	counts := map[[2]string]int{}
+	var unrouted int
+	now := time.Now()
+
 	for i := range secrets.Items {
 		s := &secrets.Items[i]
+
+		state := stateActive
 		if s.Labels[r.orphanedSecretTypeLabel()] != "" {
-			demoted++
-		} else {
-			active++
+			state = stateDemoted
 		}
+		bucket, notAfter, dated := credentialExpiry(s.Data["config"], now)
+		counts[[2]string{state, bucket}]++
+
+		// The cluster name goes in the LOG, never in a label: the no-tenant-names
+		// rule is about cardinality on the metric, not about what may be said.
+		// NotAfter only -- not Subject or SANs, which would disclose the privilege
+		// level of a credential sitting in the ArgoCD namespace.
+		if dated && (bucket == expiryExpired || bucket == expiryLt24h) {
+			r.log.Warn("registration credential is expiring",
+				slog.String("secret", s.Name),
+				slog.String("cluster", s.Labels[r.clusterLabel()]),
+				slog.String("state", state), slog.String("expiry", bucket),
+				slog.Time("notAfter", notAfter))
+		}
+		// Only the broken case warns; absent is what an unwritten Secret looks like.
+		if bucket == expiryUnreadable {
+			r.log.Warn("registration credential could not be read",
+				slog.String("secret", s.Name),
+				slog.String("cluster", s.Labels[r.clusterLabel()]))
+		}
+
 		if s.Labels[r.sourceNamespaceLabel()] != "" {
 			continue
 		}
@@ -681,18 +711,22 @@ func (r *Registrar) AuditUnrouted(ctx context.Context) error {
 			slog.String("secret", s.Name), slog.String("label", r.sourceNamespaceLabel()),
 			slog.String("fix", "restore the label, or delete the secret if the cluster is gone"))
 	}
-	registrations.WithLabelValues(stateActive).Set(float64(active))
-	registrations.WithLabelValues(stateDemoted).Set(float64(demoted))
+
+	// Every series set every pass, including back to zero, or a bucket that
+	// emptied would keep reporting its last value forever.
+	for _, state := range []string{stateActive, stateDemoted} {
+		for _, bucket := range expiryBuckets {
+			registrations.WithLabelValues(state, bucket).
+				Set(float64(counts[[2]string{state, bucket}]))
+		}
+	}
 	unroutedSecrets.Set(float64(unrouted))
 	return nil
 }
 
 // reconcileKeys is every source namespace worth visiting: those currently
-// labelled for us, plus those recorded on a registration we own.
-//
-// The second half is what lets a sweep collect anything at all. A namespace that
-// has been deleted no longer lists, so without reading its name back off the
-// Secret it left behind, nothing would ever revisit it.
+// labelled for us, plus those recorded on a registration we own. The second half
+// is what lets a sweep collect at all, since a deleted namespace no longer lists.
 func (r *Registrar) reconcileKeys(ctx context.Context) ([]string, error) {
 	keys := map[string]bool{}
 
@@ -720,21 +754,16 @@ func (r *Registrar) reconcileKeys(ctx context.Context) ([]string, error) {
 	for k := range keys {
 		out = append(out, k)
 	}
-	// Stable ordering keeps logs diffable between passes. Nothing may depend on
-	// it: which claimant wins a contested name is decided by claimContestedName,
-	// on the namespace's creation timestamp, precisely so that it does not vary
-	// with the order a driver happens to present namespaces in.
+	// Diffable logs only. Nothing may depend on it: claimContestedName decides a
+	// contested name on creation timestamp, not on presentation order.
 	sort.Strings(out)
 	return out, nil
 }
 
-// Reconcile performs one full sweep over every key. It is what --once runs, and
-// what the poll loop ran before the controller existed.
-//
-// Re-reading each kubeconfig is what keeps registrations valid across a k3s
-// server restart -- those rotate the child's client certificate, and a stale
-// Secret breaks every Application targeting that cluster with an authentication
-// error rather than a visible one.
+// Reconcile performs one full sweep over every key, which is what --once runs.
+// Re-reading each kubeconfig keeps registrations valid across a k3s server
+// restart: those rotate the child's client certificate, and a stale Secret breaks
+// every Application targeting that cluster with an authentication error.
 func (r *Registrar) Reconcile(ctx context.Context) error {
 	keys, err := r.reconcileKeys(ctx)
 	if err != nil {
@@ -768,6 +797,7 @@ type child struct {
 	config       string
 	provider     string
 	labels       map[string]string
+	annotations  map[string]string
 }
 
 // apiFailure marks an error as "the API call failed", as opposed to "the answer
@@ -777,18 +807,12 @@ type apiFailure struct{ err error }
 func (e *apiFailure) Error() string { return e.err.Error() }
 func (e *apiFailure) Unwrap() error { return e.err }
 
-// conflictError means the name is spoken for. It is deliberately distinct from a
-// failure: nothing went wrong, the answer is "not yours".
+// conflictError means the name is spoken for: nothing went wrong, the answer is
+// "not yours", so Reconcile must not count it toward the pass's error return.
 //
-// Reconcile must not count it toward the pass's error return. A contested name is
-// a configuration mistake that persists until a human fixes it, so treating it as
-// an error would fail every pass forever and pump the conflict metric forever too.
-// It is still logged at Error, because a silently resolved conflict over a
-// credential-bearing Secret is the actual hazard.
-//
-// The reason travels on the error rather than being re-derived from its text: it
-// is the metric's only label, and matching on message wording would make a
-// reworded sentence a silent monitoring regression.
+// The reason travels on the error rather than being re-derived from its text,
+// because it is the metric's only label and rewording a sentence would otherwise
+// be a silent monitoring regression.
 type conflictError struct {
 	reason string
 	err    error
@@ -797,10 +821,9 @@ type conflictError struct {
 func (e *conflictError) Error() string { return e.err.Error() }
 func (e *conflictError) Unwrap() error { return e.err }
 
-// The closed set of reasons a claim can be refused. Every value is a constant
-// because these are metric label values: anything derived from a namespace or a
-// cluster name would be attacker-chosen cardinality on the one path that is
-// explicitly adversarial.
+// The closed set of reasons a claim can be refused. Constants because these are
+// metric label values, and anything derived from a namespace or cluster name
+// would be attacker-chosen cardinality on an explicitly adversarial path.
 const (
 	// conflictNotManaged is a Secret this registrar does not own at all: hand
 	// written, or another instance's.
@@ -819,21 +842,19 @@ const (
 	// same Secret at once. Expected during a leader-election handover, so it is
 	// counted separately rather than alerted on.
 	conflictCreateRace = "create_race"
+	// conflictServerCollision is a second namespace claiming an address ArgoCD
+	// already has a live registration for.
+	conflictServerCollision = "server_collision"
 )
 
 func conflictf(reason, format string, a ...any) error {
 	return &conflictError{reason: reason, err: fmt.Errorf(format, a...)}
 }
 
-// discoverOne evaluates a single managed namespace. The bool reports whether a
-// registration could be established; false means "not this time", never "gone".
-//
-// That distinction is the whole safety story. Every false return below is a state
-// a healthy cluster passes through -- a k3k child has no kubeconfig at all for its
-// first ninety seconds, and a half-written one does not parse -- so treating any
-// of them as a deletion would deregister live clusters. The caller must skip
-// garbage collection entirely for a namespace that returns false, rather than
-// concluding its registrations are orphaned.
+// discoverOne evaluates a single managed namespace. The bool means "a
+// registration could be established", never "gone" -- every false return is a
+// state a healthy cluster passes through, so the caller must skip garbage
+// collection entirely rather than conclude anything is orphaned.
 func (r *Registrar) discoverOne(ctx context.Context, ns *coreV1.Namespace) (child, bool) {
 	name := ns.Labels[r.clusterLabel()]
 	if name == "" {
@@ -852,19 +873,15 @@ func (r *Registrar) discoverOne(ctx context.Context, ns *coreV1.Namespace) (chil
 		return child{}, false
 	}
 
-	// Two namespaces may claim one cluster name. That is NOT resolved here:
-	// discovery is per-namespace and cannot see the other claimant. apply()
-	// settles it -- see claimContestedName.
-	//
-	// Note the name is not claimed until apply() succeeds. Claiming it here,
-	// before the kubeconfig lookup below, used to mean a namespace that never
-	// produced a usable kubeconfig still poisoned a healthy namespace claiming
-	// the same name, and neither ever registered.
+	// A contested cluster name is not resolved here: discovery is per-namespace
+	// and cannot see the other claimant. apply() settles it, and not before it
+	// succeeds, so a namespace with no usable kubeconfig cannot poison a healthy
+	// one claiming the same name.
 	candidates, err := r.findKubeconfigCandidates(ctx, ns.Name)
 	if err != nil {
 		var apiErr *apiFailure
 		if errors.As(err, &apiErr) {
-			// A genuine API failure, NOT "the provisioner has not written it
+			// A genuine API failure, not "the provisioner has not written it
 			// yet". Logging this as routine is how a fleet-wide deregistration
 			// used to look reassuring in the logs.
 			r.log.Error("could not read secrets in managed namespace",
@@ -881,8 +898,8 @@ func (r *Registrar) discoverOne(ctx context.Context, ns *coreV1.Namespace) (chil
 	}
 
 	// Try candidates in order. A shape match is not a usable kubeconfig: it may
-	// be half-written, or carry an exec credential that cannot be copied into an
-	// ArgoCD Secret, and in both cases the next candidate may be fine.
+	// be half-written, or carry an exec credential this provider may not
+	// translate, and in both cases the next candidate may be fine.
 	//
 	// Two candidates may be the same Secret under different keys, which is why the
 	// parse errors below are labelled `name[key]` rather than by name alone.
@@ -892,22 +909,40 @@ func (r *Registrar) discoverOne(ctx context.Context, ns *coreV1.Namespace) (chil
 		parseErrs      []string
 	)
 	for _, c := range candidates {
-		s, cfg, perr := parseKubeconfig(c.secret.Data[c.key])
+		pk, perr := parseKubeconfig(c.secret.Data[c.key], r.cfg.ExecCredentials && c.allowExec)
 		if perr != nil {
 			parseErrs = append(parseErrs, fmt.Sprintf("%s[%s]: %v", c.secret.Name, c.key, perr))
 			continue
 		}
-		server, config, provider = s, cfg, c.provider
+		server, config, provider = pk.server, pk.config, c.provider
 		if len(parseErrs) > 0 {
 			r.log.Debug("skipped unusable kubeconfig candidates before this one",
 				slog.String("namespace", ns.Name), slog.String("using", c.secret.Name),
 				slog.Any("skipped", parseErrs))
 		}
+		if c.provenance == 0 {
+			r.log.Debug("registering from a secret with no provisioner provenance; "+
+				"anyone who can write secrets in this namespace can supply it",
+				slog.String("namespace", ns.Name), slog.String("cluster", name),
+				slog.String("secret", c.secret.Name))
+		}
+		if pk.insecure {
+			r.log.Debug("registration disables TLS verification; ArgoCD will not check "+
+				"this cluster's certificate",
+				slog.String("namespace", ns.Name), slog.String("cluster", name),
+				slog.String("secret", c.secret.Name))
+		}
+		if pk.execCommand != "" {
+			r.log.Info("registered with a translated exec credential; ArgoCD will "+
+				"authenticate with its own cloud identity, not with a credential from "+
+				"this namespace",
+				slog.String("namespace", ns.Name), slog.String("cluster", name),
+				slog.String("secret", c.secret.Name), slog.String("command", pk.execCommand))
+		}
 		break
 	}
 	if provider == "" {
-		// Could be a half-written kubeconfig, so this must not look like a
-		// deletion either.
+		// Could be half-written, so this must not look like a deletion.
 		r.log.Warn("no usable kubeconfig; skipping",
 			slog.String("namespace", ns.Name), slog.String("cluster", name),
 			slog.Any("errors", parseErrs))
@@ -922,43 +957,35 @@ func (r *Registrar) discoverOne(ctx context.Context, ns *coreV1.Namespace) (chil
 		config:       config,
 		provider:     provider,
 		labels:       propagatedLabels(ns.Labels, r.cfg.LabelPrefix),
+		annotations:  r.propagatedAnnotations(ns.Annotations, ns.Name),
 	}, true
 }
 
-// candidate is a Secret that matched some provider, together with the provider
-// that matched and the key holding the kubeconfig.
+// candidate is a Secret that matched some provider, with that provider and the
+// key holding the kubeconfig.
 type candidate struct {
 	secret   *coreV1.Secret
 	provider string
 	key      string
+	// Carried so the caller can warn when the candidate it used had nothing
+	// vouching for it.
+	provenance int
+	allowExec  bool
 }
 
 // findKubeconfigCandidates returns every (Secret, key) pair in ns where the
-// Secret matches a configured provider's glob AND carries that key, in the order
-// they should be tried: providers in configured precedence order, then Secret
-// name, then the order the provider declares its keys.
+// Secret matches a configured provider's glob and carries that key, ordered by
+// provider precedence, then provenance, then Secret name, then declared key order.
 //
-// Both conditions matter. A name-only match picks the wrong object whenever a
-// provisioner writes more than one Secret under the same prefix: vcluster's
-// `vc-*` matches both `vc-<name>` (the kubeconfig, key `config`) and
-// `vc-config-<name>` (the vcluster config, key `config.yaml`). Requiring the key
-// means the decoy is skipped rather than poisoning the namespace, whichever way
-// the two happen to sort.
+// Requiring the key as well as the name is what skips a decoy: vcluster's `vc-*`
+// matches both `vc-<name>` (key `config`) and `vc-config-<name>` (key
+// `config.yaml`).
 //
-// A LIST rather than a single answer, because matching the shape is not the same
-// as being usable. That holds at both levels.
-//
-// Across Secrets: Cluster API's contract is satisfied by managed-cloud providers
-// too, and CAPA's EKS path writes a second `<cluster>-user-kubeconfig` -- same
-// glob, same `value` key -- holding an `exec` credential that cannot be copied
-// into an ArgoCD Secret at all. Returning candidates lets the caller fall through
-// to the next one on a parse failure, instead of relying on `k` sorting before
-// `u`.
-//
-// Within one Secret: Kamaji writes `admin.conf` and `admin.svc` side by side, so
-// emitting only the first present key made the second unreachable however broken
-// the first was. Both levels use the same mechanism, because a parse failure is
-// how an unusable candidate announces itself either way.
+// A list rather than one answer, because matching the shape is not the same as
+// being usable. CAPA's EKS path writes a second `<cluster>-user-kubeconfig`
+// under the same glob and key, and Kamaji writes `admin.conf` and `admin.svc`
+// side by side. A parse failure is how an unusable candidate announces itself,
+// and the caller falls through to the next.
 func (r *Registrar) findKubeconfigCandidates(ctx context.Context, ns string) ([]candidate, error) {
 	secrets, err := r.client.CoreV1().Secrets(ns).List(ctx, metaV1.ListOptions{})
 	if err != nil {
@@ -980,41 +1007,47 @@ func (r *Registrar) findKubeconfigCandidates(ctx context.Context, ns string) ([]
 	claimed := map[string]bool{}
 
 	for _, p := range r.cfg.Providers {
+		// Most provisioner-written first. Sorted per provider because the expected
+		// Secret type is; stable over name-sorted input, so ties keep name order.
+		matched := make([]int, 0, len(idx))
 		for _, i := range idx {
-			s := &secrets.Items[i]
-			ok, err := path.Match(p.SecretNamePattern, s.Name)
+			ok, err := path.Match(p.SecretNamePattern, secrets.Items[i].Name)
 			if err != nil {
 				// A permanent configuration fault, not a transient one. Validate()
 				// checks every pattern up front so this should be unreachable.
 				return nil, &apiFailure{fmt.Errorf("provider %q: bad secret name pattern %q: %w",
 					p.Name, p.SecretNamePattern, err)}
 			}
-			if !ok {
-				continue
+			if ok {
+				matched = append(matched, i)
 			}
-			// An earlier provider already claimed this Secret. Skip it rather than
-			// offering it twice: the patterns overlap by design (`*-kubeconfig`
-			// matches k3k's Secret too) and a duplicate entry would only ever
+		}
+		sort.SliceStable(matched, func(a, b int) bool {
+			return provenance(&secrets.Items[matched[a]], p) >
+				provenance(&secrets.Items[matched[b]], p)
+		})
+
+		for _, i := range matched {
+			s := &secrets.Items[i]
+			// The patterns overlap by design, and a duplicate entry would only
 			// produce the same registration.
 			if claimed[s.Name] {
 				continue
 			}
 
-			// One candidate per key PRESENT, not merely the first one. Kamaji ships
-			// `admin.conf` and `admin.svc` together, so stopping at the first meant
-			// a half-written `admin.conf` put `admin.svc` out of reach and stranded
-			// the namespace -- while Provider.SecretKeys claimed its keys were
-			// "tried in order". They now are.
-			//
-			// Several candidates may therefore share one *coreV1.Secret pointer into
-			// secrets.Items. Read-only, and the caller tells them apart by key.
+			// One candidate per key PRESENT, so a half-written first key does not
+			// put the second out of reach. Several candidates may share one Secret
+			// pointer; read-only, and the caller tells them apart by key.
 			found := 0
 			for _, k := range p.SecretKeys {
 				if _, has := s.Data[k]; !has {
 					continue
 				}
 				found++
-				out = append(out, candidate{secret: s, provider: p.Name, key: k})
+				out = append(out, candidate{
+					secret: s, provider: p.Name, key: k,
+					provenance: provenance(s, p), allowExec: p.AllowExec,
+				})
 			}
 			if found == 0 {
 				namedButKeyless = append(namedButKeyless,
@@ -1022,9 +1055,8 @@ func (r *Registrar) findKubeconfigCandidates(ctx context.Context, ns string) ([]
 				continue
 			}
 
-			// Claimed per SECRET, not per key, and that is what keeps one physical
-			// cluster registered once: a later provider must not re-offer this
-			// object under a key of its own.
+			// Per SECRET, not per key: a later provider must not re-offer this
+			// object under a key of its own, or one cluster registers twice.
 			claimed[s.Name] = true
 		}
 	}
@@ -1032,10 +1064,8 @@ func (r *Registrar) findKubeconfigCandidates(ctx context.Context, ns string) ([]
 	if len(out) > 0 {
 		return out, nil
 	}
-	// Only worth reporting when nothing matched at all. With overlapping patterns
-	// a keyless near-miss is routine -- every k3k Secret is one, for the CAPI
-	// provider -- and reporting it on a successful pass would turn a real signal
-	// into noise.
+	// Only when nothing matched at all: with overlapping patterns a keyless
+	// near-miss is routine and reporting it on a successful pass is noise.
 	if len(namedButKeyless) > 0 {
 		return nil, fmt.Errorf("secret(s) %v matched a provider pattern but carried none of its keys",
 			namedButKeyless)
@@ -1044,50 +1074,71 @@ func (r *Registrar) findKubeconfigCandidates(ctx context.Context, ns string) ([]
 }
 
 // propagatedLabels copies the prefixed labels the ApplicationSet selects on,
-// minus the ones this tool derives for itself.
-//
-// The exclusions are a trust boundary, not tidiness. Everything here comes off
-// the source namespace, which a tenant may control, and apply() copies these
-// over the labels it just computed -- so anything not excluded can be spoofed.
-// See reservedSuffixes for what that would cost.
+// minus the ones this tool derives for itself. The exclusions are a trust
+// boundary: everything here comes off a tenant-controllable namespace, and
+// apply() copies it over the labels it just computed, so anything not excluded
+// can be spoofed.
 func propagatedLabels(in map[string]string, prefix string) map[string]string {
+	out, _ := propagate(in, prefix, 0)
+	return out
+}
+
+// propagatedAnnotations is the same for annotations, which the ApplicationSet
+// cluster generator exposes as {{metadata.annotations.<key>}} exactly as it does
+// labels. Worth having because an annotation has neither the 63-byte cap nor the
+// charset a label value is held to, so a URL or a list can reach a template.
+//
+// Bounded, unlike labels, which the apiserver bounds for us. Annotations allow
+// 256KB per object and every registration is held in ArgoCD's cluster informer,
+// so without a cap the source namespace picks ArgoCD's memory footprint.
+func (r *Registrar) propagatedAnnotations(in map[string]string, ns string) map[string]string {
+	out, dropped := propagate(in, r.cfg.LabelPrefix, maxPropagatedAnnotationBytes)
+	for _, k := range dropped {
+		r.log.Warn("annotation is too large to propagate; skipping it",
+			slog.String("namespace", ns), slog.String("annotation", k),
+			slog.Int("limit", maxPropagatedAnnotationBytes))
+	}
+	return out
+}
+
+// maxPropagatedAnnotationBytes bounds one propagated annotation value.
+const maxPropagatedAnnotationBytes = 4096
+
+// propagate copies prefixed keys minus the reserved ones. A limit of 0 means
+// unbounded; anything over it is returned in `dropped` rather than truncated,
+// since a truncated URL is a working-looking wrong answer.
+func propagate(in map[string]string, prefix string, limit int) (out map[string]string, dropped []string) {
 	reserved := map[string]bool{}
 	for _, suffix := range reservedSuffixes {
 		reserved[prefix+suffix] = true
 	}
 
-	out := map[string]string{}
+	out = map[string]string{}
 	for k, v := range in {
-		if !strings.HasPrefix(k, prefix) {
+		if !strings.HasPrefix(k, prefix) || reserved[k] {
 			continue
 		}
-		if reserved[k] {
+		if limit > 0 && len(v) > limit {
+			dropped = append(dropped, k)
 			continue
 		}
 		out[k] = v
 	}
-	return out
+	sort.Strings(dropped)
+	return out, dropped
 }
 
 // secretName is the ArgoCD cluster Secret name for a child.
 func secretName(cluster string) string { return "cluster-" + cluster }
 
 // checkOwnership decides whether c may write the cluster Secret that already
-// exists. It returns a conflictError when it may not.
+// exists, returning a conflictError when it may not. This is the tool's security
+// boundary: without it, anyone who can label a namespace `<prefix>cluster: prod`
+// could repoint ArgoCD's `prod` registration at their own API server.
 //
-// This is the tool's security boundary, and until 0.4.0 there was not one: apply
-// read the Secret, overwrote it and relabelled it as ours no matter who wrote it.
-// A tenant able to label their own namespace `<prefix>cluster: prod` could
-// therefore repoint ArgoCD's `prod` registration at their own API server with
-// their own credentials, and -- because the takeover also rewrote
-// `source-namespace` -- make it garbage-collectable on their own terms.
-//
-// The rule is incumbency. Whoever holds the registration keeps it, and a
-// challenger is refused rather than arbitrated against, which is what Kubernetes
-// itself does for name collisions (409 on create) and what every comparable
-// controller does for a derived object: cert-manager, external-dns, External
-// Secrets, Crossplane, and the ControllerRef rule that a controller may adopt an
-// orphan but never something another controller already owns.
+// The rule is incumbency. Whoever holds the registration keeps it and a
+// challenger is refused, matching the ControllerRef rule that a controller may
+// adopt an orphan but never something another controller owns.
 func (r *Registrar) checkOwnership(existing *coreV1.Secret, c child) error {
 	if existing.Labels[r.managedByLabel()] != r.cfg.ManagedByValue {
 		// Hand-registered, or another registrar's. Either way not ours to take.
@@ -1105,18 +1156,10 @@ func (r *Registrar) checkOwnership(existing *coreV1.Secret, c child) error {
 
 	case "":
 		// No recorded owner. Adopt only if the Secret already names this exact
-		// cluster, which is the ControllerRef "adopt an orphan" rule.
-		//
-		// This is deliberately narrow, because the population it was originally
-		// written for turns out not to exist: v0.1.8 wrote an UNPREFIXED
-		// managed-by, v0.2.0 wrote every label including source-namespace, and
-		// the one commit in between was squashed into the v0.2.0 merge and is in
-		// no release. So a genuine pre-0.2.0 Secret fails the managed-by check
-		// above and never reaches here. What does reach here is a Secret whose
-		// source-namespace label was stripped by someone with write access to the
-		// ArgoCD namespace -- i.e. the takeover this function exists to prevent,
-		// wearing a different hat. Requiring the cluster label to match means an
-		// attacker gains nothing they did not already have.
+		// cluster. Narrow on purpose: what reaches here is a Secret whose
+		// source-namespace label was stripped by hand, which is the takeover this
+		// function exists to prevent, so requiring the cluster label to match means
+		// an attacker gains nothing they did not already have.
 		if existing.Labels[r.clusterLabel()] != c.cluster {
 			return conflictf(conflictOrphanClusterMismatch,
 				"secret %s/%s is owned but records no source namespace, and its %s label is %q "+
@@ -1124,9 +1167,7 @@ func (r *Registrar) checkOwnership(existing *coreV1.Secret, c child) error {
 				r.cfg.TargetNamespace, existing.Name, r.clusterLabel(),
 				existing.Labels[r.clusterLabel()], c.cluster, c.namespace)
 		}
-		// Counted here rather than at the refusal choke point, because this branch
-		// is a SUCCESS: it returns nil and the registration proceeds. Look for it
-		// alongside the conflict counter and you will conclude it is missing.
+		// Counted here, not at the refusal choke point: this branch is a success.
 		adoptionsTotal.Inc()
 		r.log.Warn("adopting an owned cluster secret that records no source namespace",
 			slog.String("secret", existing.Name), slog.String("cluster", c.cluster),
@@ -1135,10 +1176,9 @@ func (r *Registrar) checkOwnership(existing *coreV1.Secret, c child) error {
 		return nil
 
 	default:
-		// Deliberately NOT compared by UID. A namespace deleted and recreated
-		// under the same name is a legitimate claimant, and refusing it here
-		// would deadlock: collect() would see a live namespace of that name and
-		// refuse to delete the registration, so neither side could ever move.
+		// not compared by UID: a namespace deleted and recreated under the same
+		// name is a legitimate claimant, and refusing it here would deadlock
+		// against collection, which sees a live namespace and keeps the Secret.
 		return conflictf(conflictIncumbent,
 			"cluster %q is registered from namespace %s; refusing to take it over for %s. "+
 				"Two namespaces must not claim one cluster name",
@@ -1146,25 +1186,15 @@ func (r *Registrar) checkOwnership(existing *coreV1.Secret, c child) error {
 	}
 }
 
-// claimContestedName decides whether c may CREATE the cluster Secret, when
-// several managed namespaces claim the same cluster name and none holds it yet.
+// claimContestedName decides whether c may CREATE the cluster Secret when
+// several managed namespaces claim the same name and none holds it yet.
+// Incumbency settles the case where a registration exists; this settles the case
+// where it does not. Oldest namespace wins, ties broken on name.
 //
-// Incumbency settles the case where a registration already exists; this settles
-// the case where it does not. The oldest namespace wins, breaking an exact tie on
-// name.
-//
-// Oldest-wins is the ecosystem's answer -- Gateway API, ingress-nginx and
-// cert-manager all use creation timestamp then name -- and it is the right shape
-// here for a specific reason: it is monotonic in the defender's favour. A
-// namespace cannot become older, so an attacker who deletes and recreates one can
-// only ever lose the tie. The alphabetical fallback is reachable only on an exact
-// timestamp match and must never be relied on.
-//
-// Refusing BOTH claimants was considered and rejected. It is symmetric, so a
-// standing claim on a guessable name would permanently block that cluster from
-// ever registering, including after a legitimate rebuild -- trading a hijack risk
-// for an availability one. Upstream reserves refuse-both for conflicts inside a
-// single object with a single author, where it penalises only the author.
+// Oldest-wins because it is monotonic in the defender's favour: a namespace
+// cannot become older, so an attacker who recreates one can only lose the tie.
+// Refusing both would be symmetric, letting a standing claim on a guessable name
+// block that cluster forever.
 func (r *Registrar) claimContestedName(ctx context.Context, c child) error {
 	selector := fmt.Sprintf("%s=%s,%s=%s",
 		r.managedByLabel(), r.cfg.ManagedByValue, r.clusterLabel(), c.cluster)
@@ -1177,9 +1207,8 @@ func (r *Registrar) claimContestedName(ctx context.Context, c child) error {
 	var winnerAt metaV1.Time
 	for i := range namespaces.Items {
 		ns := &namespaces.Items[i]
-		// A namespace being torn down is not a claimant; discover skips these
-		// too, and letting one win would block the survivor for as long as the
-		// finalizers took.
+		// A terminating namespace is not a claimant; letting one win would block
+		// the survivor for as long as its finalizers took.
 		if ns.DeletionTimestamp != nil {
 			continue
 		}
@@ -1199,6 +1228,77 @@ func (r *Registrar) claimContestedName(ctx context.Context, c child) error {
 			"not registering it from %s", c.cluster, winner, c.namespace)
 }
 
+// claimServer refuses a registration whose server URL is already held by a live
+// registration from a different source namespace.
+//
+// ArgoCD keys clusters by address: its indexer and GetClusterByURL both trim a
+// trailing slash, and the lookup returns items[0] from a set, so two Secrets on
+// one address are two claims on one identity resolved arbitrarily. Upstream
+// treats that as unsupported -- its own API refuses it, deriving the Secret name
+// from the URL -- and it splits sharding, cycles the UI, and makes one RBAC
+// decision cover both.
+//
+// Selected on ArgoCD's own label, not on ours. A hand-written cluster Secret or
+// one from a second registrar instance is ambiguous to ArgoCD just the same, and
+// this namespace is already listed elsewhere so the wider selector is free.
+func (r *Registrar) claimServer(ctx context.Context, c child) error {
+	selector := fmt.Sprintf("%s=%s", argoSecretTypeLabel, argoSecretTypeValue)
+	secrets, err := r.client.CoreV1().Secrets(r.cfg.TargetNamespace).
+		List(ctx, metaV1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return fmt.Errorf("list cluster secrets (%s): %w", selector, err)
+	}
+	for i := range secrets.Items {
+		s := &secrets.Items[i]
+		src := s.Labels[r.sourceNamespaceLabel()]
+		if src != "" && src == c.namespace {
+			continue
+		}
+		if s.Labels[r.orphanedSecretTypeLabel()] != "" {
+			continue
+		}
+		if strings.TrimRight(string(s.Data["server"]), "/") != c.server {
+			continue
+		}
+		pinned := s.Labels[r.pruneLabel()] == PruneDisabled
+
+		// An unpinned incumbent whose source namespace is gone is an orphan that
+		// collection will remove anyway; releasing the address now just avoids
+		// refusing a rebuild for one pass. A pinned one is deliberate, so it keeps
+		// its address -- the operator said keep it, and unpinning is how they say
+		// otherwise.
+		if !pinned && src != "" && !r.namespaceExists(ctx, src) {
+			r.log.Info("incumbent registration's source namespace is gone; releasing its address",
+				slog.String("secret", s.Name), slog.String("namespace", src),
+				slog.String("server", c.server))
+			continue
+		}
+
+		held := src
+		if held == "" {
+			held = "outside this registrar"
+		}
+		hint := "To scope one cluster several ways, use a single registration with " +
+			"ArgoCD's `namespaces` key, or AppProject destinationServiceAccounts"
+		if pinned {
+			hint = fmt.Sprintf("The incumbent is pinned with %s=%s; remove that label to "+
+				"let it be replaced", r.pruneLabel(), PruneDisabled)
+		}
+		return conflictf(conflictServerCollision,
+			"server %s is already registered as %s (from %s); refusing to register it again "+
+				"as %s from %s, because ArgoCD identifies a cluster by its address. %s",
+			c.server, s.Name, held, c.cluster, c.namespace, hint)
+	}
+	return nil
+}
+
+// namespaceExists answers the one question claimServer needs about an incumbent.
+// Any uncertainty answers "yes", so an API blip never releases a held address.
+func (r *Registrar) namespaceExists(ctx context.Context, name string) bool {
+	_, err := r.client.CoreV1().Namespaces().Get(ctx, name, metaV1.GetOptions{})
+	return !apiErrors.IsNotFound(err)
+}
+
 func (r *Registrar) apply(ctx context.Context, c child) error {
 	// Order matters: the propagated labels are copied LAST, so anything they can
 	// reach wins over what was computed here. propagatedLabels already withholds
@@ -1215,9 +1315,10 @@ func (r *Registrar) apply(ctx context.Context, c child) error {
 
 	want := &coreV1.Secret{
 		ObjectMeta: metaV1.ObjectMeta{
-			Name:      secretName(c.cluster),
-			Namespace: r.cfg.TargetNamespace,
-			Labels:    labels,
+			Name:        secretName(c.cluster),
+			Namespace:   r.cfg.TargetNamespace,
+			Labels:      labels,
+			Annotations: c.annotations,
 		},
 		Type: coreV1.SecretTypeOpaque,
 		StringData: map[string]string{
@@ -1236,6 +1337,9 @@ func (r *Registrar) apply(ctx context.Context, c child) error {
 		// namespaces each "would create" the same Secret and says nothing about
 		// the conflict -- the one thing it would be run to find.
 		if err := r.claimContestedName(ctx, c); err != nil {
+			return err
+		}
+		if err := r.claimServer(ctx, c); err != nil {
 			return err
 		}
 		if r.cfg.DryRun {
@@ -1272,17 +1376,32 @@ func (r *Registrar) apply(ctx context.Context, c child) error {
 		r.log.Debug("cluster secret already up to date", slog.String("cluster", c.cluster))
 		return nil
 	}
+	// Only when the address actually moves. Checking every update would cost a LIST
+	// of the ArgoCD namespace on every reconcile, for a value that rarely changes.
+	if was := string(existing.Data["server"]); was != c.server {
+		if err := r.claimServer(ctx, c); err != nil {
+			return err
+		}
+		// Updated in place, with the warning as the whole remedy. ArgoCD only
+		// invalidates a cache entry it can still find by the NEW address
+		// (argo-cd#14410), so it keeps watching the old one until its application
+		// controller restarts. Delete-and-recreate would clear that but is not
+		// atomic and would drop ArgoCD's own keys: leaked watches recover with a
+		// restart, a destroyed registration does not.
+		r.log.Warn("cluster address changed; ArgoCD may keep watching the old one "+
+			"until its application controller restarts",
+			slog.String("cluster", c.cluster), slog.String("from", was),
+			slog.String("to", c.server))
+	}
 	if r.cfg.DryRun {
 		r.log.Info("[dry-run] would update cluster secret", slog.String("cluster", c.cluster))
 		return nil
 	}
 
-	// Read-modify-write, NOT a wholesale replace. Update replaces the entire
-	// object, so sending a freshly-built Secret would silently drop everything
-	// this tool does not know about: ArgoCD's own `namespaces`,
-	// `clusterResources` and `project` keys, plus any annotations or foreign
-	// labels an operator set by hand. changed() cannot see that drift either, so
-	// the loss would land later, at an unrelated update, with no log line.
+	// Read-modify-write, not a wholesale replace: Update replaces the whole
+	// object, so a freshly-built Secret would drop ArgoCD's own `namespaces`,
+	// `clusterResources` and `project` keys plus any operator annotations, and
+	// changed() cannot see that drift either.
 	updated := existing.DeepCopy()
 	if updated.Data == nil {
 		updated.Data = map[string][]byte{}
@@ -1294,14 +1413,10 @@ func (r *Registrar) apply(ctx context.Context, c child) error {
 		updated.Labels = map[string]string{}
 	}
 	maps.Copy(updated.Labels, want.Labels)
-	// Drop prefixed labels that no longer exist upstream, so a cluster can be
-	// opted back OUT of a selector (e.g. flux=true) once it was opted in.
-	//
-	// Except the prune opt-out, which is set on the cluster Secret by whoever owns
-	// the ArgoCD namespace and has no upstream to be absent from. Sweeping it was
-	// how pinning a LIVE registration silently undid itself one reconcile later:
-	// exactly the case the feature is documented for. The demotion labels are
-	// deliberately still swept, because that is the self-heal on a reverted rename.
+	// Drop prefixed labels absent upstream, so a cluster can be opted back out of
+	// a selector. Except the prune opt-out, which is set here and has no upstream
+	// to be absent from. The demotion labels are still swept: that is the
+	// self-heal on a reverted rename.
 	for k := range updated.Labels {
 		if k == r.pruneLabel() {
 			continue
@@ -1309,6 +1424,23 @@ func (r *Registrar) apply(ctx context.Context, c child) error {
 		if strings.HasPrefix(k, r.cfg.LabelPrefix) {
 			if _, keep := want.Labels[k]; !keep {
 				delete(updated.Labels, k)
+			}
+		}
+	}
+	// Same merge and sweep as the labels above. Only prefixed annotations are
+	// swept, so ArgoCD's own and any an operator set by hand survive, which is
+	// what the read-modify-write exists for.
+	if len(c.annotations) > 0 && updated.Annotations == nil {
+		updated.Annotations = map[string]string{}
+	}
+	maps.Copy(updated.Annotations, c.annotations)
+	for k := range updated.Annotations {
+		if k == r.pruneLabel() {
+			continue
+		}
+		if strings.HasPrefix(k, r.cfg.LabelPrefix) {
+			if _, keep := c.annotations[k]; !keep {
+				delete(updated.Annotations, k)
 			}
 		}
 	}
@@ -1321,22 +1453,14 @@ func (r *Registrar) apply(ctx context.Context, c child) error {
 }
 
 // demote takes a registration out of ArgoCD's sight without destroying it.
+// Deleting would throw away what the read-modify-write in apply() protects:
+// ArgoCD's own keys and any operator annotations.
 //
-// Deleting would be simpler and is what a prune-style tool does, but this Secret
-// is not solely ours: ArgoCD writes `namespaces`, `clusterResources` and
-// `project` into it, and operators add annotations and foreign labels. apply()
-// goes to some length not to clobber those (see the read-modify-write there), and
-// deleting on a rename would throw away everything it protects. A mistaken rename
-// that gets reverted would silently take an operator's per-cluster configuration
-// with it.
-//
-// ArgoCD discovers clusters purely by the argocd.argoproj.io/secret-type label
-// selector, so parking that one key deregisters the cluster immediately and
-// completely, while every byte survives. It also self-heals: apply() copies
-// want.Labels over the existing object, restoring secret-type, and its
-// prefixed-label sweep removes the three labels written here because they are
-// prefixed and absent from want.Labels. So reverting the rename restores the
-// registration, credentials and all, with no special case anywhere.
+// ArgoCD discovers clusters purely by the argocd.argoproj.io/secret-type label,
+// so parking that one key deregisters immediately while every byte survives. It
+// self-heals too: apply() restores secret-type and its prefixed-label sweep
+// removes the three labels written here, so a reverted rename needs no special
+// case.
 func (r *Registrar) demote(ctx context.Context, s *coreV1.Secret, supersededBy string) error {
 	if r.cfg.DryRun {
 		r.log.Info("[dry-run] would demote superseded cluster secret",
@@ -1352,12 +1476,9 @@ func (r *Registrar) demote(ctx context.Context, s *coreV1.Secret, supersededBy s
 		updated.Labels[r.orphanedSecretTypeLabel()] = v
 		delete(updated.Labels, argoSecretTypeLabel)
 	}
-	// superseded-by is a breadcrumb, and it is derived from a cluster name that is
-	// only bounded by the 63 bytes a LABEL VALUE allows -- so "cluster-" + name can
-	// be 71, which the apiserver rejects. Dropping the breadcrumb is very much
-	// better than failing the write: the load-bearing half of demotion is parking
-	// the ArgoCD label above, and without it the stale registration stays visible
-	// and ArgoCD ends up with two live clusters on one server URL.
+	// A breadcrumb only. "cluster-" plus a 63-byte cluster name is 71, which the
+	// apiserver rejects as a label value, and dropping it beats failing the write:
+	// parking the ArgoCD label is the load-bearing half.
 	if errs := validation.IsValidLabelValue(supersededBy); len(errs) > 0 {
 		r.log.Warn("superseded-by would not be a valid label value; demoting without it",
 			slog.String("secret", s.Name), slog.String("supersededBy", supersededBy),
@@ -1377,8 +1498,8 @@ func (r *Registrar) demote(ctx context.Context, s *coreV1.Secret, supersededBy s
 	return nil
 }
 
-// changed reports whether the live Secret differs from what we would write.
-// Compares Data (what the apiserver stores) against StringData (what we set).
+// changed reports whether the live Secret differs from what we would write,
+// comparing stored Data against the StringData we set.
 func changed(existing, want *coreV1.Secret, labelPrefix string) bool {
 	for k, v := range want.StringData {
 		if string(existing.Data[k]) != v {
@@ -1390,10 +1511,9 @@ func changed(existing, want *coreV1.Secret, labelPrefix string) bool {
 			return true
 		}
 	}
-	// A label removed from the source must disappear here too, or a cluster could
-	// never be opted OUT of Flux once opted in. The prune opt-out is exempt for
-	// the same reason apply does not sweep it: it is set here, not upstream, so
-	// reading it as drift makes every pinned registration write on every pass.
+	// A label removed upstream must disappear here too. The prune opt-out is
+	// exempt for the same reason apply does not sweep it: it is set here, not
+	// upstream, so reading it as drift rewrites every pinned registration.
 	for k := range existing.Labels {
 		if k == PruneLabel(labelPrefix) {
 			continue
@@ -1404,36 +1524,44 @@ func changed(existing, want *coreV1.Secret, labelPrefix string) bool {
 			}
 		}
 	}
+	// Annotations the same way, both directions. Only prefixed ones are compared:
+	// an operator-set or ArgoCD-set annotation is not drift.
+	for k, v := range want.Annotations {
+		if existing.Annotations[k] != v {
+			return true
+		}
+	}
+	for k := range existing.Annotations {
+		if k == PruneLabel(labelPrefix) {
+			continue
+		}
+		if strings.HasPrefix(k, labelPrefix) {
+			if _, ok := want.Annotations[k]; !ok {
+				return true
+			}
+		}
+	}
 	return false
 }
 
 // collectOne reconciles the registrations recorded against ONE source namespace.
+// `exists` is the caller's proof about that namespace, from a single uncached
+// read. `applied` is the Secret this namespace wrote this pass, or "".
 //
-// `exists` is the caller's proof about that namespace, obtained from a single
-// uncached read. `applied` is the Secret name this namespace successfully wrote
-// this pass, or "" if it wrote none.
+// Deletion requires positive proof: only `exists == false`, set on a definite
+// NotFound. Absence from `applied` is never evidence, because a namespace can
+// fail to register for reasons that have nothing to do with its cluster being
+// gone. The caller must not call this at all for a namespace it could not
+// evaluate.
 //
-// Deletion requires POSITIVE proof. A Secret is removed only when `exists` is
-// false, which the caller sets only on a definite NotFound. Absence from
-// `applied` is never evidence: a namespace can fail to produce a registration
-// because an API call failed, because a kubeconfig was half-written, or because
-// a label was edited, and treating any of those as "deleted" would deregister
-// live clusters. The caller must not call this at all for a namespace it could
-// not evaluate.
+// `applied` is at most one Secret, but the set can hold several: a rename leaves
+// the old registration behind, demoted, still recorded against this namespace.
 //
-// `applied` is at most one Secret because a namespace carries exactly one cluster
-// label. The set can still hold several Secrets, though: a rename leaves the old
-// registration behind, demoted, still recorded against this namespace. That is
-// why the selector matches a set and not a single name -- handling only one would
-// leak every superseded registration the moment its namespace was deleted.
-// The int reports how many owned Secrets still record this namespace after the
-// pass. Zero, together with a namespace that is provably gone, means there is
-// nothing left to come back for.
+// The int reports how many owned Secrets still record this namespace. Zero, with
+// a namespace provably gone, means there is nothing to come back for.
 func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, applied string) (int, error) {
-	// Selected on ownership and source ALONE. Selecting on secret-type as well
-	// would hide already-demoted registrations, which still need collecting once
-	// their namespace finally goes away. managed-by is the ownership marker; the
-	// ArgoCD label is incidental to us.
+	// Ownership and source ALONE: selecting on secret-type would hide demoted
+	// registrations, which still need collecting when their namespace goes away.
 	selector := fmt.Sprintf("%s=%s,%s=%s",
 		r.managedByLabel(), r.cfg.ManagedByValue, r.sourceNamespaceLabel(), nsName)
 
@@ -1452,10 +1580,8 @@ func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, 
 			continue
 		}
 
-		// Opted out. Checked before BOTH removal paths, so it covers demotion as
-		// well as deletion -- demotion is reversible, but it still takes a cluster
-		// out of ArgoCD's sight, which is exactly what someone pinning a
-		// registration is asking not to happen.
+		// Checked before BOTH removal paths: demotion is reversible but still
+		// takes a cluster out of ArgoCD's sight, which is what pinning forbids.
 		if s.Labels[r.pruneLabel()] == PruneDisabled {
 			r.log.Debug("registration is opted out of collection; leaving it",
 				slog.String("secret", s.Name), slog.String("namespace", nsName),
@@ -1469,28 +1595,18 @@ func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, 
 				errs = append(errs, err.Error())
 				continue
 			}
-			// Only when it is genuinely gone. A UID conflict leaves the Secret in
-			// place on purpose, and counting it as removed retires the key: the
-			// source namespace no longer exists, so nothing can ever enqueue it
-			// again and the registration outlives its cluster until a restart.
+			// Only when genuinely gone. A UID conflict leaves the Secret in place,
+			// and counting it as removed would retire a key nothing can re-enqueue.
 			if removed {
 				remaining--
 			}
 			continue
 		}
 
-		// The namespace is still there, so nothing here is a deletion.
-		//
-		// This guard is load-bearing and must not be simplified away. A namespace
-		// that is TERMINATING is skipped by the caller without being marked
-		// unevaluable, so it reaches here with applied == "". Demoting on that
-		// would hide a live registration the instant its namespace began to
-		// terminate, moments before it was going to be deleted properly -- and if
-		// a finalizer then aborted the deletion, it would stay hidden.
-		//
-		// Outside that case, "the namespace was fully evaluated" implies
-		// applied != "": every other way discoverOne can fail makes the caller
-		// skip garbage collection for this namespace entirely.
+		// A terminating namespace reaches here with applied == "", skipped by the
+		// caller without being marked unevaluable. Demoting on that would hide a
+		// live registration the instant its namespace began terminating, and leave
+		// it hidden if a finalizer then aborted the deletion.
 		if applied == "" {
 			r.log.Warn("source namespace still exists but produced no registration; not deleting",
 				slog.String("secret", s.Name), slog.String("namespace", nsName))
@@ -1516,14 +1632,10 @@ func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, 
 			continue
 		}
 
-		// The namespace registered under a DIFFERENT name, so it has disclaimed
-		// this one and nothing will ever reclaim it. Positive proof of a second
-		// kind, not an absence.
-		//
-		// Left alone, the stale Secret is not inert: it is never rewritten, so its
-		// kubeconfig freezes with a certificate good for about a year, and ArgoCD
-		// resolves two registrations sharing one server URL by taking whichever
-		// its informer index yields first.
+		// The namespace registered under a DIFFERENT name, disclaiming this one.
+		// Positive proof of a second kind. Left alone the stale Secret is not
+		// inert: never rewritten, it keeps working from a frozen kubeconfig, and
+		// ArgoCD picks between two registrations on one server URL arbitrarily.
 		if err := r.demote(ctx, s, applied); err != nil {
 			errs = append(errs, err.Error())
 		}
@@ -1536,11 +1648,8 @@ func (r *Registrar) collectOne(ctx context.Context, nsName string, exists bool, 
 }
 
 // demotedTTLExpired reports whether a demoted registration has outlived
-// Config.DemotedTTL.
-//
-// Every uncertain answer is "no", as with collectStaleUID's missing UID. Note
-// time.Parse returns the ZERO time on failure, so an ignored error here would
-// age every demoted registration by two millennia and delete the fleet.
+// Config.DemotedTTL. Every uncertain answer is "no": time.Parse returns the ZERO
+// time on failure, so an ignored error would age the fleet by two millennia.
 func (r *Registrar) demotedTTLExpired(s *coreV1.Secret) bool {
 	if r.cfg.DemotedTTL <= 0 {
 		return false
@@ -1565,11 +1674,9 @@ func (r *Registrar) demotedTTLExpired(s *coreV1.Secret) bool {
 }
 
 // deleteExpired removes a demoted registration that has outlived its TTL.
-//
-// Not deleteOrphan: different proof, so a different message, and stricter
-// preconditions. UID *and* resourceVersion, because the race here is a REVERTED
-// rename, and a revert goes through apply's read-modify-write, which preserves
-// the UID. Only the resourceVersion moves.
+// Preconditioned on UID *and* resourceVersion, unlike deleteOrphan: the race
+// here is a reverted rename, which goes through apply's read-modify-write and so
+// preserves the UID. Only the resourceVersion moves.
 func (r *Registrar) deleteExpired(ctx context.Context, s *coreV1.Secret) error {
 	if r.cfg.DryRun {
 		r.log.Info("[dry-run] would delete expired demoted cluster secret",
@@ -1602,22 +1709,15 @@ func (r *Registrar) deleteExpired(ctx context.Context, s *coreV1.Secret) error {
 }
 
 // collectStaleUID removes registrations whose recorded source namespace has been
-// replaced by a different object of the same name.
+// replaced by a different object of the same name. Names are reusable, UIDs are
+// not, so a recorded UID that no longer matches is positive proof the source is
+// gone -- something else holds its name -- which is why this may delete.
 //
-// A namespace name is reusable; a UID is not. So a Secret recording
-// <prefix>source-namespace-uid=U1 while the namespace now called X is U2 is a
-// registration whose source is provably gone -- not merely unseen, gone, because
-// something else holds its name. That is positive proof of the same kind as a
-// NotFound, which is why this is allowed to delete.
+// It runs BEFORE discovery: delete and recreate a namespace, as a GitOps
+// re-apply does, and if the replacement never becomes discoverable every other
+// path returns early, leaving the predecessor pointing at a destroyed API server.
 //
-// It runs BEFORE discovery, and that placement is the whole point. Delete and
-// recreate a namespace (a GitOps re-apply does exactly this) and, if the
-// replacement never becomes discoverable, every other path returns early to avoid
-// concluding anything about it -- leaving the predecessor's registration pointing
-// at a destroyed API server indefinitely.
-//
-// Guarded on the label being PRESENT. Secrets written before 0.4.0 do not carry
-// it, and absence must never be read as a mismatch.
+// Guarded on the label being PRESENT; absence must never read as a mismatch.
 func (r *Registrar) collectStaleUID(ctx context.Context, nsName string, uid types.UID) error {
 	if uid == "" {
 		return nil
@@ -1645,8 +1745,7 @@ func (r *Registrar) collectStaleUID(ctx context.Context, nsName string, uid type
 		r.log.Info("source namespace was replaced by a different one of the same name",
 			slog.String("secret", s.Name), slog.String("namespace", nsName),
 			slog.String("recordedUID", recorded), slog.String("currentUID", string(uid)))
-		// The bool is genuinely unused here: collectStaleUID reports only errors,
-		// and nothing downstream counts what it removed.
+		// The bool is unused: this reports only errors.
 		if _, err := r.deleteOrphan(ctx, s, nsName); err != nil {
 			errs = append(errs, err.Error())
 		}
@@ -1659,7 +1758,7 @@ func (r *Registrar) collectStaleUID(ctx context.Context, nsName string, uid type
 }
 
 // deleteOrphan removes a registration whose source namespace is provably gone.
-// The bool reports whether the object is gone, which is NOT the same as "no error
+// The bool reports whether the object is gone, which is not the same as "no error
 // occurred": a UID conflict is reported as success because it needs no retry, and
 // the caller must not count it as one fewer registration.
 func (r *Registrar) deleteOrphan(ctx context.Context, s *coreV1.Secret, nsName string) (bool, error) {
@@ -1668,11 +1767,9 @@ func (r *Registrar) deleteOrphan(ctx context.Context, s *coreV1.Secret, nsName s
 			slog.String("secret", s.Name), slog.String("namespace", nsName))
 		return false, nil
 	}
-	// Preconditioned on the Secret's own UID. Under the poll loop the gap between
-	// the existence proof and this call was microseconds and single-threaded; under
-	// a watch it is event latency plus a requeue, so a delete decided in one
-	// reconcile can otherwise land on a Secret a later one has already recreated --
-	// deregistering a cluster that is genuinely live.
+	// Preconditioned on the Secret's own UID: under a watch the gap between the
+	// existence proof and this call is event latency plus a requeue, so a delete
+	// decided in one reconcile could land on a Secret a later one recreated.
 	err := r.client.CoreV1().Secrets(r.cfg.TargetNamespace).Delete(ctx, s.Name, metaV1.DeleteOptions{
 		Preconditions: &metaV1.Preconditions{UID: &s.UID},
 	})
@@ -1685,15 +1782,13 @@ func (r *Registrar) deleteOrphan(ctx context.Context, s *coreV1.Secret, nsName s
 		// Already gone, by whatever hand.
 		return true, nil
 	case apiErrors.IsConflict(err):
-		// The Secret was replaced between the read and the delete, so it is no
-		// longer the object the proof was about. Leave it; the next reconcile sees
-		// the new one and decides again.
+		// Replaced between the read and the delete, so no longer the object the
+		// proof was about. The next reconcile decides again.
 		r.log.Info("cluster secret changed identity before deletion; leaving it",
 			slog.String("secret", s.Name), slog.String("namespace", nsName))
 		return false, nil
 	default:
-		// Keep going. One Secret held up by a finalizer or an admission webhook
-		// must not stall collection for the rest.
+		// One Secret held up by a finalizer must not stall the rest.
 		return false, fmt.Errorf("delete %s: %w", s.Name, err)
 	}
 }

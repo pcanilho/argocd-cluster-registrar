@@ -1,0 +1,136 @@
+{{- if .Values.admissionPolicy.enabled }}
+{{- if and (not .Values.admissionPolicy.authorizedGroups) (not .Values.admissionPolicy.authorizedUsers) }}
+{{- fail "admissionPolicy.enabled requires authorizedGroups or authorizedUsers. With neither, nothing may set the ownership label and every namespace carrying it is refused." }}
+{{- end }}
+{{- $managedBy := printf "%smanaged-by" .Values.labelPrefix }}
+{{- $cluster := printf "%scluster" .Values.labelPrefix }}
+{{- /*
+  The two labels below are policy input, not decoration: together they decide
+  whether a cluster is registered and what name it takes in argocd, where writing
+  a cluster Secret is an administrative act. Kubernetes does not gate a label key
+  on its own -- RBAC grants verbs on resources -- so this is the enforcement
+  point, and without it whoever can CREATE a namespace sets its labels freely.
+
+  Ships as Warn+Audit. Flip validationActions on the BINDING once the audit log
+  is quiet; the policies need no edit for that.
+*/}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "app.fullname" . }}-managed-by
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  failurePolicy: {{ .Values.admissionPolicy.failurePolicy }}
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        {{- /*
+          CREATE is mandatory. `apply --server-side` against a namespace that
+          does not exist yet reaches admission as CREATE through the PATCH
+          endpoint, so a policy listing only UPDATE lets every server-side-applied
+          namespace through carrying any label it likes.
+        */}}
+        operations: ["CREATE", "UPDATE"]
+        resources: ["namespaces"]
+        scope: "Cluster"
+  variables:
+    - name: newValue
+      expression: >-
+        has(object.metadata.labels) && {{ $managedBy | quote }} in object.metadata.labels
+        ? object.metadata.labels[{{ $managedBy | quote }}]
+        : ""
+    {{- /*
+      `oldObject != null` is also how CREATE is detected. `has(oldObject)` is
+      invalid CEL -- has() works on fields, not on root bindings -- and is the
+      most commonly copied mistake in VAP examples.
+    */}}
+    - name: oldValue
+      expression: >-
+        oldObject != null && has(oldObject.metadata.labels)
+        && {{ $managedBy | quote }} in oldObject.metadata.labels
+        ? oldObject.metadata.labels[{{ $managedBy | quote }}]
+        : ""
+    - name: labelChanged
+      expression: variables.newValue != variables.oldValue
+    {{- /*
+      A literal group and user match. The authorizer library offers a neater
+      indirection -- grant a verb on a resource nothing serves, and onboarding
+      becomes a ClusterRoleBinding -- but its method chain could not be verified
+      here, and an unverified expression is not what a security control should
+      ship. See values.yaml.
+    */}}
+    - name: mayManage
+      expression: >-
+        request.userInfo.groups.exists(g, g in [
+          {{- range $i, $g := .Values.admissionPolicy.authorizedGroups }}{{ if $i }}, {{ end }}{{ $g | quote }}{{ end -}}
+        ]) || request.userInfo.username in [
+          {{- range $i, $u := .Values.admissionPolicy.authorizedUsers }}{{ if $i }}, {{ end }}{{ $u | quote }}{{ end -}}
+        ]
+  validations:
+    - expression: '!variables.labelChanged || variables.mayManage'
+      reason: Forbidden
+      {{- /* authorizer is not bound in messageExpression; do not reference mayManage here. */}}
+      messageExpression: >-
+        "user '" + request.userInfo.username
+        + "' may not set {{ $managedBy }} on namespace '"
+        + object.metadata.name + "'"
+---
+{{- /*
+  matchResources is deliberately absent. For Namespace objects a binding's
+  namespaceSelector matches the incoming object's own labels, so scoping the
+  binding that way lets a user evade it by omitting the label.
+*/}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "app.fullname" . }}-managed-by
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "app.fullname" . }}-managed-by
+  validationActions: {{ toJson .Values.admissionPolicy.validationActions }}
+{{- if .Values.admissionPolicy.clusterNameMustMatchNamespace }}
+---
+{{- /*
+  A second, independent policy. Kept separate because a matchCondition that
+  evaluates false skips the whole policy it belongs to, so folding an exemption
+  into one policy would silently disable the other check too.
+*/}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "app.fullname" . }}-cluster-name
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  failurePolicy: {{ .Values.admissionPolicy.failurePolicy }}
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["namespaces"]
+        scope: "Cluster"
+  matchConditions:
+    - name: has-cluster-label
+      expression: >-
+        has(object.metadata.labels) && {{ $cluster | quote }} in object.metadata.labels
+  validations:
+    - expression: object.metadata.labels[{{ $cluster | quote }}] == object.metadata.name
+      reason: Invalid
+      messageExpression: >-
+        "label {{ $cluster }} must equal the namespace name '" + object.metadata.name + "'"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "app.fullname" . }}-cluster-name
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "app.fullname" . }}-cluster-name
+  validationActions: {{ toJson .Values.admissionPolicy.validationActions }}
+{{- end }}
+{{- end }}
