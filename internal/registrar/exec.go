@@ -122,6 +122,13 @@ func execFlag(args []string, names ...string) (string, bool) {
 	return "", false
 }
 
+// identityFlags name the principal to authenticate as. Separated only so the
+// refusal can explain itself: these are declined by policy, the rest because
+// argocd-k8s-auth has nowhere to put them.
+var identityFlags = map[string]bool{
+	"-r": true, "--role": true, "--role-arn": true, "--profile": true,
+}
+
 // refuseUnsupportedArgs rejects anything outside the allowlist rather than
 // dropping it. Silently dropping an --external-id turns a working AssumeRole
 // into AccessDenied with no clue why.
@@ -143,9 +150,20 @@ func refuseUnsupportedArgs(args, allowed []string, cmd string) error {
 			}
 			continue
 		}
+		// Two different refusals. The identity flags are a policy choice, since
+		// argocd-k8s-auth does accept them and awsAuthConfig has fields for both;
+		// saying they are unsupported would send the reader after the wrong fix.
+		// Everything else really is outside what it accepts.
+		if identityFlags[name] {
+			return fmt.Errorf(
+				"kubeconfig exec passes %q to %s, which this tool will not forward: it names "+
+					"the identity to authenticate as, and the source namespace does not get to "+
+					"choose the one ArgoCD presents. Grant ArgoCD's own principal access to the "+
+					"cluster instead", name, cmd)
+		}
 		return fmt.Errorf(
-			"kubeconfig exec passes %q to %s, which %s does not accept; dropping it "+
-				"would change which identity the token is minted for, so this refuses instead",
+			"kubeconfig exec passes %q to %s, which %s does not accept; dropping it would "+
+				"change which identity the token is minted for, so this refuses instead",
 			name, cmd, argoAuthCommand)
 	}
 	return nil

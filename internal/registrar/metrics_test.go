@@ -194,10 +194,10 @@ func TestDemotedRegistrationsAreCounted(t *testing.T) {
 	if got := registrationsIn(t, stateActive); got != 1 {
 		t.Errorf("registrations{state=active} = %v, want 1", got)
 	}
-	// These fixtures carry no certData, so they must land in `none` rather than
-	// be quietly counted as healthy.
-	if got := testutil.ToFloat64(registrations.WithLabelValues(stateActive, expiryNone)); got != 1 {
-		t.Errorf("registrations{state=active,credential_expiry=none} = %v, want 1", got)
+	// These fixtures carry no certData and no exec config, so they must land in
+	// `token` rather than be quietly counted as healthy.
+	if got := testutil.ToFloat64(registrations.WithLabelValues(stateActive, expiryToken)); got != 1 {
+		t.Errorf("registrations{state=active,credential_expiry=token} = %v, want 1", got)
 	}
 	if got := testutil.ToFloat64(registrations.WithLabelValues(stateActive, expiryOK)); got != 0 {
 		t.Errorf("a registration with no certificate was counted as ok")

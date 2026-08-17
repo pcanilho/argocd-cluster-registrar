@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v3"
 	coreV1 "k8s.io/api/core/v1"
 	apiErrors "k8s.io/apimachinery/pkg/api/errors"
 	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -669,8 +670,8 @@ func (r *Registrar) AuditUnrouted(ctx context.Context) error {
 	// place that sees what ArgoCD is actually holding, which is what the expiry
 	// buckets need -- the source kubeconfig may have moved on.
 	//
-	// Recomputed from the full population every pass, so it self-clears; the
-	// per-conflict gauge PLAN.md rules out could not.
+	// Recomputed from the full population every pass, so it self-clears, which a
+	// per-conflict gauge could not.
 	counts := map[[2]string]int{}
 	var unrouted int
 	now := time.Now()
@@ -877,7 +878,7 @@ func (r *Registrar) discoverOne(ctx context.Context, ns *coreV1.Namespace) (chil
 	// and cannot see the other claimant. apply() settles it, and not before it
 	// succeeds, so a namespace with no usable kubeconfig cannot poison a healthy
 	// one claiming the same name.
-	candidates, err := r.findKubeconfigCandidates(ctx, ns.Name)
+	candidates, shadowed, err := r.findKubeconfigCandidates(ctx, ns.Name)
 	if err != nil {
 		var apiErr *apiFailure
 		if errors.As(err, &apiErr) {
@@ -939,6 +940,20 @@ func (r *Registrar) discoverOne(ctx context.Context, ns *coreV1.Namespace) (chil
 				slog.String("namespace", ns.Name), slog.String("cluster", name),
 				slog.String("secret", c.secret.Name), slog.String("command", pk.execCommand))
 		}
+		// Warn, not Debug: the winner parses cleanly, so nothing else reports it
+		// and the registration looks healthy until its token runs out. The winner
+		// is excluded because an earlier candidate failing to parse can leave it
+		// listed on both sides, which reads as nonsense.
+		if r.cfg.ExecCredentials && !c.allowExec {
+			if over := without(shadowed, c.secret.Name); len(over) > 0 {
+				r.log.Warn("registered from a shape that cannot carry an exec credential "+
+					"while one that can was also present; declare the managed provider "+
+					"before the generic one",
+					slog.String("namespace", ns.Name), slog.String("cluster", name),
+					slog.String("using", c.secret.Name), slog.String("provider", c.provider),
+					slog.Any("passedOver", over))
+			}
+		}
 		break
 	}
 	if provider == "" {
@@ -986,10 +1001,12 @@ type candidate struct {
 // under the same glob and key, and Kamaji writes `admin.conf` and `admin.svc`
 // side by side. A parse failure is how an unusable candidate announces itself,
 // and the caller falls through to the next.
-func (r *Registrar) findKubeconfigCandidates(ctx context.Context, ns string) ([]candidate, error) {
+// Also reports the Secrets an exec-capable provider matched but an earlier one
+// had already claimed, which is what a misordered provider list looks like.
+func (r *Registrar) findKubeconfigCandidates(ctx context.Context, ns string) ([]candidate, []string, error) {
 	secrets, err := r.client.CoreV1().Secrets(ns).List(ctx, metaV1.ListOptions{})
 	if err != nil {
-		return nil, &apiFailure{fmt.Errorf("list secrets: %w", err)}
+		return nil, nil, &apiFailure{fmt.Errorf("list secrets: %w", err)}
 	}
 
 	// Deterministic order so repeated passes pick the same Secret when several
@@ -1003,8 +1020,9 @@ func (r *Registrar) findKubeconfigCandidates(ctx context.Context, ns string) ([]
 	})
 
 	var out []candidate
-	var namedButKeyless []string
+	var namedButKeyless, shadowed []string
 	claimed := map[string]bool{}
+	seenShadowed := map[string]bool{}
 
 	for _, p := range r.cfg.Providers {
 		// Most provisioner-written first. Sorted per provider because the expected
@@ -1015,7 +1033,7 @@ func (r *Registrar) findKubeconfigCandidates(ctx context.Context, ns string) ([]
 			if err != nil {
 				// A permanent configuration fault, not a transient one. Validate()
 				// checks every pattern up front so this should be unreachable.
-				return nil, &apiFailure{fmt.Errorf("provider %q: bad secret name pattern %q: %w",
+				return nil, nil, &apiFailure{fmt.Errorf("provider %q: bad secret name pattern %q: %w",
 					p.Name, p.SecretNamePattern, err)}
 			}
 			if ok {
@@ -1032,6 +1050,17 @@ func (r *Registrar) findKubeconfigCandidates(ctx context.Context, ns string) ([]
 			// The patterns overlap by design, and a duplicate entry would only
 			// produce the same registration.
 			if claimed[s.Name] {
+				// Except when the loser is the exec-capable one: `*-kubeconfig`
+				// matches `<c>-user-kubeconfig` too, so declaring capi first takes
+				// both of CAPA's Secrets and capa-eks never gets a candidate.
+				//
+				// Recorded only when this provider could actually have used the
+				// Secret and it really carries an exec block, or the warning fires
+				// forever on a namespace with nothing to fix.
+				if p.AllowExec && !seenShadowed[s.Name] && carriesExec(s, p.SecretKeys) {
+					seenShadowed[s.Name] = true
+					shadowed = append(shadowed, s.Name)
+				}
 				continue
 			}
 
@@ -1062,15 +1091,47 @@ func (r *Registrar) findKubeconfigCandidates(ctx context.Context, ns string) ([]
 	}
 
 	if len(out) > 0 {
-		return out, nil
+		return out, shadowed, nil
 	}
 	// Only when nothing matched at all: with overlapping patterns a keyless
 	// near-miss is routine and reporting it on a successful pass is noise.
 	if len(namedButKeyless) > 0 {
-		return nil, fmt.Errorf("secret(s) %v matched a provider pattern but carried none of its keys",
+		return nil, nil, fmt.Errorf("secret(s) %v matched a provider pattern but carried none of its keys",
 			namedButKeyless)
 	}
-	return nil, fmt.Errorf("no secret matching any configured provider")
+	return nil, nil, fmt.Errorf("no secret matching any configured provider")
+}
+
+// without returns in minus the given name.
+func without(in []string, name string) []string {
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if v != name {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// carriesExec reports whether any of keys holds a kubeconfig with an exec block,
+// which is what makes passing the Secret over worth a warning.
+func carriesExec(s *coreV1.Secret, keys []string) bool {
+	for _, k := range keys {
+		raw, has := s.Data[k]
+		if !has {
+			continue
+		}
+		var kc kubeconfig
+		if err := yaml.Unmarshal(raw, &kc); err != nil {
+			continue
+		}
+		for i := range kc.Users {
+			if kc.Users[i].User.Exec != nil {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // propagatedLabels copies the prefixed labels the ApplicationSet selects on,
@@ -1079,52 +1140,74 @@ func (r *Registrar) findKubeconfigCandidates(ctx context.Context, ns string) ([]
 // apply() copies it over the labels it just computed, so anything not excluded
 // can be spoofed.
 func propagatedLabels(in map[string]string, prefix string) map[string]string {
-	out, _ := propagate(in, prefix, 0)
+	out, _ := propagate(in, prefix, propagateLimits{})
 	return out
 }
 
 // propagatedAnnotations is the same for annotations, which the ApplicationSet
-// cluster generator exposes as {{metadata.annotations.<key>}} exactly as it does
-// labels. Worth having because an annotation has neither the 63-byte cap nor the
-// charset a label value is held to, so a URL or a list can reach a template.
-//
-// Bounded, unlike labels, which the apiserver bounds for us. Annotations allow
-// 256KB per object and every registration is held in ArgoCD's cluster informer,
-// so without a cap the source namespace picks ArgoCD's memory footprint.
+// cluster generator exposes as {{metadata.annotations.<key>}}. Worth having
+// because an annotation has neither the 63-byte cap nor the charset a label
+// value is held to, so a URL or a list can reach a template.
 func (r *Registrar) propagatedAnnotations(in map[string]string, ns string) map[string]string {
-	out, dropped := propagate(in, r.cfg.LabelPrefix, maxPropagatedAnnotationBytes)
+	out, dropped := propagate(in, r.cfg.LabelPrefix, annotationLimits)
 	for _, k := range dropped {
-		r.log.Warn("annotation is too large to propagate; skipping it",
+		r.log.Warn("annotation not propagated; it is over a size or count limit",
 			slog.String("namespace", ns), slog.String("annotation", k),
-			slog.Int("limit", maxPropagatedAnnotationBytes))
+			slog.Int("maxBytes", annotationLimits.value),
+			slog.Int("maxTotalBytes", annotationLimits.total),
+			slog.Int("maxKeys", annotationLimits.count))
 	}
 	return out
 }
 
-// maxPropagatedAnnotationBytes bounds one propagated annotation value.
-const maxPropagatedAnnotationBytes = 4096
+// annotationLimits bounds the propagated annotation set. Labels need none: the
+// apiserver bounds those for us. Annotations it allows 256KB of per object, and
+// apply() merges onto ArgoCD's own keys, so an unbounded set lets a tenant push
+// its own registration past that ceiling and fail every later Update, the
+// credential refresh included. Every registration also sits in ArgoCD's cluster
+// informer, so without a cap the source namespace picks ArgoCD's memory
+// footprint as well.
+var annotationLimits = propagateLimits{value: 4096, total: 32768, count: 32}
 
-// propagate copies prefixed keys minus the reserved ones. A limit of 0 means
-// unbounded; anything over it is returned in `dropped` rather than truncated,
-// since a truncated URL is a working-looking wrong answer.
-func propagate(in map[string]string, prefix string, limit int) (out map[string]string, dropped []string) {
+// propagateLimits bounds one propagated set. Zero is unbounded.
+type propagateLimits struct {
+	value int // bytes in one value
+	total int // bytes across all values
+	count int // number of keys
+}
+
+// propagate copies prefixed keys minus the reserved ones. Anything over a limit
+// is returned in `dropped` rather than truncated, since a truncated URL is a
+// working-looking wrong answer. Admitted in sorted order, so the same set
+// survives every pass rather than flapping with map iteration.
+func propagate(in map[string]string, prefix string, lim propagateLimits) (out map[string]string, dropped []string) {
 	reserved := map[string]bool{}
 	for _, suffix := range reservedSuffixes {
 		reserved[prefix+suffix] = true
 	}
 
-	out = map[string]string{}
-	for k, v := range in {
-		if !strings.HasPrefix(k, prefix) || reserved[k] {
-			continue
+	keys := make([]string, 0, len(in))
+	for k := range in {
+		if strings.HasPrefix(k, prefix) && !reserved[k] {
+			keys = append(keys, k)
 		}
-		if limit > 0 && len(v) > limit {
+	}
+	sort.Strings(keys)
+
+	out = map[string]string{}
+	total := 0
+	for _, k := range keys {
+		v := in[k]
+		switch {
+		case lim.value > 0 && len(v) > lim.value,
+			lim.count > 0 && len(out) >= lim.count,
+			lim.total > 0 && total+len(v) > lim.total:
 			dropped = append(dropped, k)
 			continue
 		}
 		out[k] = v
+		total += len(v)
 	}
-	sort.Strings(dropped)
 	return out, dropped
 }
 
@@ -1378,7 +1461,13 @@ func (r *Registrar) apply(ctx context.Context, c child) error {
 	}
 	// Only when the address actually moves. Checking every update would cost a LIST
 	// of the ArgoCD namespace on every reconcile, for a value that rarely changes.
-	if was := string(existing.Data["server"]); was != c.server {
+	//
+	// Normalised on both sides, because 0.5.x stored the address as written: an
+	// upgrade that only trims a trailing slash is not a move, and a refusal here
+	// returns before the Update, leaving the untrimmed value to refuse again on
+	// every later pass while the credential stops being refreshed.
+	was := string(existing.Data["server"])
+	if strings.TrimRight(was, "/") != c.server {
 		if err := r.claimServer(ctx, c); err != nil {
 			return err
 		}

@@ -79,6 +79,23 @@ helm upgrade <release_name> --install \
   -n <namespace> --create-namespace
 ```
 
+### Verifying the image
+
+Images are signed keyless with cosign, through GitHub Actions OIDC.
+
+```bash
+cosign verify ghcr.io/pcanilho/argocd-cluster-registrar:<tag> \
+  --certificate-identity-regexp '^https://github\.com/pcanilho/argocd-cluster-registrar/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+**From 0.6.0 this needs cosign v3.** Releases up to 0.5.0 were signed with cosign
+v2, which writes the signature to a `.sig` tag; 0.6.0 onwards uses cosign v3,
+whose default is the protobuf bundle stored as an OCI 1.1 referring artifact. A
+cosign v2 client will not find a 0.6.0 signature and will report the image as
+unsigned rather than as failing verification, so check your client version before
+concluding anything.
+
 ## Configuring
 
 ### Values
@@ -171,6 +188,18 @@ is the loosest shipped. Within one `Secret`, every declared key that is present 
 tried in turn and the first that parses wins, so an unusable key falls through to
 the next instead of stranding the namespace.
 
+Within one provider, candidates are ordered by **provenance** before name: a
+`Secret` whose type matches the one the provisioner stamps scores highest, then
+one carrying a controller `ownerReference`, then name order as before. Only
+`capi`, `capa-eks` and `capz-aks` match on type, and neither signal is beyond a
+tenant who can write `Secret`s in the namespace, so treat this as tie-breaking
+rather than as a security control. It does mean that where a namespace holds
+several matching `Secret`s, which one wins can differ from 0.5.x.
+
+With `execCredentials` on, passing over a `Secret` that does carry an exec block
+in favour of one that cannot is logged at Warn, naming what was skipped. That is
+almost always a `providers` list with the generic entry declared first.
+
 **Kamaji** normally writes both `admin.conf` and `admin.svc`, and both normally
 parse, so `admin.conf` wins on order and `admin.svc` is reached only when the
 first is unusable. Declare `admin.svc` first in a custom entry to prefer the
@@ -190,9 +219,12 @@ past 15 minutes and it silently breaks.
 
 The exec one is translated into ArgoCD's own `awsAuthConfig` or
 `execProviderConfig`, which has no such clock, because ArgoCD mints the
-credential per connection. **Declare the managed preset first**, or
-`<cluster>-kubeconfig` sorts ahead of `<cluster>-user-kubeconfig` and the
-expiring token wins anyway.
+credential per connection. **Declare the managed preset first.** For `capa-eks`
+this is load-bearing rather than a preference: `capi`'s `*-kubeconfig` glob also
+matches `<cluster>-user-kubeconfig`, so declaring `capi` first claims *both* of
+CAPA's Secrets and the exec-bearing one never becomes a candidate at all. That
+case is logged at Warn. `capz-aks` uses `*-kubeconfig-user`, which `capi` does
+not match, so there only precedence is at stake.
 
 ```yaml
 execCredentials: true
@@ -224,6 +256,42 @@ providers:
 > `aws eks get-token` and `kubelogin` are refused rather than guessed at. GKE is
 > not translated: `argocd-k8s-auth gcp` returns a token bound to no cluster and no
 > audience.
+
+Because ArgoCD authenticates as itself, the rest is configuration on ArgoCD that
+this tool cannot do for you. Nothing below is optional, and a registration will
+sit `Unknown` until it is in place.
+
+**EKS.** Give `argocd-application-controller` and `argocd-server` an IRSA or Pod
+Identity role, trusted by the management cluster's OIDC provider. Then authorize
+that role on every child cluster, either as an EKS access entry or an `aws-auth`
+mapping. Role assumption is deliberately not forwarded: ArgoCD's `awsAuthConfig`
+does have `roleARN` and `profile` fields, but this tool emits neither, because a
+role named by the source kubeconfig would let a namespace choose which role
+ArgoCD assumes. Authorize the ArgoCD principal on each cluster directly.
+
+Region handling depends on the source kubeconfig, and it is worth knowing which
+shape you get. With no `--region` in the exec block -- which is what CAPA writes
+-- an `awsAuthConfig` is emitted and `argocd-k8s-auth aws` resolves the region
+from the ArgoCD pod's own environment, so that environment must supply one. With
+a `--region`, an `execProviderConfig` carrying `AWS_REGION` is emitted instead and
+the pod environment is not consulted. Whether one region's STS endpoint is
+accepted for a cluster in another has not been verified here, so if you span
+regions, set `--region` per cluster in the source kubeconfig rather than relying
+on a single ambient value.
+
+**AKS.** Label the ArgoCD pods `azure.workload.identity/use: "true"`, set
+`AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_FEDERATED_TOKEN_FILE`, and create
+a federated credential per ArgoCD ServiceAccount. Grant the app registration
+*Azure Kubernetes Service Cluster User Role* on each cluster plus a
+`ClusterRoleBinding` inside it for the object ID. `argocd-k8s-auth azure` defaults
+to workload identity on current ArgoCD; older builds fall back to `devicecode`,
+which cannot work in a pod, so check yours before relying on this.
+
+Both preset shapes are **assumed**, not tested: the translation is unit-tested
+against the kubeconfigs CAPA and CAPZ generate, but no registration produced this
+way has been run against a real EKS or AKS cluster. What is unverified is the
+runtime -- whether the emitted config authenticates from a real ArgoCD pod -- not
+the shapes. Pilot one cluster before the fleet.
 
 **vcluster** exports a kubeconfig pointing at `https://localhost:8443`, which is
 fine for a port-forward and useless to ArgoCD. This is the most common reason a
@@ -316,7 +384,8 @@ Prefixed **annotations** are copied the same way, with the same exclusions. The
 cluster generator exposes them as `{{metadata.annotations.<key>}}`, so they reach
 a template exactly as labels do. Use them for anything a label value cannot hold:
 a URL, a comma-separated list, anything over 63 bytes or containing `/` or `:`.
-Values over 4KiB are skipped and logged. Note the generator's `selector` matches
+Values over 4KiB are skipped and logged, as is anything past 32KiB in total or 32
+keys; nothing is truncated. Note the generator's `selector` matches
 labels only, so **labels select, annotations configure**.
 
 Propagation runs both ways: remove a prefixed key from the namespace and it is
@@ -435,15 +504,21 @@ instance's own decisions:
 Aggregate the two gauges across replicas (`sum by`, `max by`). They are set only
 by the reconcile that audits, so a leader-election standby serves them as zero for
 as long as it stands by, and a bare threshold or an `avg` quietly stops firing.
+Wrap `registrations` in `sum()` for the same reason: every bucket is published,
+most of them at zero, so a bare `>` selector compares per bucket and a bare `<`
+one fires against the empty ones.
 
 `state` is `active` or `demoted`. `credential_expiry` is one of `expired`,
-`lt_24h`, `lt_7d`, `lt_30d`, `ok`, `none`, `absent` or `unreadable`, read from the
-client certificate in the registration ArgoCD is actually holding. `none` means
-there is no certificate to read, which is every bearer-token cluster:
-**unmeasured, not healthy**. `absent` is a registration with no config at all,
-and `unreadable` one whose config or certificate will not decode: the first is
-not yet written, the second is broken. Sum across the buckets to recover the
-plain count.
+`lt_24h`, `lt_7d`, `lt_30d`, `ok`, `token`, `exec`, `absent` or `unreadable`,
+read from the client certificate in the registration ArgoCD is actually holding.
+`token` is a bearer-token cluster, with no certificate to read: **unmeasured, not
+healthy**. `exec` is a translated credential, which ArgoCD mints per connection,
+so there is genuinely nothing to expire -- and it doubles as the one fleet-wide
+check that translation ran, since a cluster you expected in `exec` sitting in
+`token` is a misordered `providers` list. `absent` is a registration with no
+config at all, and `unreadable` one whose config or certificate will not decode:
+the first is not yet written, the second is broken. Sum across the buckets to
+recover the plain count.
 
 This matters because `interval` only bounds how stale a credential can get; it
 does not tell you when one is about to run out. CAPI and kubeadm issue client
@@ -503,7 +578,10 @@ namespaces is a different situation.
 
 Incumbency stops a registration being taken. It cannot stop someone who can label
 a namespace from registering a cluster under any *free* name, and no collision
-rule could: the label is the authorization.
+rule could: the label is the authorization. A server address is claimed the same
+way, first come: nothing here connects to the address before registering it, so
+whoever registers an address first holds it, and a later claimant on the real
+cluster is refused.
 
 If you cannot vouch for who sets these labels, constrain them where they are
 written. The chart ships the policy, off by default:
@@ -519,15 +597,31 @@ admissionPolicy:
   clusterNameMustMatchNamespace: true
 ```
 
-Needs Kubernetes 1.30 or later. It ships as `Warn` and `Audit` so you can watch
-the audit log before switching `validationActions` to `Deny`; the policies
-themselves need no edit for that. Enabling it with an empty allowlist fails the
-render rather than refusing every namespace in the cluster.
+Needs Kubernetes 1.30 or later, where `ValidatingAdmissionPolicy` reached `v1`.
+The chart checks and fails the render below that, because the alternative is
+`helm upgrade` failing the whole release on "no matches for kind" and taking the
+deployment with it. It ships as `Warn` and `Audit` so you can watch the audit log
+before switching `validationActions` to `Deny`; the policies themselves need no
+edit for that. Enabling it with an empty allowlist fails the render rather than
+refusing every namespace in the cluster.
 
-Two limits worth knowing. Existing namespaces are not re-checked, since admission
-only sees writes, so audit those separately. And a policy cannot protect its own
+> [!WARNING]
+> **`authorizedUsers` is transitive.** The policy matches on the requesting
+> username, so listing a controller grants it the label on every namespace it
+> creates. A self-service provisioner that creates namespaces with labels its
+> callers supply therefore hands the label to every one of those callers, and the
+> policy stops meaning anything. If a controller must be listed, give it a
+> narrower path for the label rather than the one it uses for tenant requests.
+
+Three further limits. Existing namespaces are not re-checked, since admission
+only sees writes, so audit those separately. A policy cannot protect its own
 binding from deletion, which is a property of admission policy rather than of
-this chart.
+this chart. And it constrains `<prefix>managed-by`, plus optionally
+`<prefix>cluster` -- **not** the other prefixed labels, which propagate as
+written and are what an ApplicationSet actually selects on. A namespace that is
+legitimately entitled to register can still label itself into any selector you
+have written. Scope those selectors to values a tenant cannot set, or template a
+policy of your own over the keys you select on.
 
 ### Changing `managedBy` or `labelPrefix` later
 

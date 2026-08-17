@@ -8,7 +8,10 @@ targetNamespace: argocd
 #
 # Annotations carry what a label value cannot: a URL, a list, anything over 63
 # bytes. The ApplicationSet cluster generator exposes both, but selects on labels
-# only. Values over 4KiB are skipped.
+# only. Bounded, since the source namespace is tenant-controlled and the cluster
+# Secret has to stay under the apiserver's 256KB annotation ceiling: 4KiB per
+# value, 32KiB in total, 32 keys. Anything over is skipped and logged, never
+# truncated.
 labelPrefix: argocd-cluster-registrar/
 
 # Value of the `<labelPrefix>managed-by` label that identifies both the namespaces
@@ -61,7 +64,7 @@ managedBy: cluster-registrar
 # about 15 minutes, the other an exec credential that gets translated into
 # ArgoCD's own argocd-k8s-auth configuration and does not expire that way.
 #
-# empty BY DEFAULT, and that is load-bearing rather than an oversight. Helm
+# Empty by default, and that is load-bearing rather than an oversight. Helm
 # coalesces chart defaults into every user's values, so a non-empty default here
 # would be indistinguishable from a deliberate setting: a 0.2.x values file that
 # sets only `secretNamePattern`/`secretKey` and never mentions `providers` would
@@ -204,8 +207,16 @@ affinity: {}
 #
 # This is the enforcement point the README's security section describes. The
 # labels are policy input, not decoration, and Kubernetes cannot gate a label key
-# through RBAC alone: whoever can CREATE a namespace sets its labels at creation.
-# Needs Kubernetes 1.30 or later, where ValidatingAdmissionPolicy went GA.
+# through RBAC alone: whoever can create a namespace sets its labels at creation.
+#
+# Needs Kubernetes 1.30 or later, where ValidatingAdmissionPolicy reached v1. The
+# chart checks and fails the render below that: leaving it to the apiserver means
+# helm failing the whole release on "no matches for kind", deployment included.
+#
+# The check reads Helm's KubeVersion, which is a default when there is no cluster
+# to ask and tracks the Helm release. Rendering offline under Helm 3.14 or older
+# therefore refuses this policy whatever your cluster runs; use Helm 3.15+ or
+# pass --kube-version. install, upgrade and ArgoCD all discover the real version.
 admissionPolicy:
   enabled: false
 
@@ -229,6 +240,17 @@ admissionPolicy:
   # Remember a controller-created namespace authenticates as its ServiceAccount,
   # never as the human who merged the change, so any controller that labels
   # namespaces needs listing here.
+  #
+  # Listing one is transitive, and that is the mistake worth avoiding: the policy
+  # matches on username, so a controller listed here may set the label on every
+  # namespace it creates. A self-service provisioner that passes caller-supplied
+  # labels through therefore hands the label to everyone it serves and the policy
+  # stops meaning anything. Give such a controller a narrower path for the label
+  # instead of listing the one it uses for tenant requests.
+  #
+  # Note this constrains <labelPrefix>managed-by, and optionally
+  # <labelPrefix>cluster below. The other prefixed labels propagate as written,
+  # and those are what an ApplicationSet selects on.
   #
   # Kubernetes' authorizer CEL library allows a neater indirection -- grant a verb
   # on a resource nothing serves, and onboarding becomes a ClusterRoleBinding

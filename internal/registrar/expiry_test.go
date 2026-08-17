@@ -88,11 +88,35 @@ func TestBearerTokenIsUnmeasuredNotHealthy(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 	got, _, dated := credentialExpiry(blob, time.Now())
-	if got != expiryNone {
-		t.Errorf("bucket = %q, want %q", got, expiryNone)
+	if got != expiryToken {
+		t.Errorf("bucket = %q, want %q", got, expiryToken)
 	}
 	if dated {
 		t.Error("a token registration claimed to carry a date")
+	}
+}
+
+// A translated exec credential also has no certificate, but it means the
+// opposite of a token: ArgoCD mints one per connection, so nothing expires.
+// Sharing a bucket with tokens made a misordered provider list invisible.
+func TestTranslatedExecIsItsOwnBucket(t *testing.T) {
+	for name, cfg := range map[string]argoClusterConfig{
+		"awsAuthConfig":      {AWSAuthConfig: &argoAWSAuthConfig{ClusterName: "c"}},
+		"execProviderConfig": {ExecProviderConfig: &argoExecProviderConfig{Command: argoAuthCommand}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			blob, err := json.Marshal(cfg)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			got, _, dated := credentialExpiry(blob, time.Now())
+			if got != expiryExec {
+				t.Errorf("bucket = %q, want %q", got, expiryExec)
+			}
+			if dated {
+				t.Error("an exec registration claimed to carry a date")
+			}
+		})
 	}
 }
 

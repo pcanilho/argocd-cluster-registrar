@@ -26,7 +26,7 @@ var (
 	// Set from the audit pass, which already lists every owned Secret.
 	registrations = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "argocd_cluster_registrar_registrations",
-		Help: "Cluster registrations this instance owns, by state.",
+		Help: "Cluster registrations this instance owns, by state and remaining credential lifetime.",
 	}, []string{"state", "credential_expiry"})
 
 	unroutedSecrets = prometheus.NewGauge(prometheus.GaugeOpts{
@@ -50,10 +50,12 @@ const (
 	expiryLt7d    = "lt_7d"
 	expiryLt30d   = "lt_30d"
 	expiryOK      = "ok"
-	// expiryNone is a registration with no client certificate to read: a bearer
-	// token, which carries no expiry we can see. Present so the metric cannot lie
-	// by omission -- these are not healthy, they are unmeasured.
-	expiryNone = "none"
+	// expiryToken is a bearer token: no certificate to read, so unmeasured rather
+	// than healthy.
+	expiryToken = "token"
+	// expiryExec is a translated exec credential, minted per connection, so there
+	// is nothing to expire. Also the only signal that translation ran.
+	expiryExec = "exec"
 	// expiryUnreadable is a certificate or config blob that will not decode.
 	expiryUnreadable = "unreadable"
 	// expiryAbsent is a registration with no config at all. Nothing is broken.
@@ -62,7 +64,7 @@ const (
 
 var expiryBuckets = []string{
 	expiryExpired, expiryLt24h, expiryLt7d, expiryLt30d,
-	expiryOK, expiryNone, expiryUnreadable, expiryAbsent,
+	expiryOK, expiryToken, expiryExec, expiryUnreadable, expiryAbsent,
 }
 
 // conflictReasons is every value the reason label can take. One list, so that

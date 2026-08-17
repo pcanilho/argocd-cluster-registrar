@@ -116,6 +116,15 @@ jobs:
           # The chart-version guard compares against the latest tag.
           fetch-depth: 0
 
+      # Pinned because the admission policy's version guard reads Helm's
+      # KubeVersion, which is a per-release default when no cluster is reachable
+      # (3.14 reports 1.29, 3.15 reports 1.30). Whichever helm the runner image
+      # happens to ship would otherwise decide whether these renders pass.
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.18.4
+
       # Rendering with defaults is not enough. commonLabels and commonAnnotations
       # default to empty, so a template that only breaks when they are SET passed
       # lint for as long as nobody set them.
@@ -180,6 +189,27 @@ jobs:
             echo "::error::chart rendered 2 replicas without leader election"
             exit 1
           fi
+
+      # Below 1.30 the kind is only v1beta1, so an unguarded template fails the
+      # whole release on "no matches for kind" and takes the deployment with it.
+      - name: The admission policy refuses to render below Kubernetes 1.30
+        run: |
+          set -euo pipefail
+          chart=deploy/charts/argocd-cluster-registrar
+          args=(--set admissionPolicy.enabled=true --set 'admissionPolicy.authorizedGroups={x}')
+          # Matched on the message, not just on a non-zero exit: any unrelated
+          # template break would otherwise satisfy this while proving nothing.
+          if err=$(helm template t "$chart" "${args[@]}" --kube-version 1.29.0 2>&1); then
+            echo "::error::the admission policy rendered on 1.29"
+            exit 1
+          fi
+          if ! grep -q 'went GA in Kubernetes 1.30' <<<"$err"; then
+            echo "::error::the 1.29 render failed for the wrong reason"
+            printf '%s\n' "$err"
+            exit 1
+          fi
+          helm template t "$chart" "${args[@]}" --kube-version 1.30.0 >/dev/null || {
+            echo "::error::the admission policy did not render on 1.30"; exit 1; }
 
       # An admission policy that permits nobody would refuse every namespace
       # carrying the ownership label, which is a cluster-wide outage delivered by
@@ -578,7 +608,7 @@ jobs:
       - name: It can read Secrets but never watch them
         run: |
           set -euo pipefail
-          # not `head -1`: every namespace has a `default` ServiceAccount and it
+          # Not `head -1`: every namespace has a `default` ServiceAccount and it
           # sorts before ours, so that silently tested the wrong identity.
           name=$(kubectl get sa -n registrar -o name \
             | grep argocd-cluster-registrar | head -1 | cut -d/ -f2)
@@ -938,6 +968,17 @@ jobs:
           # Dropping the dimension must fail here, not silently retire the alert.
           if ! grep -q 'credential_expiry=' <<<"$active"; then
             echo "::error::the registrations gauge lost its credential_expiry dimension"
+            printf '%s\n' "$active"
+            exit 1
+          fi
+          # The fixtures carry a real certificate, so one must land in a dated
+          # bucket. Collapsing them all into `token` would retire the expiry alert
+          # while leaving the label in place.
+          dated=$(awk '/^argocd_cluster_registrar_registrations\{/ && /state="active"/ \
+            && /credential_expiry="(ok|lt_30d|lt_7d|lt_24h|expired)"/ \
+            && $2+0 > 0 {print}' /tmp/metrics.txt)
+          if [ -z "$dated" ]; then
+            echo "::error::no registration landed in a certificate-dated expiry bucket"
             printf '%s\n' "$active"
             exit 1
           fi

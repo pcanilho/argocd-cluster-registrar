@@ -29,11 +29,16 @@ func credentialExpiry(config []byte, now time.Time) (bucket string, notAfter tim
 	if err := json.Unmarshal(config, &cfg); err != nil {
 		return expiryUnreadable, time.Time{}, false
 	}
+	// Exec first, because ArgoCD prefers it over the TLS credentials when both are
+	// present. This tool never writes that shape, but a hand-edited Secret would
+	// otherwise be reported against a certificate ArgoCD does not use.
+	if cfg.AWSAuthConfig != nil || cfg.ExecProviderConfig != nil {
+		return expiryExec, time.Time{}, false
+	}
 	if cfg.TLSClientConfig.CertData == "" {
-		// A bearer token or an exec credential. Neither carries an expiry we can
-		// read, and a JWT `exp` is not one either: a legacy ServiceAccount token
-		// has none at all.
-		return expiryNone, time.Time{}, false
+		// A token has an expiry we cannot see, unlike exec which has none to have.
+		// A JWT `exp` would not help either: a legacy ServiceAccount token has none.
+		return expiryToken, time.Time{}, false
 	}
 
 	cert, err := parseCertificate(cfg.TLSClientConfig.CertData)

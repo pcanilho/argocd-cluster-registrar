@@ -5,21 +5,25 @@ All notable changes to **argocd-cluster-registrar** are documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.6.0] - 2026-08-14
+## [0.6.0] - 2026-08-17
 
 ### Security
 
 - **Discovery no longer trusts a Secret on its name alone.** Candidates are now
   ordered by provenance -- the provisioner's `Secret.Type` and a controller
   `ownerReference` -- before name, so a Secret planted in a watched namespace
-  loses to the one its provisioner wrote even when it sorts earlier
-  (`k3k-aaa-kubeconfig` precedes `k3k-real-kubeconfig`). A candidate with neither
-  signal is logged at Debug, not Warn: a provisioner that sets no
+  loses to the one its provisioner wrote even when it sorts earlier. A candidate
+  with neither signal is logged at Debug, not Warn: a provisioner that sets no
   `ownerReference` would otherwise log per namespace per interval forever. Run
-  with `--debug` to audit it. This raises the bar rather than closing the hole:
-  anyone who can write Secrets in a watched namespace still decides what that
-  namespace publishes, and constraining who may label a namespace remains the
-  real control.
+  with `--debug` to audit it.
+
+  **How much this buys depends on your provider.** Only `capi` declares a
+  `Secret.Type`; for every other preset the sole available signal is the
+  controller `ownerReference`. Neither is unforgeable by someone who can write
+  Secrets in the watched namespace, though a dangling `ownerReference` at least
+  gets the forgery garbage-collected. So this reorders candidates for any
+  provider, but against a deliberate attacker it only raises the bar on `capi`.
+  Constraining who may label a namespace remains the real control.
 - **Two live registrations may no longer share a server URL.** ArgoCD identifies
   a cluster by its address and resolves a collision by informer-index order, so a
   second namespace could previously claim an address production already held.
@@ -51,10 +55,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list, or anything over 63 bytes. Values over 4KiB are skipped and logged.
 - **`registrations` gained a `credential_expiry` dimension**, read from the
   client certificate in the registration ArgoCD is holding: `expired`, `lt_24h`,
-  `lt_7d`, `lt_30d`, `ok`, `none`, `absent` or `unreadable`. Bearer-token clusters
-  land in `none` rather than being counted as healthy, and `absent` is kept
-  distinct from `unreadable` because a registration with no config yet is not a
-  damaged one.
+  `lt_7d`, `lt_30d`, `ok`, `token`, `exec`, `absent` or `unreadable`.
+  Bearer-token clusters land in `token` rather than being counted as healthy;
+  `exec` is a translated credential, which ArgoCD mints per connection and so has
+  nothing to expire. The two are kept apart because they mean opposite things,
+  and because `exec` is the only fleet-wide signal that translation actually ran.
+  `absent` is kept distinct from `unreadable` because a registration with no
+  config yet is not a damaged one.
 - **`proxy-url` is carried** into ArgoCD's `config.proxyUrl` instead of being
   dropped in silence. `argocd cluster add` still ignores it. Refused when the
   URL embeds credentials, uses a scheme ArgoCD rejects, or accompanies
@@ -63,9 +70,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The `ValidatingAdmissionPolicy` the README recommends now ships**, off by
   default under `admissionPolicy`. One policy constrains who may set
   `<prefix>managed-by`, an optional second requires `<prefix>cluster` to equal the
-  namespace name. Kubernetes 1.30 or later. It ships as `Warn` and `Audit`, and
-  enabling it with an empty allowlist fails the render rather than refusing every
-  namespace in the cluster.
+  namespace name. Kubernetes 1.30 or later, checked at render time: below that
+  the kind is alpha or beta only, so an unguarded template would fail the whole
+  release on "no matches for kind" and take the deployment with it. Note the
+  check reads Helm's KubeVersion, which is a default when there is no cluster to
+  ask and tracks the Helm release, so rendering offline under Helm 3.14 or older
+  refuses the policy; use Helm 3.15+ or pass `--kube-version`. It
+  ships as `Warn` and `Audit`, and enabling it with an empty allowlist fails the
+  render rather than refusing every namespace in the cluster.
+
+  Two things it does not do. Listing a controller in `authorizedUsers` grants
+  that controller the label for every namespace it creates, so a self-service
+  provisioner that passes caller-supplied labels through hands the label to
+  everyone it serves -- put it behind a narrower path instead. And it constrains
+  `<prefix>managed-by` only: the other prefixed labels, which are what an
+  ApplicationSet actually selects on, are propagated as written.
 
 ### Changed
 
@@ -76,6 +95,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delete-and-recreate is not atomic and would discard ArgoCD's own keys.
 - `--label-prefix` now refuses any prefix reaching the `argocd.argoproj.io/`
   domain, not just the one that could reach `secret-type`.
+- **Propagated annotations are bounded as a set**, not only per value. 4KiB per
+  value as before, plus 32KiB across all of them and 32 keys. The apiserver
+  allows 256KB of annotations per object and a registration is written by
+  merging onto ArgoCD's own keys, so an unbounded set let a source namespace push
+  its own registration past that ceiling and fail every later write, the
+  credential refresh included. Keys are admitted in sorted order, so which ones
+  fit does not change between passes.
+- **A misordered provider list is logged at Warn**, where the globs overlap.
+  `*-kubeconfig` also matches `<cluster>-user-kubeconfig`, so declaring `capi`
+  before `capa-eks` claims both of CAPA's Secrets and the exec-bearing one never
+  becomes a candidate; the registration then looks healthy until its ~15-minute
+  token runs out. Nothing reported this before, at any log level, because the
+  losing candidate parsed cleanly. `capz-aks` uses `*-kubeconfig-user`, which
+  `capi` does not match, so there is nothing to shadow and nothing to warn about
+  there -- declaration order still decides which is preferred.
 - Code comments lost 318 lines of release archaeology, prior-art citation and bug
   narration with no behaviour change. That material belongs in this file.
 
@@ -108,11 +142,12 @@ worth knowing before you do it:
 
 1. **Audit any dashboard or alert that references `..._registrations`.** It gained
    a `credential_expiry` label, so a bare `registrations{state="active"}` now
-   returns one series per bucket instead of one series. `sum(...)` and
-   `sum by (state) (...)` are unaffected, but a threshold alert written against
-   the bare selector now compares **per bucket** and may quietly stop firing, and
-   a single-value panel will show an arbitrary bucket. This is the only change
-   here that can fail silently in a way you would not notice.
+   returns nine series instead of one, most of them zero. `sum(...)` and
+   `sum by (state) (...)` are unaffected. A bare-selector threshold alert is not:
+   a `>` alert now compares **per bucket** and may quietly stop firing, and a `<`
+   alert starts firing against every empty bucket, which is a false page rather
+   than a silent one. A single-value panel will show an arbitrary bucket. Wrap
+   the selector in `sum()` and both directions are correct again.
 
 2. **If you verify release signatures, re-check your command.** Signing moved
    from cosign v2 to v3, whose default bundle format differs. See *Build* above.
@@ -143,17 +178,47 @@ worth knowing before you do it:
    To scope one cluster several ways, use a single registration with ArgoCD's
    `namespaces` key, or `AppProject` destination service accounts.
 
+   Worth knowing before you get one: a refusal on the *move* path returns before
+   the write, so the `Secret` keeps its old address and the refusal repeats every
+   interval while that cluster's credential stops being refreshed. It stays
+   `active` in the gauge throughout. Alert on
+   `conflicts_total{reason=~"incumbent|server_collision"}`; the log line names
+   the cluster, the labels deliberately do not.
+
+   Two addresses that reach the same cluster are still two registrations. Only a
+   trailing slash is normalised, so `https://Host:6443`, `https://host:6443` and
+   the IP form do not collide with each other.
+
 7. **Where a namespace holds several matching `Secret`s, which one wins can
    change.** Candidates are now ordered by how much they look like their
    provisioner wrote them (a matching `Secret` type, a controller
-   `ownerReference`) before falling back to name order.
+   `ownerReference`) before falling back to name order. The `Secret`-type signal
+   applies only to `capi`; for every other preset the ordering turns on whether a
+   candidate carries a controller `ownerReference`. See *Security* above.
 
 8. **The published image base changed.** See *Build* above.
 
 9. **A server address ending in `/` is now stored without it**, matching how
-   ArgoCD normalises it. Such a registration logs `cluster address changed` once
-   on the first reconcile after the upgrade and is then rewritten in place. The
-   warning is expected and does not repeat.
+   ArgoCD normalises it. Such a registration is rewritten in place on the first
+   reconcile after the upgrade. Normalisation is compared on both sides, so it is
+   not treated as an address change: no `cluster address changed` warning is
+   logged and the collision check in note 6 is not run against a pair that has
+   coexisted for months. The rewrite itself logs at Info like any other update.
+
+10. **Prefixed *annotations* on a cluster `Secret` are now swept.** 0.5.x had no
+    annotation handling at all, so anything hand-set under `--label-prefix` on a
+    cluster `Secret` is removed on the first reconcile: the source namespace is
+    the only source of truth for these. ArgoCD's own annotations and anything
+    under another prefix are untouched.
+
+11. **A kubeconfig this release starts refusing leaves its registration frozen,
+    not removed.** That covers `https://kubernetes.default.svc` (note 5), a
+    `proxy-url` carrying credentials or paired with `insecure-skip-tls-verify`,
+    and an untranslatable `exec` block. The namespace is skipped, so the existing
+    `Secret` keeps working on the credential it already holds and simply stops
+    being refreshed. This is a `Warn` log only -- no counter moves and the gauge
+    still reports it `active` -- so grep for `no usable kubeconfig` after
+    upgrading.
 
 ## [0.5.0] - 2026-08-07
 

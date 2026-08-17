@@ -1,10 +1,13 @@
 package registrar
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -301,7 +304,7 @@ func TestFindKubeconfigSecretSkipsDecoy(t *testing.T) {
 	r, _ := newTestRegistrar(decoy, wanted)
 	r.cfg.Providers = mustPresets(t, "vcluster")
 
-	got, err := r.findKubeconfigCandidates(context.Background(), "ns")
+	got, _, err := r.findKubeconfigCandidates(context.Background(), "ns")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1224,7 +1227,7 @@ func TestOneSecretYieldsOneCandidatePerPresentKey(t *testing.T) {
 	)
 	r.cfg.Providers = mustPresets(t, "kamaji")
 
-	got, err := r.findKubeconfigCandidates(context.Background(), "tenant-c")
+	got, _, err := r.findKubeconfigCandidates(context.Background(), "tenant-c")
 	if err != nil {
 		t.Fatalf("find candidates: %v", err)
 	}
@@ -1630,7 +1633,7 @@ func TestReservedSuffixesAreNotPropagatedAsAnnotations(t *testing.T) {
 // informer, so without a cap the source namespace picks ArgoCD's memory
 // footprint. Dropped rather than truncated: a truncated URL looks like it works.
 func TestOversizedAnnotationIsDroppedNotTruncated(t *testing.T) {
-	big := strings.Repeat("x", maxPropagatedAnnotationBytes+1)
+	big := strings.Repeat("x", annotationLimits.value+1)
 	r, c := newTestRegistrar(
 		annotatedNS(testNS, "a", map[string]string{
 			testPrefix + "big":   big,
@@ -1648,6 +1651,132 @@ func TestOversizedAnnotationIsDroppedNotTruncated(t *testing.T) {
 	}
 	if got.Annotations[testPrefix+"small"] != "kept" {
 		t.Error("one oversized annotation dropped its well-behaved sibling")
+	}
+}
+
+// Per-value was the only cap, so ~64 values still reached the apiserver's 256KB
+// ceiling. apply() merges onto ArgoCD's own keys, so crossing it fails every
+// later Update including the credential refresh: a tenant could wedge its own
+// registration for good.
+func TestAnnotationSetIsBoundedInTotalNotOnlyPerValue(t *testing.T) {
+	ann := map[string]string{}
+	// Each is under the per-value cap and together they are far over the total.
+	// Sized so the TOTAL cap is what binds: at value-1 bytes each, the total runs
+	// out after 8 keys and the count cap is never reached.
+	for i := 0; i < annotationLimits.count+8; i++ {
+		ann[fmt.Sprintf("%sk%02d", testPrefix, i)] = strings.Repeat("y", annotationLimits.value-1)
+	}
+	r, c := newTestRegistrar(
+		annotatedNS(testNS, "a", ann),
+		kubeconfigSecret(testNS, "k3k-a-kubeconfig"),
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := getSecret(t, c, "cluster-a")
+
+	kept, bytes := 0, 0
+	for k, v := range got.Annotations {
+		if strings.HasPrefix(k, testPrefix) {
+			kept++
+			bytes += len(v)
+		}
+	}
+	if kept > annotationLimits.count {
+		t.Errorf("propagated %d annotations, over the %d cap", kept, annotationLimits.count)
+	}
+	if bytes > annotationLimits.total {
+		t.Errorf("propagated %d bytes, over the %d cap", bytes, annotationLimits.total)
+	}
+	if kept == 0 {
+		t.Error("the cap dropped everything rather than admitting what fits")
+	}
+}
+
+// The count cap needs its own fixture. With values large enough to exhaust the
+// byte budget the total cap always binds first, so a test built that way leaves
+// the count limb uncovered and it could be deleted unnoticed.
+func TestAnnotationSetIsBoundedInKeyCount(t *testing.T) {
+	ann := map[string]string{}
+	// Tiny values: count+8 of them is nowhere near the total byte budget.
+	for i := 0; i < annotationLimits.count+8; i++ {
+		ann[fmt.Sprintf("%sk%02d", testPrefix, i)] = "small"
+	}
+	if len(ann)*len("small") >= annotationLimits.total {
+		t.Fatalf("fixture is too large to isolate the count cap: %d bytes", len(ann)*len("small"))
+	}
+
+	out, dropped := propagate(ann, testPrefix, annotationLimits)
+	if len(out) != annotationLimits.count {
+		t.Errorf("propagated %d annotations, want exactly the %d cap", len(out), annotationLimits.count)
+	}
+	if len(dropped) != 8 {
+		t.Errorf("dropped %d annotations, want the 8 over the cap", len(dropped))
+	}
+	// Sorted admission means the survivors are the first N by key.
+	for i := 0; i < annotationLimits.count; i++ {
+		k := fmt.Sprintf("%sk%02d", testPrefix, i)
+		if _, ok := out[k]; !ok {
+			t.Errorf("%s was dropped although it sorts within the cap", k)
+		}
+	}
+}
+
+// Which annotations survive must not flap: map iteration order would rewrite the
+// Secret every pass and hand ArgoCD a different set each time.
+func TestTheAdmittedAnnotationSetIsStableAcrossPasses(t *testing.T) {
+	ann := map[string]string{}
+	for i := 0; i < annotationLimits.count+8; i++ {
+		ann[fmt.Sprintf("%sk%02d", testPrefix, i)] = strings.Repeat("z", annotationLimits.value-1)
+	}
+	var first map[string]string
+	for pass := 0; pass < 3; pass++ {
+		out, _ := propagate(ann, testPrefix, annotationLimits)
+		if pass == 0 {
+			first = out
+			continue
+		}
+		if !reflect.DeepEqual(out, first) {
+			t.Fatalf("pass %d admitted a different set than pass 0", pass)
+		}
+	}
+}
+
+// 0.5.x stored the address as written, so normalising a trailing slash must not
+// read as a move. It would run the collision check against a pair that has
+// coexisted for months, and a refusal there leaves the untrimmed value in place
+// to refuse again forever while the credential stops being refreshed.
+func TestNormalisingATrailingSlashIsNotAnAddressMove(t *testing.T) {
+	// A live incumbent already holds the same address. If the trailing slash reads
+	// as a move, claimServer runs and refuses, and the Secret never gets rewritten.
+	incumbent := registeredSecret("other", "other-ns")
+	incumbent.Data["server"] = []byte(k3kServer)
+	// It must exist, or claimServer releases the address as a dead incumbent and
+	// the test would pass without exercising anything.
+	otherNS := &coreV1.Namespace{ObjectMeta: metaV1.ObjectMeta{Name: "other-ns"}}
+
+	// What 0.5.x stored: the address exactly as the kubeconfig wrote it.
+	stored := registeredSecret("a", testNS)
+	stored.Data["server"] = []byte(k3kServer + "/")
+
+	r, c := newTestRegistrar(
+		managedNS(testNS, "a"),
+		kubeconfigSecret(testNS, "k3k-a-kubeconfig"),
+		stored, incumbent, otherNS,
+	)
+
+	before := testutil.ToFloat64(conflictsTotal.WithLabelValues(conflictServerCollision))
+	if _, err := r.ReconcileOne(context.Background(), testNS); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	after := testutil.ToFloat64(conflictsTotal.WithLabelValues(conflictServerCollision))
+
+	if got := getSecret(t, c, "cluster-a"); string(got.Data["server"]) != k3kServer {
+		t.Errorf("server = %q, want the normalised %q", got.Data["server"], k3kServer)
+	}
+	if after != before {
+		t.Errorf("normalising a trailing slash counted %v server collisions", after-before)
 	}
 }
 
@@ -1715,6 +1844,121 @@ func TestProviderOrderDecidesWhichEksCredentialWins(t *testing.T) {
 	}
 	if !strings.Contains(ch.config, "bearerToken") {
 		t.Errorf("expected the token to win on provider order: %s", ch.config)
+	}
+}
+
+// The winner parses cleanly, so no parse error reports it and the registration
+// looks healthy until the token runs out. Without this the only signal that a
+// providers list is misordered is the absence of an Info line.
+func TestPassingOverAnExecCandidateIsWarnedAbout(t *testing.T) {
+	var buf bytes.Buffer
+	r, _ := newTestRegistrar(
+		managedNS("eks", "c"),
+		secretWith("eks", "c-kubeconfig", "value", tokenKubeconfig),
+		secretWith("eks", "c-user-kubeconfig", "value", execKubeconfig),
+	)
+	r.log = slog.New(slog.NewTextHandler(&buf, nil))
+	r.cfg.Providers = mustPresets(t, "capi", "capa-eks")
+	r.cfg.ExecCredentials = true
+
+	if _, ok := discoverNS(t, r, "eks"); !ok {
+		t.Fatal("expected one registration, got none")
+	}
+	if !strings.Contains(buf.String(), "cannot carry an exec credential") {
+		t.Errorf("a misordered provider list registered silently: %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "c-user-kubeconfig") {
+		t.Error("the warning did not name the candidate it passed over")
+	}
+}
+
+// The shape being exec-CAPABLE is not the same as the Secret carrying an exec
+// block. A `<c>-user-kubeconfig` holding a plain certificate is nothing to fix,
+// and warning about it every interval forever is how a real warning gets
+// filtered out.
+func TestNoWarningWhenThePassedOverSecretCarriesNoExec(t *testing.T) {
+	var buf bytes.Buffer
+	r, _ := newTestRegistrar(
+		managedNS("eks", "c"),
+		secretWith("eks", "c-kubeconfig", "value", tokenKubeconfig),
+		secretWith("eks", "c-user-kubeconfig", "value", tokenKubeconfig),
+	)
+	r.log = slog.New(slog.NewTextHandler(&buf, nil))
+	r.cfg.Providers = mustPresets(t, "capi", "capa-eks")
+	r.cfg.ExecCredentials = true
+
+	if _, ok := discoverNS(t, r, "eks"); !ok {
+		t.Fatal("expected one registration, got none")
+	}
+	if strings.Contains(buf.String(), "cannot carry an exec credential") {
+		t.Errorf("warned about a passed-over secret that has no exec block: %s", buf.String())
+	}
+}
+
+// A kubeconfig carrying both a static credential and an exec block registers on
+// the static one, so it can be the Secret that WINS while also being the one
+// recorded as shadowed. Naming it on both sides of the warning reads as
+// nonsense, so there should be no warning at all.
+func TestNoWarningWhenTheShadowedSecretIsTheOneUsed(t *testing.T) {
+	const staticAndExec = `apiVersion: v1
+kind: Config
+clusters:
+- name: managed
+  cluster:
+    server: https://example.eks.amazonaws.com
+    certificate-authority-data: Y2FkYXRh
+users:
+- name: managed
+  user:
+    client-certificate-data: Y2VydA==
+    client-key-data: a2V5
+    exec:
+      apiVersion: client.authentication.k8s.io/v1beta1
+      command: aws-iam-authenticator
+      args: [token, -i, my-eks-cluster]
+`
+	var buf bytes.Buffer
+	r, _ := newTestRegistrar(
+		managedNS("eks", "c"),
+		secretWith("eks", "c-kubeconfig", "value", "not a kubeconfig at all"),
+		secretWith("eks", "c-user-kubeconfig", "value", staticAndExec),
+	)
+	r.log = slog.New(slog.NewTextHandler(&buf, nil))
+	r.cfg.Providers = mustPresets(t, "capi", "capa-eks")
+	r.cfg.ExecCredentials = true
+
+	ch, ok := discoverNS(t, r, "eks")
+	if !ok {
+		t.Fatal("expected the static credential to win after the first failed to parse")
+	}
+	// certData proves the winner was the static-credential Secret, i.e. the same
+	// one that carries the exec block and so appears in `shadowed`.
+	if !strings.Contains(ch.config, "certData") {
+		t.Fatalf("expected the static credential to be carried: %s", ch.config)
+	}
+	if strings.Contains(buf.String(), "cannot carry an exec credential") {
+		t.Errorf("warned while using the very secret it called passed over: %s", buf.String())
+	}
+}
+
+// Ordered correctly there is nothing to say, and a warning on every namespace
+// every interval is how a real one gets filtered out.
+func TestCorrectProviderOrderWarnsAboutNothing(t *testing.T) {
+	var buf bytes.Buffer
+	r, _ := newTestRegistrar(
+		managedNS("eks", "c"),
+		secretWith("eks", "c-kubeconfig", "value", tokenKubeconfig),
+		secretWith("eks", "c-user-kubeconfig", "value", execKubeconfig),
+	)
+	r.log = slog.New(slog.NewTextHandler(&buf, nil))
+	r.cfg.Providers = mustPresets(t, "capa-eks", "capi")
+	r.cfg.ExecCredentials = true
+
+	if _, ok := discoverNS(t, r, "eks"); !ok {
+		t.Fatal("expected one registration, got none")
+	}
+	if strings.Contains(buf.String(), "cannot carry an exec credential") {
+		t.Errorf("a correctly ordered list still warned: %s", buf.String())
 	}
 }
 

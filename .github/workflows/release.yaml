@@ -34,8 +34,11 @@ jobs:
           go-version: stable
           check-latest: true
 
+      # Pinned to a patch, not a major: `@v3` floated to cosign v2.5.2, and v4
+      # installs cosign v3.0.6, whose default signature format differs. Consumers
+      # have to see that coming, so it must not float again.
       - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@v4.1.2
 
       # goreleaser has no SBOM generator of its own; it shells out to syft, and
       # fails the release if it is missing. The images do not need this.
