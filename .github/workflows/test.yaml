@@ -291,7 +291,13 @@ jobs:
             echo "::error::Chart.yaml version ($chart_version) and appVersion ($app_version) disagree"
             exit 1
           fi
-          latest=$(git tag -l 'v*.*.*' --sort=-v:refname | head -1 | sed 's/^v//')
+          # Prereleases are excluded deliberately. The question here is whether the
+          # in-tree chart is behind the last RELEASE, and v0.6.0-rc1 is not one.
+          # Neither ordering available agrees with semver on this: git's
+          # --sort=-v:refname calls v0.6.0-rc1 the newest tag, and `sort -V` then
+          # puts 0.6.0 ahead of it, so a chart correctly ahead of the last release
+          # fails the check the moment a candidate for it is tagged.
+          latest=$(git tag -l 'v*.*.*' --sort=-v:refname | sed '/-/d; s/^v//' | head -1)
           if [ -z "$latest" ]; then
             echo "no tags yet, nothing to compare against"
             exit 0
