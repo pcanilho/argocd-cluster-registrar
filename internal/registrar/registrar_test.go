@@ -1,14 +1,19 @@
 package registrar
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	coreV1 "k8s.io/api/core/v1"
 	apiErrors "k8s.io/apimachinery/pkg/api/errors"
 	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -46,6 +51,8 @@ const (
 	testNS = "k3k-a"
 	// k3kServer is the endpoint inside the k3k kubeconfig fixture.
 	k3kServer = "https://192.168.1.192"
+	// testProject is a propagated label value, not ArgoCD's project data key.
+	testProject = "platform"
 )
 
 func testConfig() Config {
@@ -297,7 +304,7 @@ func TestFindKubeconfigSecretSkipsDecoy(t *testing.T) {
 	r, _ := newTestRegistrar(decoy, wanted)
 	r.cfg.Providers = mustPresets(t, "vcluster")
 
-	got, err := r.findKubeconfigCandidates(context.Background(), "ns")
+	got, _, err := r.findKubeconfigCandidates(context.Background(), "ns")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -402,18 +409,21 @@ func TestKamajiViaCAPIRegistersOnce(t *testing.T) {
 
 // A Secret can match the shape and still be unusable. CAPA's EKS path writes
 // `<cluster>-user-kubeconfig` with an exec credential, which satisfies the CAPI
-// glob and the `value` key but cannot be copied into an ArgoCD Secret.
+// glob and the `value` key; `capi` does not allow translating it.
 //
 // In the real EKS layout `c-kubeconfig` happens to sort before
 // `c-user-kubeconfig`, so picking the first match would work by luck. The unusable
 // Secret here is named to sort FIRST, so this passes only if a failed parse
 // genuinely falls through to the next candidate.
-func TestPrefersUsableCandidateOverExecCredential(t *testing.T) {
+func TestPrefersUsableCandidateOverUntranslatableExec(t *testing.T) {
 	r, _ := newTestRegistrar(
 		managedNS("capi-c", "c"),
 		secretWith("capi-c", "aaa-kubeconfig", "value", execKubeconfig),
 		secretWith("capi-c", "c-kubeconfig", "value", capiKubeconfig),
 	)
+	// `capi` does not allow exec, so the exec candidate is refused and the next
+	// one is tried. It loses because this provider disallows translation, not
+	// because an exec credential is inherently uncopyable.
 	r.cfg.Providers = mustPresets(t, "capi")
 
 	ch, ok := discoverNS(t, r, "capi-c")
@@ -1152,6 +1162,12 @@ func TestConfigValidate(t *testing.T) {
 		"prefix that ArgoCD's own key falls under": func(c *Config) {
 			c.LabelPrefix = "argocd.argoproj.io/"
 		},
+		// A partial prefix reaches every key under the domain, not just
+		// secret-type, and what it would reach matters: skip-reconcile stops
+		// reconciliation of every Application targeting the cluster.
+		"prefix shorter than the ArgoCD domain": func(c *Config) {
+			c.LabelPrefix = "argocd.argoproj.i"
+		},
 		// Negative would expire every demoted registration on sight, since
 		// time.Since is always greater than a negative duration.
 		"negative demoted TTL": func(c *Config) { c.DemotedTTL = -time.Second },
@@ -1211,7 +1227,7 @@ func TestOneSecretYieldsOneCandidatePerPresentKey(t *testing.T) {
 	)
 	r.cfg.Providers = mustPresets(t, "kamaji")
 
-	got, err := r.findKubeconfigCandidates(context.Background(), "tenant-c")
+	got, _, err := r.findKubeconfigCandidates(context.Background(), "tenant-c")
 	if err != nil {
 		t.Fatalf("find candidates: %v", err)
 	}
@@ -1423,5 +1439,888 @@ func TestLeaderElectionIDSerialisesExactlyTheCollidingInstalls(t *testing.T) {
 	}
 	if errs := validation.IsDNS1123Subdomain(base); len(errs) > 0 {
 		t.Errorf("%q is not a valid object name: %s", base, strings.Join(errs, "; "))
+	}
+}
+
+// ownedSecret is secretWith plus a controller ownerReference, i.e. what a
+// provisioner writes rather than what a tenant can drop in beside it.
+func ownedSecret(ns, name, key, body string) *coreV1.Secret {
+	s := secretWith(ns, name, key, body)
+	yes := true
+	s.OwnerReferences = []metaV1.OwnerReference{{
+		APIVersion: "k3k.io/v1alpha1", Kind: "Cluster", Name: "real", UID: "u1",
+		Controller: &yes,
+	}}
+	return s
+}
+
+// Discovery matches on Secret name and key alone, both of which anyone with
+// Secret write in the namespace chooses. `k3k-aaa-kubeconfig` sorts before
+// `k3k-real-kubeconfig`, so on a pure name sort the planted one wins and ArgoCD
+// is pointed at whatever server it names.
+func TestPlantedSecretLosesToTheProvisionersOwn(t *testing.T) {
+	r, _ := newTestRegistrar(
+		managedNS(testNS, "a"),
+		secretWith(testNS, "k3k-aaa-kubeconfig", "kubeconfig.yaml", tokenKubeconfig),
+		ownedSecret(testNS, "k3k-real-kubeconfig", "kubeconfig.yaml", k3kKubeconfig),
+	)
+
+	ch, ok := discoverNS(t, r, testNS)
+	if !ok {
+		t.Fatal("expected one registration, got none")
+	}
+	if ch.server != k3kServer {
+		t.Errorf("registered the planted secret: server = %q, want %q", ch.server, k3kServer)
+	}
+}
+
+// The CAPI contract mandates the Secret type, so it is a provenance signal on
+// the loosest pattern shipped -- which is the one most in need of one.
+func TestCAPISecretTypeOutranksAnEarlierName(t *testing.T) {
+	planted := secretWith("capi-c", "aaa-kubeconfig", "value", tokenKubeconfig)
+	genuine := secretWith("capi-c", "c-kubeconfig", "value", capiKubeconfig)
+	genuine.Type = "cluster.x-k8s.io/secret"
+
+	r, _ := newTestRegistrar(managedNS("capi-c", "c"), planted, genuine)
+	r.cfg.Providers = mustPresets(t, "capi")
+
+	ch, ok := discoverNS(t, r, "capi-c")
+	if !ok {
+		t.Fatal("expected one registration, got none")
+	}
+	if ch.server != "https://192.168.1.196:6443" {
+		t.Errorf("registered the planted secret: server = %q", ch.server)
+	}
+}
+
+// Provenance orders candidates; it never excludes them. A fleet whose
+// provisioner sets neither signal must keep registering exactly as before.
+func TestSecretWithNoProvenanceStillRegisters(t *testing.T) {
+	r, _ := newTestRegistrar(
+		managedNS(testNS, "a"),
+		secretWith(testNS, "k3k-a-kubeconfig", "kubeconfig.yaml", k3kKubeconfig),
+	)
+
+	if _, ok := discoverNS(t, r, testNS); !ok {
+		t.Fatal("a secret with no ownerReference and no type must still register")
+	}
+}
+
+// registeredAt is registeredSecret pinned to a specific server address, which is
+// the identity ArgoCD actually keys a cluster by.
+func registeredAt(cluster, srcNS, server string) *coreV1.Secret {
+	s := registeredSecret(cluster, srcNS)
+	s.Data["server"] = []byte(server)
+	return s
+}
+
+// ArgoCD identifies a cluster by its address, and GetClusterByURL returns
+// items[0], so two live registrations sharing a server are two claims on one
+// identity and which one wins is an informer-index accident. Incumbency settles
+// the cluster NAME; nothing settled the address.
+func TestSecondNamespaceCannotClaimARegisteredServer(t *testing.T) {
+	r, c := newTestRegistrar(
+		// The incumbent's namespace must exist, or garbage collection removes its
+		// registration before the collision is ever reached.
+		managedNS("other-ns", "a"),
+		registeredAt("a", "other-ns", k3kServer),
+		managedNS(testNS, "b"),
+		kubeconfigSecret(testNS, "k3k-b-kubeconfig"),
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Logf("reconcile reported: %v", err)
+	}
+	if secretExists(t, c, "cluster-b") {
+		t.Error("registered a second cluster on an address ArgoCD already holds")
+	}
+	if !secretExists(t, c, "cluster-a") {
+		t.Error("the incumbent registration was disturbed")
+	}
+}
+
+// A demoted registration is invisible to ArgoCD, so it holds no identity and
+// must not block the address being claimed again.
+func TestDemotedRegistrationDoesNotHoldItsServer(t *testing.T) {
+	demoted := registeredAt("a", "other-ns", k3kServer)
+	delete(demoted.Labels, argoSecretTypeLabel)
+	demoted.Labels[OrphanedSecretTypeLabel(testPrefix)] = argoSecretTypeValue
+
+	r, c := newTestRegistrar(
+		demoted,
+		managedNS(testNS, "b"),
+		kubeconfigSecret(testNS, "k3k-b-kubeconfig"),
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Logf("reconcile reported: %v", err)
+	}
+	if !secretExists(t, c, "cluster-b") {
+		t.Error("a demoted registration blocked its address from being reclaimed")
+	}
+}
+
+// The same namespace re-registering its own cluster is not a collision.
+func TestOwnRegistrationIsNotAServerCollision(t *testing.T) {
+	r, c := newTestRegistrar(
+		registeredAt("a", testNS, k3kServer),
+		managedNS(testNS, "a"),
+		kubeconfigSecret(testNS, "k3k-a-kubeconfig"),
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !secretExists(t, c, "cluster-a") {
+		t.Error("a namespace was blocked from updating its own registration")
+	}
+}
+
+// annotatedNS is managedNS with annotations on the source namespace.
+func annotatedNS(name, cluster string, kv map[string]string) *coreV1.Namespace {
+	ns := managedNS(name, cluster)
+	ns.Annotations = kv
+	return ns
+}
+
+// The ApplicationSet cluster generator reads {{metadata.annotations.<key>}} just
+// as it reads labels, and an annotation has neither the 63-byte cap nor the
+// charset a label value is held to. A URL cannot be a label value at all.
+func TestPrefixedAnnotationsPropagate(t *testing.T) {
+	r, c := newTestRegistrar(
+		annotatedNS(testNS, "a", map[string]string{
+			testPrefix + "grafana": "https://grafana.example.com/d/abc",
+			"unprefixed":           "ignored",
+		}),
+		kubeconfigSecret(testNS, "k3k-a-kubeconfig"),
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := getSecret(t, c, "cluster-a")
+	if got.Annotations[testPrefix+"grafana"] != "https://grafana.example.com/d/abc" {
+		t.Errorf("prefixed annotation was not propagated: %v", got.Annotations)
+	}
+	if _, ok := got.Annotations["unprefixed"]; ok {
+		t.Error("an unprefixed annotation was propagated")
+	}
+}
+
+// The reserved suffixes are a trust boundary for annotations exactly as for
+// labels, or a namespace could aim garbage collection at kube-system.
+func TestReservedSuffixesAreNotPropagatedAsAnnotations(t *testing.T) {
+	r, c := newTestRegistrar(
+		annotatedNS(testNS, "a", map[string]string{
+			SourceNamespaceLabel(testPrefix): "kube-system",
+			PruneLabel(testPrefix):           PruneDisabled,
+		}),
+		kubeconfigSecret(testNS, "k3k-a-kubeconfig"),
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := getSecret(t, c, "cluster-a")
+	for _, k := range []string{SourceNamespaceLabel(testPrefix), PruneLabel(testPrefix)} {
+		if _, ok := got.Annotations[k]; ok {
+			t.Errorf("reserved key %q was propagated as an annotation", k)
+		}
+	}
+}
+
+// Annotations allow 256KB and every registration sits in ArgoCD's cluster
+// informer, so without a cap the source namespace picks ArgoCD's memory
+// footprint. Dropped rather than truncated: a truncated URL looks like it works.
+func TestOversizedAnnotationIsDroppedNotTruncated(t *testing.T) {
+	big := strings.Repeat("x", annotationLimits.value+1)
+	r, c := newTestRegistrar(
+		annotatedNS(testNS, "a", map[string]string{
+			testPrefix + "big":   big,
+			testPrefix + "small": "kept",
+		}),
+		kubeconfigSecret(testNS, "k3k-a-kubeconfig"),
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := getSecret(t, c, "cluster-a")
+	if _, ok := got.Annotations[testPrefix+"big"]; ok {
+		t.Error("an oversized annotation was propagated")
+	}
+	if got.Annotations[testPrefix+"small"] != "kept" {
+		t.Error("one oversized annotation dropped its well-behaved sibling")
+	}
+}
+
+// Per-value was the only cap, so ~64 values still reached the apiserver's 256KB
+// ceiling. apply() merges onto ArgoCD's own keys, so crossing it fails every
+// later Update including the credential refresh: a tenant could wedge its own
+// registration for good.
+func TestAnnotationSetIsBoundedInTotalNotOnlyPerValue(t *testing.T) {
+	ann := map[string]string{}
+	// Each is under the per-value cap and together they are far over the total.
+	// Sized so the TOTAL cap is what binds: at value-1 bytes each, the total runs
+	// out after 8 keys and the count cap is never reached.
+	for i := 0; i < annotationLimits.count+8; i++ {
+		ann[fmt.Sprintf("%sk%02d", testPrefix, i)] = strings.Repeat("y", annotationLimits.value-1)
+	}
+	r, c := newTestRegistrar(
+		annotatedNS(testNS, "a", ann),
+		kubeconfigSecret(testNS, "k3k-a-kubeconfig"),
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := getSecret(t, c, "cluster-a")
+
+	kept, bytes := 0, 0
+	for k, v := range got.Annotations {
+		if strings.HasPrefix(k, testPrefix) {
+			kept++
+			bytes += len(v)
+		}
+	}
+	if kept > annotationLimits.count {
+		t.Errorf("propagated %d annotations, over the %d cap", kept, annotationLimits.count)
+	}
+	if bytes > annotationLimits.total {
+		t.Errorf("propagated %d bytes, over the %d cap", bytes, annotationLimits.total)
+	}
+	if kept == 0 {
+		t.Error("the cap dropped everything rather than admitting what fits")
+	}
+}
+
+// The count cap needs its own fixture. With values large enough to exhaust the
+// byte budget the total cap always binds first, so a test built that way leaves
+// the count limb uncovered and it could be deleted unnoticed.
+func TestAnnotationSetIsBoundedInKeyCount(t *testing.T) {
+	ann := map[string]string{}
+	// Tiny values: count+8 of them is nowhere near the total byte budget.
+	for i := 0; i < annotationLimits.count+8; i++ {
+		ann[fmt.Sprintf("%sk%02d", testPrefix, i)] = "small"
+	}
+	if len(ann)*len("small") >= annotationLimits.total {
+		t.Fatalf("fixture is too large to isolate the count cap: %d bytes", len(ann)*len("small"))
+	}
+
+	out, dropped := propagate(ann, testPrefix, annotationLimits)
+	if len(out) != annotationLimits.count {
+		t.Errorf("propagated %d annotations, want exactly the %d cap", len(out), annotationLimits.count)
+	}
+	if len(dropped) != 8 {
+		t.Errorf("dropped %d annotations, want the 8 over the cap", len(dropped))
+	}
+	// Sorted admission means the survivors are the first N by key.
+	for i := 0; i < annotationLimits.count; i++ {
+		k := fmt.Sprintf("%sk%02d", testPrefix, i)
+		if _, ok := out[k]; !ok {
+			t.Errorf("%s was dropped although it sorts within the cap", k)
+		}
+	}
+}
+
+// Which annotations survive must not flap: map iteration order would rewrite the
+// Secret every pass and hand ArgoCD a different set each time.
+func TestTheAdmittedAnnotationSetIsStableAcrossPasses(t *testing.T) {
+	ann := map[string]string{}
+	for i := 0; i < annotationLimits.count+8; i++ {
+		ann[fmt.Sprintf("%sk%02d", testPrefix, i)] = strings.Repeat("z", annotationLimits.value-1)
+	}
+	var first map[string]string
+	for pass := 0; pass < 3; pass++ {
+		out, _ := propagate(ann, testPrefix, annotationLimits)
+		if pass == 0 {
+			first = out
+			continue
+		}
+		if !reflect.DeepEqual(out, first) {
+			t.Fatalf("pass %d admitted a different set than pass 0", pass)
+		}
+	}
+}
+
+// 0.5.x stored the address as written, so normalising a trailing slash must not
+// read as a move. It would run the collision check against a pair that has
+// coexisted for months, and a refusal there leaves the untrimmed value in place
+// to refuse again forever while the credential stops being refreshed.
+func TestNormalisingATrailingSlashIsNotAnAddressMove(t *testing.T) {
+	// A live incumbent already holds the same address. If the trailing slash reads
+	// as a move, claimServer runs and refuses, and the Secret never gets rewritten.
+	incumbent := registeredSecret("other", "other-ns")
+	incumbent.Data["server"] = []byte(k3kServer)
+	// It must exist, or claimServer releases the address as a dead incumbent and
+	// the test would pass without exercising anything.
+	otherNS := &coreV1.Namespace{ObjectMeta: metaV1.ObjectMeta{Name: "other-ns"}}
+
+	// What 0.5.x stored: the address exactly as the kubeconfig wrote it.
+	stored := registeredSecret("a", testNS)
+	stored.Data["server"] = []byte(k3kServer + "/")
+
+	r, c := newTestRegistrar(
+		managedNS(testNS, "a"),
+		kubeconfigSecret(testNS, "k3k-a-kubeconfig"),
+		stored, incumbent, otherNS,
+	)
+
+	before := testutil.ToFloat64(conflictsTotal.WithLabelValues(conflictServerCollision))
+	if _, err := r.ReconcileOne(context.Background(), testNS); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	after := testutil.ToFloat64(conflictsTotal.WithLabelValues(conflictServerCollision))
+
+	if got := getSecret(t, c, "cluster-a"); string(got.Data["server"]) != k3kServer {
+		t.Errorf("server = %q, want the normalised %q", got.Data["server"], k3kServer)
+	}
+	if after != before {
+		t.Errorf("normalising a trailing slash counted %v server collisions", after-before)
+	}
+}
+
+// The sweep must reach prefixed annotations, or a cluster could never be opted
+// back out, and must not reach anything else.
+func TestAnnotationSweepSparesForeignKeys(t *testing.T) {
+	existing := registeredSecret("a", testNS)
+	existing.Annotations = map[string]string{
+		testPrefix + "gone":            "stale",
+		"argocd.argoproj.io/something": "operator-set",
+	}
+	r, c := newTestRegistrar(
+		managedNS(testNS, "a"),
+		kubeconfigSecret(testNS, "k3k-a-kubeconfig"),
+		existing,
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := getSecret(t, c, "cluster-a")
+	if _, ok := got.Annotations[testPrefix+"gone"]; ok {
+		t.Error("a prefixed annotation absent upstream survived the sweep")
+	}
+	if got.Annotations["argocd.argoproj.io/something"] != "operator-set" {
+		t.Errorf("the sweep destroyed a foreign annotation: %v", got.Annotations)
+	}
+}
+
+// The whole point of the capa-eks preset. Both Secrets satisfy `value`, and
+// `<c>-kubeconfig` sorts before `<c>-user-kubeconfig`, so provider precedence is
+// the only thing that can put the exec one first.
+func TestCapaEksPresetPrefersExecOverTheExpiringToken(t *testing.T) {
+	r, _ := newTestRegistrar(
+		managedNS("eks", "c"),
+		secretWith("eks", "c-kubeconfig", "value", tokenKubeconfig),
+		secretWith("eks", "c-user-kubeconfig", "value", execKubeconfig),
+	)
+	r.cfg.Providers = mustPresets(t, "capa-eks", "capi")
+	r.cfg.ExecCredentials = true
+
+	ch, ok := discoverNS(t, r, "eks")
+	if !ok {
+		t.Fatal("expected one registration, got none")
+	}
+	if !strings.Contains(ch.config, "awsAuthConfig") {
+		t.Errorf("registered the 15-minute token instead of the translated credential: %s", ch.config)
+	}
+}
+
+// Declared the other way round, the expiring token wins. Documented behaviour,
+// and the thing an operator will get wrong.
+func TestProviderOrderDecidesWhichEksCredentialWins(t *testing.T) {
+	r, _ := newTestRegistrar(
+		managedNS("eks", "c"),
+		secretWith("eks", "c-kubeconfig", "value", tokenKubeconfig),
+		secretWith("eks", "c-user-kubeconfig", "value", execKubeconfig),
+	)
+	r.cfg.Providers = mustPresets(t, "capi", "capa-eks")
+	r.cfg.ExecCredentials = true
+
+	ch, ok := discoverNS(t, r, "eks")
+	if !ok {
+		t.Fatal("expected one registration, got none")
+	}
+	if !strings.Contains(ch.config, "bearerToken") {
+		t.Errorf("expected the token to win on provider order: %s", ch.config)
+	}
+}
+
+// The winner parses cleanly, so no parse error reports it and the registration
+// looks healthy until the token runs out. Without this the only signal that a
+// providers list is misordered is the absence of an Info line.
+func TestPassingOverAnExecCandidateIsWarnedAbout(t *testing.T) {
+	var buf bytes.Buffer
+	r, _ := newTestRegistrar(
+		managedNS("eks", "c"),
+		secretWith("eks", "c-kubeconfig", "value", tokenKubeconfig),
+		secretWith("eks", "c-user-kubeconfig", "value", execKubeconfig),
+	)
+	r.log = slog.New(slog.NewTextHandler(&buf, nil))
+	r.cfg.Providers = mustPresets(t, "capi", "capa-eks")
+	r.cfg.ExecCredentials = true
+
+	if _, ok := discoverNS(t, r, "eks"); !ok {
+		t.Fatal("expected one registration, got none")
+	}
+	if !strings.Contains(buf.String(), "cannot carry an exec credential") {
+		t.Errorf("a misordered provider list registered silently: %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "c-user-kubeconfig") {
+		t.Error("the warning did not name the candidate it passed over")
+	}
+}
+
+// The shape being exec-CAPABLE is not the same as the Secret carrying an exec
+// block. A `<c>-user-kubeconfig` holding a plain certificate is nothing to fix,
+// and warning about it every interval forever is how a real warning gets
+// filtered out.
+func TestNoWarningWhenThePassedOverSecretCarriesNoExec(t *testing.T) {
+	var buf bytes.Buffer
+	r, _ := newTestRegistrar(
+		managedNS("eks", "c"),
+		secretWith("eks", "c-kubeconfig", "value", tokenKubeconfig),
+		secretWith("eks", "c-user-kubeconfig", "value", tokenKubeconfig),
+	)
+	r.log = slog.New(slog.NewTextHandler(&buf, nil))
+	r.cfg.Providers = mustPresets(t, "capi", "capa-eks")
+	r.cfg.ExecCredentials = true
+
+	if _, ok := discoverNS(t, r, "eks"); !ok {
+		t.Fatal("expected one registration, got none")
+	}
+	if strings.Contains(buf.String(), "cannot carry an exec credential") {
+		t.Errorf("warned about a passed-over secret that has no exec block: %s", buf.String())
+	}
+}
+
+// A kubeconfig carrying both a static credential and an exec block registers on
+// the static one, so it can be the Secret that WINS while also being the one
+// recorded as shadowed. Naming it on both sides of the warning reads as
+// nonsense, so there should be no warning at all.
+func TestNoWarningWhenTheShadowedSecretIsTheOneUsed(t *testing.T) {
+	const staticAndExec = `apiVersion: v1
+kind: Config
+clusters:
+- name: managed
+  cluster:
+    server: https://example.eks.amazonaws.com
+    certificate-authority-data: Y2FkYXRh
+users:
+- name: managed
+  user:
+    client-certificate-data: Y2VydA==
+    client-key-data: a2V5
+    exec:
+      apiVersion: client.authentication.k8s.io/v1beta1
+      command: aws-iam-authenticator
+      args: [token, -i, my-eks-cluster]
+`
+	var buf bytes.Buffer
+	r, _ := newTestRegistrar(
+		managedNS("eks", "c"),
+		secretWith("eks", "c-kubeconfig", "value", "not a kubeconfig at all"),
+		secretWith("eks", "c-user-kubeconfig", "value", staticAndExec),
+	)
+	r.log = slog.New(slog.NewTextHandler(&buf, nil))
+	r.cfg.Providers = mustPresets(t, "capi", "capa-eks")
+	r.cfg.ExecCredentials = true
+
+	ch, ok := discoverNS(t, r, "eks")
+	if !ok {
+		t.Fatal("expected the static credential to win after the first failed to parse")
+	}
+	// certData proves the winner was the static-credential Secret, i.e. the same
+	// one that carries the exec block and so appears in `shadowed`.
+	if !strings.Contains(ch.config, "certData") {
+		t.Fatalf("expected the static credential to be carried: %s", ch.config)
+	}
+	if strings.Contains(buf.String(), "cannot carry an exec credential") {
+		t.Errorf("warned while using the very secret it called passed over: %s", buf.String())
+	}
+}
+
+// Ordered correctly there is nothing to say, and a warning on every namespace
+// every interval is how a real one gets filtered out.
+func TestCorrectProviderOrderWarnsAboutNothing(t *testing.T) {
+	var buf bytes.Buffer
+	r, _ := newTestRegistrar(
+		managedNS("eks", "c"),
+		secretWith("eks", "c-kubeconfig", "value", tokenKubeconfig),
+		secretWith("eks", "c-user-kubeconfig", "value", execKubeconfig),
+	)
+	r.log = slog.New(slog.NewTextHandler(&buf, nil))
+	r.cfg.Providers = mustPresets(t, "capa-eks", "capi")
+	r.cfg.ExecCredentials = true
+
+	if _, ok := discoverNS(t, r, "eks"); !ok {
+		t.Fatal("expected one registration, got none")
+	}
+	if strings.Contains(buf.String(), "cannot carry an exec credential") {
+		t.Errorf("a correctly ordered list still warned: %s", buf.String())
+	}
+}
+
+// The global flag alone changes nothing: the provider must allow it too.
+func TestGlobalFlagAloneDoesNotEnableTranslation(t *testing.T) {
+	r, _ := newTestRegistrar(
+		managedNS("capi-c", "c"),
+		secretWith("capi-c", "c-kubeconfig", "value", execKubeconfig),
+	)
+	r.cfg.Providers = mustPresets(t, "capi")
+	r.cfg.ExecCredentials = true
+
+	if _, ok := discoverNS(t, r, "capi-c"); ok {
+		t.Error("capi translated an exec credential; only exec-bearing shapes may")
+	}
+}
+
+// And the provider alone changes nothing either.
+func TestProviderAloneDoesNotEnableTranslation(t *testing.T) {
+	r, _ := newTestRegistrar(
+		managedNS("eks", "c"),
+		secretWith("eks", "c-user-kubeconfig", "value", execKubeconfig),
+	)
+	r.cfg.Providers = mustPresets(t, "capa-eks")
+	r.cfg.ExecCredentials = false
+
+	if _, ok := discoverNS(t, r, "eks"); ok {
+		t.Error("capa-eks translated with --exec-credentials off")
+	}
+}
+
+func TestParseProviderExecSuffix(t *testing.T) {
+	p, err := ParseProvider("mine=*-user-kubeconfig=value=exec")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !p.AllowExec {
+		t.Error("the exec suffix did not reach AllowExec")
+	}
+	if _, err := ParseProvider("mine=*-kubeconfig=value=true"); err == nil {
+		t.Error("a 4th field other than \"exec\" was accepted")
+	}
+	plain, err := ParseProvider("mine=*-kubeconfig=value")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if plain.AllowExec {
+		t.Error("a 3-field spec enabled exec")
+	}
+}
+
+// The chart flattens a providers[] entry into the --provider DSL and the binary
+// parses it back. If the two drift, a custom provider silently stops being
+// configurable. The lease name has the same pin from both sides, and it exists
+// because those two did drift once.
+//
+// The literal is what `helm template --set providers[0].allowExec=true` renders.
+func TestProviderSpecMatchesWhatTheChartRenders(t *testing.T) {
+	const fromChart = "mytool=mytool-*-kubeconfig=admin.conf,admin.svc=exec"
+
+	p, err := ParseProvider(fromChart)
+	if err != nil {
+		t.Fatalf("the binary cannot parse what the chart renders: %v", err)
+	}
+	if p.Name != "mytool" {
+		t.Errorf("name = %q", p.Name)
+	}
+	if p.SecretNamePattern != "mytool-*-kubeconfig" {
+		t.Errorf("pattern = %q", p.SecretNamePattern)
+	}
+	if !slices.Equal(p.SecretKeys, []string{keyAdminConf, keyAdminSvc}) {
+		t.Errorf("keys = %v", p.SecretKeys)
+	}
+	if !p.AllowExec {
+		t.Error("the chart's =exec suffix did not reach AllowExec")
+	}
+	// And the three-field form the chart renders without allowExec.
+	plain, err := ParseProvider("mytool=mytool-*-kubeconfig=admin.conf,admin.svc")
+	if err != nil {
+		t.Fatalf("three-field form: %v", err)
+	}
+	if plain.AllowExec {
+		t.Error("a chart entry without allowExec enabled exec")
+	}
+}
+
+// capz-aks spells its glob the other way round from capa-eks: CAPZ appends
+// "-user" to "<cluster>-kubeconfig" rather than inserting it. A wrong glob here
+// matches nothing and the failure is silent.
+func TestCapzAksMatchesCAPZsSpelling(t *testing.T) {
+	r, _ := newTestRegistrar(
+		managedNS("aks", "c"),
+		secretWith("aks", "c-kubeconfig-user", "value", execKubeconfigWith(
+			"kubelogin", "get-token", "--server-id", "6dae42f8-4368-4678-94ff-3960e28e3630")),
+	)
+	r.cfg.Providers = mustPresets(t, "capz-aks")
+	r.cfg.ExecCredentials = true
+
+	ch, ok := discoverNS(t, r, "aks")
+	if !ok {
+		t.Fatal("capz-aks did not match <cluster>-kubeconfig-user")
+	}
+	if !strings.Contains(ch.config, "execProviderConfig") {
+		t.Errorf("no execProviderConfig emitted: %s", ch.config)
+	}
+	if !strings.Contains(ch.config, "AAD_SERVER_APPLICATION_ID") {
+		t.Errorf("the AAD server application id was not carried: %s", ch.config)
+	}
+}
+
+// CAPA's spelling must not match capz-aks, or one preset would swallow both and
+// the distinction the README documents would be untrue.
+func TestCapzAksDoesNotMatchTheCAPASpelling(t *testing.T) {
+	r, _ := newTestRegistrar(
+		managedNS("aks", "c"),
+		secretWith("aks", "c-user-kubeconfig", "value", execKubeconfig),
+	)
+	r.cfg.Providers = mustPresets(t, "capz-aks")
+	r.cfg.ExecCredentials = true
+
+	if _, ok := discoverNS(t, r, "aks"); ok {
+		t.Error("capz-aks matched CAPA's <cluster>-user-kubeconfig")
+	}
+}
+
+// The collision check runs on UPDATE too, not only on create: an address that
+// moves onto one another namespace already holds is the same collision, and it
+// is the path a re-pointed cluster actually takes.
+func TestServerCollisionIsCheckedWhenAnAddressMoves(t *testing.T) {
+	// `a` already sits at the k3k fixture's address, from another namespace.
+	incumbent := registeredAt("a", "other-ns", k3kServer)
+	// `b` is registered from testNS at a different address, and its kubeconfig
+	// now resolves to the address `a` holds.
+	moving := registeredAt("b", testNS, "https://192.0.2.99")
+
+	r, c := newTestRegistrar(
+		managedNS("other-ns", "a"), incumbent,
+		managedNS(testNS, "b"), kubeconfigSecret(testNS, "k3k-b-kubeconfig"), moving,
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Logf("reconcile reported: %v", err)
+	}
+
+	got := getSecret(t, c, "cluster-b")
+	if string(got.Data["server"]) == k3kServer {
+		t.Error("a registration moved onto an address another namespace already holds")
+	}
+}
+
+// A failed LIST must not be read as "no collision". Called directly rather than
+// through Reconcile: a reactor broad enough to reach this also kills the earlier
+// LISTs, so the pass would prove nothing about this function.
+func TestServerCollisionCheckFailsClosedOnAPIError(t *testing.T) {
+	r, c := newTestRegistrar()
+	c.PrependReactor("list", resourceSecrets, func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apiErrors.NewInternalError(io.ErrUnexpectedEOF)
+	})
+
+	err := r.claimServer(context.Background(), child{
+		cluster: "a", namespace: testNS, server: k3kServer,
+	})
+	if err == nil {
+		t.Fatal("a failed collision check was treated as no collision")
+	}
+	// And it must not be a conflictError: nothing was proven, so the caller has
+	// to retry rather than log a refusal and move on.
+	var conflict *conflictError
+	if errors.As(err, &conflict) {
+		t.Errorf("an API failure was reported as a refusal: %v", err)
+	}
+}
+
+// The audit is where an unreadable credential is actually noticed, and that
+// branch was never exercised end to end.
+func TestAuditBucketsAnUnreadableCredential(t *testing.T) {
+	broken := registeredSecret("broken", testNS)
+	broken.Data["config"] = []byte(`{"tlsClientConfig":{"certData":"!!!not base64"}}`)
+	absent := registeredSecret("absent", testNS)
+	delete(absent.Data, "config")
+
+	r, _ := newTestRegistrar(broken, absent)
+	if err := r.AuditUnrouted(context.Background()); err != nil {
+		t.Fatalf("audit: %v", err)
+	}
+
+	if got := testutil.ToFloat64(registrations.WithLabelValues(stateActive, expiryUnreadable)); got != 1 {
+		t.Errorf("credential_expiry=unreadable = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(registrations.WithLabelValues(stateActive, expiryAbsent)); got != 1 {
+		t.Errorf("credential_expiry=absent = %v, want 1", got)
+	}
+}
+
+// ArgoCD reads `project` and `shard` from the cluster Secret's Data, never from
+// its labels, so a prefixed label of either name is inert to ArgoCD and useful
+// to an ApplicationSet selector. Withholding it would break the selector and
+// protect nothing, which is why neither is in reservedSuffixes.
+func TestProjectAndShardLabelsStillPropagate(t *testing.T) {
+	ns := managedNS(testNS, "a")
+	ns.Labels[testPrefix+SuffixProject] = testProject
+	ns.Labels[testPrefix+SuffixShard] = "2"
+
+	r, c := newTestRegistrar(ns, kubeconfigSecret(testNS, "k3k-a-kubeconfig"))
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	got := getSecret(t, c, "cluster-a")
+	if got.Labels[testPrefix+SuffixProject] != testProject {
+		t.Errorf("the project label was withheld: %v", got.Labels)
+	}
+	if got.Labels[testPrefix+SuffixShard] != "2" {
+		t.Errorf("the shard label was withheld: %v", got.Labels)
+	}
+	// And they must not reach ArgoCD's own keys, which live in Data.
+	if _, ok := got.Data["project"]; ok {
+		t.Error("a propagated label reached ArgoCD's project data key")
+	}
+	if _, ok := got.Data["shard"]; ok {
+		t.Error("a propagated label reached ArgoCD's shard data key")
+	}
+}
+
+// An existing registration carrying those labels must survive the upgrade. This
+// is the regression the reservation would have caused: the sweep deleting a
+// label an ApplicationSet selects on.
+func TestExistingProjectLabelSurvivesReconcile(t *testing.T) {
+	existing := registeredSecret("a", testNS)
+	existing.Labels[testPrefix+SuffixProject] = testProject
+
+	ns := managedNS(testNS, "a")
+	ns.Labels[testPrefix+SuffixProject] = testProject
+
+	r, c := newTestRegistrar(ns, kubeconfigSecret(testNS, "k3k-a-kubeconfig"), existing)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := getSecret(t, c, "cluster-a"); got.Labels[testPrefix+SuffixProject] != testProject {
+		t.Errorf("an existing project label was swept: %v", got.Labels)
+	}
+}
+
+// ArgoCD's cluster indexer keys on strings.TrimRight(server, "/") and
+// GetClusterByURL trims the same way, so `https://x/` and `https://x` are one
+// cluster to ArgoCD. An exact-byte comparison here would let a trailing slash
+// walk past the collision check into the exact ambiguity it exists to prevent.
+func TestTrailingSlashCannotEvadeTheServerCollisionCheck(t *testing.T) {
+	kc := strings.Replace(k3kKubeconfig, k3kServer, k3kServer+"/", 1)
+
+	r, c := newTestRegistrar(
+		managedNS("other-ns", "a"),
+		registeredAt("a", "other-ns", k3kServer),
+		managedNS(testNS, "b"),
+		secretWith(testNS, "k3k-b-kubeconfig", "kubeconfig.yaml", kc),
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Logf("reconcile reported: %v", err)
+	}
+	if secretExists(t, c, "cluster-b") {
+		t.Error("a trailing slash evaded the collision check")
+	}
+}
+
+// And the stored address is normalised, so it matches what ArgoCD indexes.
+func TestServerIsStoredNormalised(t *testing.T) {
+	kc := strings.Replace(k3kKubeconfig, k3kServer, k3kServer+"/", 1)
+	pk, err := parseKubeconfig([]byte(kc), false)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if pk.server != k3kServer {
+		t.Errorf("server = %q, want %q", pk.server, k3kServer)
+	}
+}
+
+// A cluster Secret this registrar does not own is ambiguous to ArgoCD just the
+// same, so the check selects on ArgoCD's own label rather than ours.
+func TestForeignClusterSecretAlsoHoldsItsAddress(t *testing.T) {
+	foreign := &coreV1.Secret{
+		ObjectMeta: metaV1.ObjectMeta{
+			Name:      "hand-written",
+			Namespace: testTargetNS,
+			Labels:    map[string]string{argoSecretTypeLabel: argoSecretTypeValue},
+		},
+		Data: map[string][]byte{"server": []byte(k3kServer)},
+	}
+	r, c := newTestRegistrar(
+		foreign,
+		managedNS(testNS, "b"),
+		kubeconfigSecret(testNS, "k3k-b-kubeconfig"),
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Logf("reconcile reported: %v", err)
+	}
+	if secretExists(t, c, "cluster-b") {
+		t.Error("registered onto an address a hand-written cluster Secret already holds")
+	}
+}
+
+// An orphaned incumbent will be collected anyway; holding its address until then
+// refuses a rebuild for no reason.
+func TestDeadIncumbentReleasesItsAddress(t *testing.T) {
+	r, c := newTestRegistrar(
+		registeredAt("a", "vanished-ns", k3kServer),
+		managedNS(testNS, "b"),
+		kubeconfigSecret(testNS, "k3k-b-kubeconfig"),
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Logf("reconcile reported: %v", err)
+	}
+	if !secretExists(t, c, "cluster-b") {
+		t.Error("a registration whose namespace is gone blocked the address")
+	}
+}
+
+// Unless it is pinned. `prune: disabled` means the operator said keep it, and
+// unpinning is how they say otherwise.
+func TestPinnedDeadIncumbentKeepsItsAddress(t *testing.T) {
+	pinned := registeredAt("a", "vanished-ns", k3kServer)
+	pinned.Labels[PruneLabel(testPrefix)] = PruneDisabled
+
+	r, c := newTestRegistrar(
+		pinned,
+		managedNS(testNS, "b"),
+		kubeconfigSecret(testNS, "k3k-b-kubeconfig"),
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Logf("reconcile reported: %v", err)
+	}
+	if secretExists(t, c, "cluster-b") {
+		t.Error("a pinned registration's address was reclaimed against the operator's intent")
+	}
+	if !secretExists(t, c, "cluster-a") {
+		t.Error("the pinned registration was removed")
+	}
+}
+
+// The label sweep exempts the prune opt-out; the annotation sweep must too, or
+// pinning a registration via an annotation undoes itself one reconcile later.
+func TestPruneAnnotationSurvivesTheAnnotationSweep(t *testing.T) {
+	existing := registeredSecret("a", testNS)
+	existing.Annotations = map[string]string{
+		PruneLabel(testPrefix):  PruneDisabled,
+		testPrefix + "leftover": "should-go",
+	}
+	r, c := newTestRegistrar(
+		managedNS(testNS, "a"), kubeconfigSecret(testNS, "k3k-a-kubeconfig"), existing,
+	)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := getSecret(t, c, "cluster-a")
+	if got.Annotations[PruneLabel(testPrefix)] != PruneDisabled {
+		t.Errorf("the prune opt-out was swept from annotations: %v", got.Annotations)
+	}
+	if _, ok := got.Annotations[testPrefix+"leftover"]; ok {
+		t.Error("an ordinary prefixed annotation absent upstream survived the sweep")
 	}
 }

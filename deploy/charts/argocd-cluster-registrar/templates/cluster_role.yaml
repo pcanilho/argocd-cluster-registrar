@@ -17,11 +17,12 @@
 # nothing else -- in particular it does not watch the provisioner-written
 # kubeconfig Secrets, which would mean an informer over every Secret in the
 # cluster that could not be narrowed (they carry none of our labels). Those are
-# still read directly, which is why `get` appears below alongside `list`.
+# still read directly, by LIST only: a name cannot be known in advance, and
+# cluster-wide `get` on Secrets is deliberately not granted.
 #
 # Residual risk worth naming rather than hiding: cluster-wide Secret READ still
 # lets this ServiceAccount read every credential in the cluster. That is inherent
-# to label-driven discovery across arbitrary namespaces. What it does NOT do is
+# to label-driven discovery across arbitrary namespaces. What it does not do is
 # hold them in memory: nothing Secret-shaped is ever cached.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole

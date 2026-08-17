@@ -34,8 +34,11 @@ jobs:
           go-version: stable
           check-latest: true
 
+      # Pinned to a patch, not a major: `@v3` floated to cosign v2.5.2, and v4
+      # installs cosign v3.0.6, whose default signature format differs. Consumers
+      # have to see that coming, so it must not float again.
       - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@v4.1.2
 
       # goreleaser has no SBOM generator of its own; it shells out to syft, and
       # fails the release if it is missing. The images do not need this.
@@ -50,17 +53,22 @@ jobs:
         run: |
           set -euo pipefail
           version="${TAG#v}"
+          # A prerelease reuses its target version's notes: v0.6.0-rc1 reads
+          # '## [0.6.0]'. The changelog documents releases, not the candidates on
+          # the way to one, and a gate demanding a section per RC would fail the
+          # run before it ever reached the signing step an RC exists to exercise.
+          lookup="${version%%-*}"
           notes_file="$RUNNER_TEMP/notes.md"
           # Body of the matching '## [version]' section, stopping at the next
           # '## [' header or EOF. The header line itself is dropped, since the
           # release title already carries the version.
-          awk -v ver="$version" '
+          awk -v ver="$lookup" '
             $0 ~ "^## \\[" ver "\\]" { found = 1; next }
             found && /^## \[/        { exit }
             found                    { print }
           ' CHANGELOG.md > "$notes_file"
           if [ ! -s "$notes_file" ]; then
-            echo "::error::No CHANGELOG.md section found for ${TAG} (looked for '## [${version}]'). Add the section before tagging."
+            echo "::error::No CHANGELOG.md section found for ${TAG} (looked for '## [${lookup}]'). Add the section before tagging."
             exit 1
           fi
           echo "notes_file=$notes_file" >> "$GITHUB_OUTPUT"

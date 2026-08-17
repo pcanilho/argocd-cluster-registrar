@@ -8,7 +8,7 @@ import (
 
 // Shape taken verbatim from a live k3k v1.2.0-rc3 `k3k-<name>-kubeconfig`
 // Secret: client certificates, and a server URL that is the LoadBalancer address
-// on port 443 (NOT the in-cluster Service DNS name on 6443).
+// on port 443 (not the in-cluster Service DNS name on 6443).
 const k3kKubeconfig = `apiVersion: v1
 kind: Config
 clusters:
@@ -131,8 +131,13 @@ current-context: capi-child-admin@capi-child
 `
 
 // CAPA's EKS path writes a SECOND `<cluster>-user-kubeconfig` carrying an exec
-// credential. It satisfies the CAPI glob and the `value` key, but cannot be
-// copied into an ArgoCD Secret at all.
+// credential. Shape taken from cluster-api-provider-aws
+// pkg/cloud/services/eks/config.go, whose default TokenMethod is
+// iam-authenticator, so `aws-iam-authenticator token -i <eksClusterName>`.
+//
+// The args matter and must not be dropped from this fixture. Without them a
+// translation attempt would fail for lack of a cluster name rather than because
+// the gate is shut, and the refusal test would keep passing with the gate open.
 const execKubeconfig = `apiVersion: v1
 kind: Config
 clusters:
@@ -146,6 +151,10 @@ users:
     exec:
       apiVersion: client.authentication.k8s.io/v1beta1
       command: aws-iam-authenticator
+      args:
+      - token
+      - -i
+      - my-eks-cluster
 current-context: managed
 contexts:
 - name: managed
@@ -155,7 +164,8 @@ contexts:
 `
 
 func TestParseKubeconfigKamajiShape(t *testing.T) {
-	server, _, err := parseKubeconfig([]byte(kamajiKubeconfig))
+	pk, err := parseKubeconfig([]byte(kamajiKubeconfig), false)
+	server := pk.server
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -165,7 +175,8 @@ func TestParseKubeconfigKamajiShape(t *testing.T) {
 }
 
 func TestParseKubeconfigCAPIShape(t *testing.T) {
-	server, config, err := parseKubeconfig([]byte(capiKubeconfig))
+	pk, err := parseKubeconfig([]byte(capiKubeconfig), false)
+	server, config := pk.server, pk.config
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -178,7 +189,8 @@ func TestParseKubeconfigCAPIShape(t *testing.T) {
 }
 
 func TestParseKubeconfigClientCerts(t *testing.T) {
-	server, config, err := parseKubeconfig([]byte(k3kKubeconfig))
+	pk, err := parseKubeconfig([]byte(k3kKubeconfig), false)
+	server, config := pk.server, pk.config
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -213,7 +225,8 @@ func TestParseKubeconfigClientCerts(t *testing.T) {
 }
 
 func TestParseKubeconfigBearerToken(t *testing.T) {
-	server, config, err := parseKubeconfig([]byte(tokenKubeconfig))
+	pk, err := parseKubeconfig([]byte(tokenKubeconfig), false)
+	server, config := pk.server, pk.config
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -243,7 +256,7 @@ func TestParseKubeconfigErrors(t *testing.T) {
 		"cert without key": "apiVersion: v1\nclusters:\n- name: a\n  cluster:\n    server: https://x\nusers:\n- name: a\n  user:\n    client-certificate-data: Y2VydA==\n",
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, _, err := parseKubeconfig([]byte(in)); err == nil {
+			if _, err := parseKubeconfig([]byte(in), false); err == nil {
 				t.Error("expected an error, got nil")
 			}
 		})
@@ -308,7 +321,7 @@ func TestPropagatedLabelsHonoursCustomPrefix(t *testing.T) {
 		ManagedByLabel(p):      "reg",
 		ClusterLabel(p):        "c1",
 		"example.com/tier":     "prod",
-		"nas.canilho.net/flux": "true", // different prefix, must NOT leak
+		"nas.canilho.net/flux": "true", // different prefix, must not leak
 	}, p)
 	if len(got) != 1 || got["example.com/tier"] != "prod" {
 		t.Fatalf("expected only example.com/tier, got %v", got)
@@ -319,7 +332,8 @@ func TestPropagatedLabelsHonoursCustomPrefix(t *testing.T) {
 // own config) so a `vc-*` glob matches both. Matching on name alone picked the
 // decoy and skipped the namespace entirely.
 func TestParseKubeconfigVclusterShape(t *testing.T) {
-	server, config, err := parseKubeconfig([]byte(vclusterKubeconfig))
+	pk, err := parseKubeconfig([]byte(vclusterKubeconfig), false)
+	server, config := pk.server, pk.config
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -362,7 +376,8 @@ current-context: sandbox
 `
 
 func TestParseKubeconfigHonoursCurrentContext(t *testing.T) {
-	server, config, err := parseKubeconfig([]byte(multiContextKubeconfig))
+	pk, err := parseKubeconfig([]byte(multiContextKubeconfig), false)
+	server, config := pk.server, pk.config
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -395,7 +410,7 @@ users:
 - name: ub
   user: {token: tb}
 `
-	if _, _, err := parseKubeconfig([]byte(noCurrent)); err == nil {
+	if _, err := parseKubeconfig([]byte(noCurrent), false); err == nil {
 		t.Error("expected a refusal on an ambiguous multi-entry kubeconfig, got nil")
 	}
 }
@@ -410,9 +425,128 @@ func TestParseKubeconfigRejectsUnusableCredentials(t *testing.T) {
 		"unknown ctx":  "apiVersion: v1\nclusters:\n- name: a\n  cluster: {server: https://a}\n- name: b\n  cluster: {server: https://b}\nusers:\n- name: ua\n  user: {token: t}\n- name: ub\n  user: {token: u}\ncontexts:\n- name: c\n  context: {cluster: zzz, user: ua}\ncurrent-context: c\n",
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, _, err := parseKubeconfig([]byte(in)); err == nil {
+			if _, err := parseKubeconfig([]byte(in), false); err == nil {
 				t.Error("expected an error, got nil")
 			}
 		})
+	}
+}
+
+// ArgoCD resolves this one server value through rest.InClusterConfig() and
+// ignores caData/certData/keyData entirely, so a child registered under it
+// silently points at the management cluster and looks healthy doing it.
+func TestRefusesInClusterServerAddress(t *testing.T) {
+	for _, srv := range []string{
+		"https://kubernetes.default.svc",
+		"https://kubernetes.default.svc/",
+	} {
+		kc := "apiVersion: v1\nclusters:\n- name: c\n  cluster:\n    server: " + srv +
+			"\n    certificate-authority-data: Y2E=\nusers:\n- name: u\n  user:\n    token: t\n"
+		if _, err := parseKubeconfig([]byte(kc), false); err == nil {
+			t.Errorf("server %q was accepted", srv)
+		}
+	}
+}
+
+func TestCarriesProxyURL(t *testing.T) {
+	kc := "apiVersion: v1\nclusters:\n- name: c\n  cluster:\n    server: https://a\n" +
+		"    certificate-authority-data: Y2E=\n    proxy-url: http://proxy.internal:3128\n" +
+		"users:\n- name: u\n  user:\n    token: t\n"
+	pk, err := parseKubeconfig([]byte(kc), false)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var got argoClusterConfig
+	if err := json.Unmarshal([]byte(pk.config), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.ProxyURL != "http://proxy.internal:3128" {
+		t.Errorf("proxyUrl = %q", got.ProxyURL)
+	}
+}
+
+// Absent proxy-url must not emit an empty field.
+func TestNoProxyURLEmitsNoProxyURL(t *testing.T) {
+	pk, err := parseKubeconfig([]byte(k3kKubeconfig), false)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if strings.Contains(pk.config, "proxyUrl") {
+		t.Errorf("config carries an empty proxyUrl: %s", pk.config)
+	}
+}
+
+func TestRefusesUnusableProxyURLs(t *testing.T) {
+	cases := map[string]string{
+		"bad scheme":    "    proxy-url: ftp://p:21\n",
+		"embeds creds":  "    proxy-url: http://user:pass@p:3128\n",
+		"not a url":     "    proxy-url: \"::\"\n",
+		"with insecure": "    proxy-url: http://p:3128\n    insecure-skip-tls-verify: true\n",
+	}
+	for name, line := range cases {
+		t.Run(name, func(t *testing.T) {
+			kc := "apiVersion: v1\nclusters:\n- name: c\n  cluster:\n    server: https://a\n" +
+				"    certificate-authority-data: Y2E=\n" + line +
+				"users:\n- name: u\n  user:\n    token: t\n"
+			if _, err := parseKubeconfig([]byte(kc), false); err == nil {
+				t.Error("accepted")
+			}
+		})
+	}
+}
+
+// insecure is reported so the caller can warn; it stays copied through.
+func TestInsecureIsReportedToTheCaller(t *testing.T) {
+	kc := "apiVersion: v1\nclusters:\n- name: c\n  cluster:\n    server: https://a\n" +
+		"    insecure-skip-tls-verify: true\nusers:\n- name: u\n  user:\n    token: t\n"
+	pk, err := parseKubeconfig([]byte(kc), false)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !pk.insecure {
+		t.Error("insecure was not reported")
+	}
+}
+
+// An exact string compare missed the port and FQDN spellings, all of which reach
+// the same apiserver ArgoCD would use through rest.InClusterConfig().
+func TestInClusterServerIsRefusedInEverySpelling(t *testing.T) {
+	for _, srv := range []string{
+		"https://kubernetes.default.svc",
+		"https://kubernetes.default.svc/",
+		"https://kubernetes.default.svc:443",
+		"https://kubernetes.default",
+		"https://kubernetes.default:443",
+		"https://kubernetes.default.svc.cluster.local",
+		"https://kubernetes.default.svc.cluster.local:443",
+		"https://KUBERNETES.DEFAULT.SVC",
+	} {
+		kc := "apiVersion: v1\nclusters:\n- name: c\n  cluster:\n    server: " + srv +
+			"\n    certificate-authority-data: Y2E=\nusers:\n- name: u\n  user:\n    token: t\n"
+		if _, err := parseKubeconfig([]byte(kc), false); err == nil {
+			t.Errorf("server %q was accepted", srv)
+		}
+	}
+	// A real cluster that merely looks similar must still register.
+	kc := "apiVersion: v1\nclusters:\n- name: c\n  cluster:\n" +
+		"    server: https://kubernetes.default.example.com\n    certificate-authority-data: Y2E=\n" +
+		"users:\n- name: u\n  user:\n    token: t\n"
+	if _, err := parseKubeconfig([]byte(kc), false); err != nil {
+		t.Errorf("a real cluster with a similar name was refused: %v", err)
+	}
+}
+
+// socks5h is a common spelling and routes DNS through the proxy, which is the
+// point of using one. Refusing it turned a working registration into a failure.
+func TestProxySchemeSocks5hIsAccepted(t *testing.T) {
+	kc := "apiVersion: v1\nclusters:\n- name: c\n  cluster:\n    server: https://a\n" +
+		"    certificate-authority-data: Y2E=\n    proxy-url: socks5h://p:1080\n" +
+		"users:\n- name: u\n  user:\n    token: t\n"
+	pk, err := parseKubeconfig([]byte(kc), false)
+	if err != nil {
+		t.Fatalf("socks5h was refused: %v", err)
+	}
+	if !strings.Contains(pk.config, "socks5h://p:1080") {
+		t.Errorf("proxyUrl was not carried: %s", pk.config)
 	}
 }

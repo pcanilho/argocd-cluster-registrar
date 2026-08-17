@@ -38,6 +38,7 @@ var (
 	secretKey         string
 	labelPrefix       string
 	demotedTTL        time.Duration
+	execCredentials   bool
 
 	leaderElect            bool
 	leaderElectionID       string
@@ -46,14 +47,9 @@ var (
 )
 
 // resolveProviders turns the flags into the provider list, honouring the
-// pre-0.3.0 single-provider flags.
-//
-// The gate is `Changed`, NOT emptiness, and that distinction is the whole point:
-// --secret-name-pattern and --secret-key both carry non-empty defaults, so they
-// are never unset. Testing them for "" would take the legacy branch every single
-// time and silently ignore --provider entirely -- the same class of quiet
-// misconfiguration the 0.1.x migration note warns about, which is precisely what
-// this compatibility path exists to avoid.
+// pre-0.3.0 single-provider flags. The gate is `Changed`, not emptiness:
+// --secret-name-pattern and --secret-key carry non-empty defaults, so testing
+// them for "" would take the legacy branch every time and ignore --provider.
 func resolveProviders(cmd *cobra.Command) ([]registrar.Provider, error) {
 	legacy := cmd.Flags().Changed("secret-name-pattern") || cmd.Flags().Changed("secret-key")
 
@@ -87,33 +83,21 @@ func resolveProviders(cmd *cobra.Command) ([]registrar.Provider, error) {
 	return []registrar.Provider{p}, nil
 }
 
-// options is everything the flags decide, separated from the act of using them.
-//
-// Extracted because the two struct literals below are hand-written: a field left
-// off leaves the option at its zero value, and not every zero value is harmless.
-// Assembling them in a pure function is what makes "every flag reaches the option
-// it configures" a thing a test can assert without a cluster.
-//
-// Warnings are returned as DATA rather than logged in place. A function that logs
-// is a function whose warnings can only be tested by capturing a logger, which is
-// how a warning ends up silently never firing.
+// options is everything the flags decide, separated from using them so it is
+// testable without a cluster. Warnings are returned rather than logged for the
+// same reason.
 type options struct {
 	cfg      registrar.Config
 	ctrl     registrar.ControllerOptions
 	warnings []string
 }
 
-// buildOptions maps the parsed flags onto the registrar's configuration.
-//
-// It talks to nothing. Everything below it in RunE -- building a client, taking a
-// lease, starting a manager -- needs a cluster and stays untestable; this is the
-// part that does not have to be.
+// buildOptions maps the parsed flags onto the registrar's configuration. It
+// talks to nothing; everything below it in RunE needs a cluster.
 func buildOptions(cmd *cobra.Command) (options, error) {
 	if interval <= 0 {
-		// RequeueAfter: 0 means "do not requeue", so a Helm value of
-		// `interval: 0s` would leave every registration reconciled once and
-		// then never refreshed again -- silently, until a certificate
-		// rotation broke it days later.
+		// RequeueAfter: 0 means "do not requeue", so `interval: 0s` would leave
+		// every registration reconciled once and never refreshed again.
 		return options{}, fmt.Errorf("--interval must be positive, got %s", interval)
 	}
 
@@ -129,6 +113,7 @@ func buildOptions(cmd *cobra.Command) (options, error) {
 		LabelPrefix:     labelPrefix,
 		DryRun:          dryRun,
 		DemotedTTL:      demotedTTL,
+		ExecCredentials: execCredentials,
 	}
 	if err := cfg.Validate(); err != nil {
 		return options{}, err
@@ -136,13 +121,9 @@ func buildOptions(cmd *cobra.Command) (options, error) {
 
 	var warnings []string
 
-	// Derived unless it was set, so an instance deployed from a plain manifest
-	// takes the same lease as a chart-deployed one with identical configuration.
-	// The chart has always derived it; the binary defaulted to a constant, so the
-	// two would not contend and both would reconcile.
-	//
-	// Gated on Changed rather than emptiness, matching resolveProviders: an
-	// explicit empty value is a mistake worth reporting, not a request to derive.
+	// Derived unless set, so a manifest-deployed instance takes the same lease as
+	// a chart-deployed one with identical configuration. Gated on Changed, not
+	// emptiness: an explicit empty value is a mistake, not a request to derive.
 	lease := leaderElectionID
 	if !cmd.Flags().Changed("leader-election-id") {
 		lease = registrar.LeaderElectionID(labelPrefix, managedByValue)
@@ -150,23 +131,37 @@ func buildOptions(cmd *cobra.Command) (options, error) {
 		return options{}, fmt.Errorf("--leader-election-id must not be empty; omit it to derive one")
 	}
 
-	// A local, deliberately NOT the package variable. Assigning to `leaderElect`
-	// here mutated global state from inside a request path: harmless in a process
-	// that runs this once, but in a test binary the value leaks into every case
-	// that runs afterwards.
+	// A local, not the package variable: assigning to `leaderElect` would leak
+	// into every test case that runs afterwards.
 	elect := leaderElect
 	if elect && dryRun {
-		// Same hazard as a second live instance, slower: a --dry-run process
-		// holding the lease is a registrar that reports what it would do while
+		// A --dry-run process holding the lease reports what it would do while
 		// the real one waits.
 		warnings = append(warnings, "--dry-run disables leader election")
 		elect = false
 	}
 
+	// Both halves of the exec gate must be on, and a half-on configuration is a
+	// silent no-op in one direction and a silent refusal in the other.
+	anyAllowsExec := false
+	for _, p := range providers {
+		if p.AllowExec {
+			anyAllowsExec = true
+			break
+		}
+	}
+	switch {
+	case execCredentials && !anyAllowsExec:
+		warnings = append(warnings, "--exec-credentials is set but no configured provider "+
+			"allows it, so nothing will be translated; the capa-eks and capz-aks presets do")
+	case !execCredentials && anyAllowsExec:
+		warnings = append(warnings, "a configured provider allows exec credentials but "+
+			"--exec-credentials is off, so its kubeconfigs will still be refused")
+	}
+
 	if demotedTTL > 0 && demotedTTL < interval {
-		// A demoted registration is only revisited when its namespace is
-		// requeued, so nothing can expire faster than the interval and a smaller
-		// TTL reads as a promise the loop cannot keep.
+		// Demoted registrations are only revisited when their namespace is
+		// requeued, so nothing can expire faster than the interval.
 		warnings = append(warnings, fmt.Sprintf(
 			"--demoted-ttl %s is shorter than --interval %s, so expiry cannot happen sooner than %s",
 			demotedTTL, interval, interval))
@@ -214,9 +209,14 @@ does not leave a broken entry behind in ArgoCD. Renaming a cluster instead
 DEMOTES the old Secret: it is hidden from ArgoCD but kept, so reverting the
 rename restores it.
 
+Prefixed labels AND annotations on the source namespace are copied onto the
+cluster Secret, so an ApplicationSet can select or template on them.
+
 A registration is never taken over. If the Secret already exists and records a
 different source namespace, or is not ours at all, it is refused and logged. An
-unclaimed name contested by several namespaces goes to the oldest.`,
+unclaimed name contested by several namespaces goes to the oldest, and an address
+another namespace already registered is refused outright, because ArgoCD
+identifies a cluster by its server URL.`,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		level := slog.LevelInfo
 		if debug {
@@ -292,7 +292,7 @@ func registerFlags(f *pflag.FlagSet) {
 	// and StringSlice would split it into separate providers.
 	f.StringArrayVar(&providerSpecs, "provider", nil,
 		"provisioner to look for; repeatable. One of "+strings.Join(registrar.PresetNames(), ", ")+
-			", or a custom \"name=pattern=key[,key...]\". Defaults to k3k")
+			", or a custom \"name=pattern=key[,key...][=exec]\". Defaults to k3k")
 	// Superseded by --provider, kept so a 0.2.x values file keeps working. Note
 	// these defaults are never empty, which is why resolveProviders gates on
 	// Changed() rather than on the values.
@@ -301,11 +301,12 @@ func registerFlags(f *pflag.FlagSet) {
 	f.StringVar(&secretKey, "secret-key", "kubeconfig.yaml",
 		"DEPRECATED, use --provider: key inside that Secret holding the kubeconfig")
 	f.StringVar(&labelPrefix, "label-prefix", registrar.DefaultLabelPrefix,
-		"prefix for the labels read from the source namespace and copied onto the cluster Secret")
+		"prefix for the labels and annotations read from the source namespace and "+
+			"copied onto the cluster Secret")
 	f.BoolVar(&leaderElect, "leader-elect", false,
 		"only reconcile while holding the lease, so two identically configured instances do not both run")
 	// Derived from the configuration that decides whether two instances actually
-	// collide, NOT from the release name: ownership is established purely by
+	// collide, not from the release name: ownership is established purely by
 	// label-prefix and managed-by, so instances differing only in release name
 	// contend for the same Secrets and must contend for the same lease.
 	f.StringVar(&leaderElectionID, "leader-election-id", "",
@@ -318,8 +319,14 @@ func registerFlags(f *pflag.FlagSet) {
 	// unauthenticated port on every install that never asked for one.
 	f.StringVar(&metricsBindAddress, "metrics-bind-address", "0",
 		`address serving Prometheus metrics; "0" disables it, which is the default`)
-	// Off by default. Demotion is the reversible half of removal, so putting a
-	// clock on it also puts a clock on how long a mistaken rename can be undone.
+	// Separate from the per-provider AllowExec: that says a Secret shape is
+	// exec-bearing, this says the ArgoCD deployment holds the cloud identity such
+	// a registration would authenticate as.
+	f.BoolVar(&execCredentials, "exec-credentials", false,
+		"translate exec credential plugins (EKS, AKS) into ArgoCD's argocd-k8s-auth "+
+			"configuration; only affects providers that allow it, such as capa-eks")
+	// A clock on demotion is also a clock on how long a mistaken rename can be
+	// undone, hence off by default.
 	f.DurationVar(&demotedTTL, "demoted-ttl", 0,
 		"delete a demoted registration once it has been superseded this long; 0 keeps it indefinitely")
 }
