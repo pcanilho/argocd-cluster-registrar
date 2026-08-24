@@ -31,7 +31,12 @@ env:
   # Must be v2+. golangci-lint-action v9 rejects v1 outright
   # ("golangci-lint v1 is not supported by golangci-lint-action >= v7"), so the
   # previous 'v1.60' meant the lint job could never start.
-  GOLANGCI_VERSION: 'v2.12'
+  # Must also track the Go release that GO_VERSION resolves to: golangci-lint
+  # typechecks the stdlib with its own vendored go/types, and an older one
+  # cannot parse newer stdlib sources. v2.12 failed against Go 1.27 with
+  # "could not import math/rand/v2 (method must have no type parameters)".
+  # v2.13.0 added go1.27 support.
+  GOLANGCI_VERSION: 'v2.13'
 
 jobs:
   lint:
