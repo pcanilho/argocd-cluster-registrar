@@ -235,7 +235,8 @@ func awsCredential(clusterName, region string) execCredential {
 // a source kubeconfig would let a namespace choose which identity ArgoCD
 // presents, and `--login devicecode` or `azurecli` cannot work in a pod anyway.
 //
-//nolint:unparam // the error is required by execTranslators; kubelogin cannot fail
+// The error return is always nil. It exists because execTranslators requires
+// this signature, and kubelogin has nothing that can fail here.
 func translateKubelogin(e *kubeconfigExec) (execCredential, error) {
 	env := map[string]string{}
 	if v, ok := execFlag(e.Args, "--server-id"); ok {
