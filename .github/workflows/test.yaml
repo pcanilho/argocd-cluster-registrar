@@ -126,7 +126,7 @@ jobs:
       # (3.14 reports 1.29, 3.15 reports 1.30). Whichever helm the runner image
       # happens to ship would otherwise decide whether these renders pass.
       - name: Setup Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: v3.18.4
 
