@@ -105,9 +105,14 @@ jobs:
       - name: The apiserver authn/authz arm stays out of the binary
         run: |
           set -euo pipefail
-          if go list -deps ./... | grep -q '^k8s.io/apiserver'; then
+          # Captured, not piped: `grep -q` exits on the first match, and under
+          # `pipefail` the SIGPIPE that kills the producer is reported as the
+          # pipeline's status, so a match would read as a miss.
+          deps=$(go list -deps ./...)
+          hits=$(grep '^k8s.io/apiserver' <<<"$deps" || true)
+          if [ -n "$hits" ]; then
             echo "::error::k8s.io/apiserver is linked; pkg/metrics/filters was probably imported"
-            go list -deps ./... | grep '^k8s.io/apiserver' | head -20
+            head -20 <<<"$hits"
             exit 1
           fi
 
@@ -255,8 +260,9 @@ jobs:
         run: |
           set -euo pipefail
           chart=deploy/charts/argocd-cluster-registrar
-          got=$(helm template t "$chart" --set leaderElection.enabled=true \
-            | grep -o 'leader-election-id=[a-z0-9-]*' | head -1 | cut -d= -f2)
+          rendered=$(helm template t "$chart" --set leaderElection.enabled=true)
+          ids=$(grep -o 'leader-election-id=[a-z0-9-]*' <<<"$rendered")
+          got=$(head -1 <<<"$ids" | cut -d= -f2)
           want=acr-991221237547448b
           if [ "$got" != "$want" ]; then
             echo "::error::chart renders lease ${got}, the binary derives ${want}"
@@ -302,12 +308,14 @@ jobs:
           # --sort=-v:refname calls v0.6.0-rc1 the newest tag, and `sort -V` then
           # puts 0.6.0 ahead of it, so a chart correctly ahead of the last release
           # fails the check the moment a candidate for it is tagged.
-          latest=$(git tag -l 'v*.*.*' --sort=-v:refname | sed '/-/d; s/^v//' | head -1)
+          tags=$(git tag -l 'v*.*.*' --sort=-v:refname | sed '/-/d; s/^v//')
+          latest=$(head -1 <<<"$tags")
           if [ -z "$latest" ]; then
             echo "no tags yet, nothing to compare against"
             exit 0
           fi
-          oldest=$(printf '%s\n%s\n' "$chart_version" "$latest" | sort -V | head -1)
+          sorted=$(printf '%s\n%s\n' "$chart_version" "$latest" | sort -V)
+          oldest=$(head -1 <<<"$sorted")
           if [ "$chart_version" != "$latest" ] && [ "$oldest" = "$chart_version" ]; then
             echo "::error::Chart.yaml is $chart_version but the latest tag is $latest; a local install would pull a stale image"
             exit 1
@@ -376,8 +384,8 @@ jobs:
               exit 1
             fi
           done
-          helm template t "$chart" --set demotedTTL=720h \
-            | grep -q -- '--demoted-ttl=720h' || {
+          rendered=$(helm template t "$chart" --set demotedTTL=720h)
+          grep -q -- '--demoted-ttl=720h' <<<"$rendered" || {
             echo "::error::a configured demotedTTL did not reach the pod"; exit 1; }
 
       # An empty --metrics-bind-address means ":8080" to controller-runtime, not
@@ -621,8 +629,9 @@ jobs:
           set -euo pipefail
           # Not `head -1`: every namespace has a `default` ServiceAccount and it
           # sorts before ours, so that silently tested the wrong identity.
-          name=$(kubectl get sa -n registrar -o name \
-            | grep argocd-cluster-registrar | head -1 | cut -d/ -f2)
+          sas=$(kubectl get sa -n registrar -o name)
+          matched=$(grep argocd-cluster-registrar <<<"$sas")
+          name=$(head -1 <<<"$matched" | cut -d/ -f2)
           test -n "$name"
           sa="system:serviceaccount:registrar:$name"
           echo "asserting against $sa"
@@ -686,8 +695,8 @@ jobs:
             # Grep the distinctive half: "records no source namespace" also appears
             # in the adoption warning, which would make this pass without the audit
             # having run at all.
-            if kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar \
-                 | grep -q 'it can never be collected'; then
+            logs=$(kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar || true)
+            if grep -q 'it can never be collected' <<<"$logs"; then
               echo "audit reported it after $((i*5))s"
               kubectl delete secret cluster-audited -n argocd
               exit 0
@@ -727,8 +736,9 @@ jobs:
             kubectl logs -n registrar deploy/registrar-argocd-cluster-registrar --tail=30
             exit 1
           fi
-          if kubectl get secret cluster-hand -n argocd \
-               -o jsonpath='{.metadata.labels.argocd-cluster-registrar/managed-by}' | grep -q .; then
+          owner=$(kubectl get secret cluster-hand -n argocd \
+            -o jsonpath='{.metadata.labels.argocd-cluster-registrar/managed-by}' || true)
+          if [ -n "$owner" ]; then
             echo "::error::a hand-registered cluster Secret was relabelled as ours"
             exit 1
           fi
@@ -883,7 +893,8 @@ jobs:
           kubectl get secret cluster-scoped -n argocd >/dev/null || {
             echo "::error::a registration was deleted when its namespace left scope"
             kubectl logs -n registrar "$dep" --tail=50; exit 1; }
-          kubectl logs -n registrar "$dep" | grep -q 'no longer carries the ownership label' || {
+          logs=$(kubectl logs -n registrar "$dep" || true)
+          grep -q 'no longer carries the ownership label' <<<"$logs" || {
             echo "::error::the namespace left scope without the controller noticing"
             kubectl logs -n registrar "$dep" --tail=50; exit 1; }
 
@@ -928,10 +939,12 @@ jobs:
           kubectl create secret generic k3k-usurper-kubeconfig \
             -n k3k-usurper --from-file=kubeconfig.yaml=/tmp/usurper.yaml
           for i in $(seq 1 12); do
-            kubectl logs -n registrar "$dep" | grep -q 'conflict=incumbent' && break
+            logs=$(kubectl logs -n registrar "$dep" || true)
+            grep -q 'conflict=incumbent' <<<"$logs" && break
             sleep 5
           done
-          kubectl logs -n registrar "$dep" | grep -q 'conflict=incumbent' || {
+          logs=$(kubectl logs -n registrar "$dep" || true)
+          grep -q 'conflict=incumbent' <<<"$logs" || {
             echo "::error::the second claimant was never refused as an incumbency"
             kubectl logs -n registrar "$dep" --tail=50; exit 1; }
 
@@ -1025,8 +1038,9 @@ jobs:
           kubectl label --overwrite namespace zzz-first \
             argocd-cluster-registrar/cluster=contested
           for i in $(seq 1 12); do
-            if kubectl get secret cluster-contested -n argocd \
-                 -o jsonpath='{.metadata.labels.argocd\.argoproj\.io/secret-type}' | grep -q cluster; then
+            stype=$(kubectl get secret cluster-contested -n argocd \
+              -o jsonpath='{.metadata.labels.argocd\.argoproj\.io/secret-type}' 2>/dev/null || true)
+            if grep -q cluster <<<"$stype"; then
               echo "restored after $((i*5))s"
               exit 0
             fi
