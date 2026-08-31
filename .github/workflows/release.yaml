@@ -43,7 +43,7 @@ jobs:
       # goreleaser has no SBOM generator of its own; it shells out to syft, and
       # fails the release if it is missing. The images do not need this.
       - name: Install Syft
-        uses: anchore/sbom-action/download-syft@v0.24.0
+        uses: anchore/sbom-action/download-syft@v0.24.2
 
       # Release notes come from CHANGELOG.md.
       - name: Extract changelog section
