@@ -331,7 +331,7 @@ func ParseProvider(spec string) (Provider, error) {
 	}
 
 	var keys []string
-	for _, k := range strings.Split(parts[2], ",") {
+	for k := range strings.SplitSeq(parts[2], ",") {
 		if k = strings.TrimSpace(k); k != "" {
 			keys = append(keys, k)
 		}
@@ -632,8 +632,7 @@ func (r *Registrar) ReconcileOne(ctx context.Context, nsName string) (bool, erro
 	}
 
 	if err := r.apply(ctx, c); err != nil {
-		var conflict *conflictError
-		if errors.As(err, &conflict) {
+		if conflict, ok := errors.AsType[*conflictError](err); ok {
 			// Not a failure: a contested name persists until a human fixes it, and
 			// counting it would fail every pass forever. Still logged at Error,
 			// because a silently resolved conflict over a credential-bearing Secret
@@ -880,8 +879,7 @@ func (r *Registrar) discoverOne(ctx context.Context, ns *coreV1.Namespace) (chil
 	// one claiming the same name.
 	candidates, shadowed, err := r.findKubeconfigCandidates(ctx, ns.Name)
 	if err != nil {
-		var apiErr *apiFailure
-		if errors.As(err, &apiErr) {
+		if _, ok := errors.AsType[*apiFailure](err); ok {
 			// A genuine API failure, not "the provisioner has not written it
 			// yet". Logging this as routine is how a fleet-wide deregistration
 			// used to look reassuring in the logs.
@@ -1397,13 +1395,11 @@ func (r *Registrar) apply(ctx context.Context, c child) error {
 	maps.Copy(labels, c.labels)
 
 	want := &coreV1.Secret{
-		ObjectMeta: metaV1.ObjectMeta{
-			Name:        secretName(c.cluster),
-			Namespace:   r.cfg.TargetNamespace,
-			Labels:      labels,
-			Annotations: c.annotations,
-		},
-		Type: coreV1.SecretTypeOpaque,
+		Name:        secretName(c.cluster),
+		Namespace:   r.cfg.TargetNamespace,
+		Labels:      labels,
+		Annotations: c.annotations,
+		Type:        coreV1.SecretTypeOpaque,
 		StringData: map[string]string{
 			"name":   c.cluster,
 			"server": c.server,
