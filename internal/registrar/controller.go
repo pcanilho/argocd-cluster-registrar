@@ -8,7 +8,6 @@ import (
 
 	"github.com/go-logr/logr"
 	coreV1 "k8s.io/api/core/v1"
-	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -261,7 +260,7 @@ func (r *Registrar) Start(ctx context.Context, opts ControllerOptions) error {
 		for _, k := range keys {
 			select {
 			case seeds <- event.TypedGenericEvent[*coreV1.Namespace]{
-				Object: &coreV1.Namespace{ObjectMeta: metaV1.ObjectMeta{Name: k}},
+				Object: &coreV1.Namespace{Name: k},
 			}:
 			case <-ctx.Done():
 				return nil

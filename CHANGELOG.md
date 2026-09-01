@@ -5,6 +5,28 @@ All notable changes to **argocd-cluster-registrar** are documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-09-01
+
+Maintenance only. No flag, metric, label, annotation or chart value moves, and
+the reconcile and collection logic is untouched.
+
+### Build
+
+- **Go 1.27 is the new floor.** The `go` directive moves from 1.26.0 to 1.27.0,
+  and the now-redundant `toolchain` line goes with it. This binds source builds
+  only: `go install ...@v0.6.1` needs a 1.27 toolchain. The released binaries
+  and the published image are unaffected.
+- **`go fix` applied**, every rewrite semantics-preserving: `errors.As` against
+  a declared target becomes `errors.AsType[T]`, a `strings.Split` consumed by a
+  `range` becomes `strings.SplitSeq`, tests take `t.Context()`, and composite
+  literals drop the `ObjectMeta` wrapper now that promoted fields are allowed in
+  one. That last one accounts for most of the diff.
+- **Kubernetes client libraries move to 0.37.0**, from 0.36.3.
+- **The gosec action is pinned one commit past its own `v2.29.0` tag**, whose
+  `action.yml` still names the 2.28.0 image: Go 1.26.5 with `GOTOOLCHAIN=local`,
+  below the new floor. Upstream repinned it to the 2.29.0 image a day after
+  tagging. Dependabot tracks tags, so v2.30.0 will move it forward again.
+
 ## [0.6.0] - 2026-08-17
 
 ### Security

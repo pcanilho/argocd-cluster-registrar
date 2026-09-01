@@ -11,7 +11,6 @@ import (
 	coreV1 "k8s.io/api/core/v1"
 	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
@@ -55,14 +54,12 @@ func TestEveryReturnPathRequeues(t *testing.T) {
 		ns.Finalizers = []string{"kubernetes.io/test"}
 		return ns
 	}
-	unlabelled := &coreV1.Namespace{ObjectMeta: metaV1.ObjectMeta{
+	unlabelled := &coreV1.Namespace{
 		Name:   "k3k-nolabel",
-		Labels: map[string]string{ManagedByLabel(testPrefix): testManagedBy},
-	}}
-	unowned := &coreV1.Secret{ObjectMeta: metaV1.ObjectMeta{
+		Labels: map[string]string{ManagedByLabel(testPrefix): testManagedBy}}
+	unowned := &coreV1.Secret{
 		Name: "cluster-hand", Namespace: testTargetNS,
-		Labels: map[string]string{argoSecretTypeLabel: argoSecretTypeValue},
-	}}
+		Labels: map[string]string{argoSecretTypeLabel: argoSecretTypeValue}}
 
 	for name, tc := range map[string]struct {
 		key      string
@@ -84,10 +81,9 @@ func TestEveryReturnPathRequeues(t *testing.T) {
 		},
 		"namespace lost its ownership label": {
 			key: testNS,
-			objs: []runtime.Object{&coreV1.Namespace{ObjectMeta: metaV1.ObjectMeta{
+			objs: []runtime.Object{&coreV1.Namespace{
 				Name:   testNS,
-				Labels: map[string]string{ClusterLabel(testPrefix): "a"},
-			}}},
+				Labels: map[string]string{ClusterLabel(testPrefix): "a"}}},
 		},
 		"no cluster label": {
 			key:  "k3k-nolabel",
@@ -133,7 +129,7 @@ func TestEveryReturnPathRequeues(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			rec, _ := newTestReconciler(tc.objs...)
 			res, err := rec.Reconcile(context.Background(),
-				ctrl.Request{NamespacedName: types.NamespacedName{Name: tc.key}})
+				ctrl.Request{Name: tc.key})
 
 			// Asserting "no error" is the point. Skipping the case on error --
 			// as this test first did -- means a regression that turns a happy
@@ -159,7 +155,7 @@ func TestDryRunStillRequeues(t *testing.T) {
 	r.cfg.DryRun = true
 
 	res, err := rec.Reconcile(context.Background(),
-		ctrl.Request{NamespacedName: types.NamespacedName{Name: testNS}})
+		ctrl.Request{Name: testNS})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -196,7 +192,7 @@ func TestErrorsDoNotCarryARequeue(t *testing.T) {
 func TestReconcileRefreshesRotatedKubeconfig(t *testing.T) {
 	rec, r := newTestReconciler(
 		managedNS(testNS, "a"), kubeconfigSecret(testNS, "k3k-a-kubeconfig"))
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: testNS}}
+	req := ctrl.Request{Name: testNS}
 
 	if _, err := rec.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("first reconcile: %v", err)
@@ -261,7 +257,7 @@ func TestDemotionSurvivesAClusterNameTooLongForALabelValue(t *testing.T) {
 		registeredSecret("a", "k3k-x"),
 	)
 	if _, err := rec.Reconcile(context.Background(),
-		ctrl.Request{NamespacedName: types.NamespacedName{Name: "k3k-x"}}); err != nil {
+		ctrl.Request{Name: "k3k-x"}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 

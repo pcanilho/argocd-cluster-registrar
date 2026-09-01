@@ -1,7 +1,6 @@
 package registrar
 
 import (
-	"context"
 	"io"
 	"log/slog"
 	"os"
@@ -51,15 +50,14 @@ func startEnvtest(t *testing.T) *rest.Config {
 // survives forever with no symptom at all.
 func TestAStrandedRegistrationIsCollectedOnStartup(t *testing.T) {
 	base := startEnvtest(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	client, err := ClientFor(base)
 	if err != nil {
 		t.Fatalf("client: %v", err)
 	}
 	if _, err := client.CoreV1().Namespaces().Create(ctx,
-		&coreV1.Namespace{ObjectMeta: metaV1.ObjectMeta{Name: testTargetNS}},
+		&coreV1.Namespace{Name: testTargetNS},
 		metaV1.CreateOptions{}); err != nil {
 		t.Fatalf("create %s: %v", testTargetNS, err)
 	}

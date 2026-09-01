@@ -89,14 +89,13 @@ func newTestRegistrar(objs ...runtime.Object) (*Registrar, *fake.Clientset) {
 }
 
 func managedNS(name, cluster string) *coreV1.Namespace {
-	return &coreV1.Namespace{ObjectMeta: metaV1.ObjectMeta{
+	return &coreV1.Namespace{
 		Name: name,
 		UID:  types.UID("uid-" + name),
 		Labels: map[string]string{
 			ManagedByLabel(testPrefix): testManagedBy,
 			ClusterLabel(testPrefix):   cluster,
-		},
-	}}
+		}}
 }
 
 // managedNSAt is managedNS with a creation timestamp, which is what decides a
@@ -109,23 +108,21 @@ func managedNSAt(name, cluster string, age time.Duration) *coreV1.Namespace {
 
 func kubeconfigSecret(ns, name string) *coreV1.Secret {
 	return &coreV1.Secret{
-		ObjectMeta: metaV1.ObjectMeta{Name: name, Namespace: ns},
-		Data:       map[string][]byte{"kubeconfig.yaml": []byte(k3kKubeconfig)},
+		Name: name, Namespace: ns,
+		Data: map[string][]byte{"kubeconfig.yaml": []byte(k3kKubeconfig)},
 	}
 }
 
 // registeredSecret is what a previous pass would have written.
 func registeredSecret(cluster, srcNS string) *coreV1.Secret {
 	return &coreV1.Secret{
-		ObjectMeta: metaV1.ObjectMeta{
-			Name:      secretName(cluster),
-			Namespace: testTargetNS,
-			Labels: map[string]string{
-				argoSecretTypeLabel:              argoSecretTypeValue,
-				ManagedByLabel(testPrefix):       testManagedBy,
-				ClusterLabel(testPrefix):         cluster,
-				SourceNamespaceLabel(testPrefix): srcNS,
-			},
+		Name:      secretName(cluster),
+		Namespace: testTargetNS,
+		Labels: map[string]string{
+			argoSecretTypeLabel:              argoSecretTypeValue,
+			ManagedByLabel(testPrefix):       testManagedBy,
+			ClusterLabel(testPrefix):         cluster,
+			SourceNamespaceLabel(testPrefix): srcNS,
 		},
 		Data: map[string][]byte{"name": []byte(cluster), "server": []byte(testServer), "config": []byte("{}")},
 	}
@@ -192,10 +189,9 @@ func TestTransientSecretListErrorDoesNotDeregisterAnything(t *testing.T) {
 // gone rather than merely absent from the desired set.
 func TestCollectRequiresProofTheNamespaceIsGone(t *testing.T) {
 	// The namespace exists but carries no cluster label, so it yields no child.
-	unlabelled := &coreV1.Namespace{ObjectMeta: metaV1.ObjectMeta{
+	unlabelled := &coreV1.Namespace{
 		Name:   testNS,
-		Labels: map[string]string{ManagedByLabel(testPrefix): testManagedBy},
-	}}
+		Labels: map[string]string{ManagedByLabel(testPrefix): testManagedBy}}
 	r, c := newTestRegistrar(unlabelled, registeredSecret("a", testNS))
 
 	if err := r.Reconcile(context.Background()); err != nil {
@@ -219,11 +215,10 @@ func TestCollectDeletesWhenNamespaceIsActuallyGone(t *testing.T) {
 // The safety property asserted in the package comment: GC only ever touches what
 // it owns.
 func TestCollectNeverTouchesUnlabelledSecrets(t *testing.T) {
-	hand := &coreV1.Secret{ObjectMeta: metaV1.ObjectMeta{
+	hand := &coreV1.Secret{
 		Name:      "cluster-handmade",
 		Namespace: testTargetNS,
-		Labels:    map[string]string{argoSecretTypeLabel: argoSecretTypeValue},
-	}}
+		Labels:    map[string]string{argoSecretTypeLabel: argoSecretTypeValue}}
 	r, c := newTestRegistrar(hand)
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -294,12 +289,12 @@ func TestApplyPreservesForeignFieldsAndAnnotations(t *testing.T) {
 // kubeconfig. The namespace must not be skipped because of it.
 func TestFindKubeconfigSecretSkipsDecoy(t *testing.T) {
 	decoy := &coreV1.Secret{
-		ObjectMeta: metaV1.ObjectMeta{Name: "vc-config-x", Namespace: "ns"},
-		Data:       map[string][]byte{"config.yaml": []byte("not a kubeconfig")},
+		Name: "vc-config-x", Namespace: "ns",
+		Data: map[string][]byte{"config.yaml": []byte("not a kubeconfig")},
 	}
 	wanted := &coreV1.Secret{
-		ObjectMeta: metaV1.ObjectMeta{Name: "vc-x", Namespace: "ns"},
-		Data:       map[string][]byte{"config": []byte(vclusterKubeconfig)},
+		Name: "vc-x", Namespace: "ns",
+		Data: map[string][]byte{"config": []byte(vclusterKubeconfig)},
 	}
 	r, _ := newTestRegistrar(decoy, wanted)
 	r.cfg.Providers = mustPresets(t, "vcluster")
@@ -318,8 +313,8 @@ func TestFindKubeconfigSecretSkipsDecoy(t *testing.T) {
 
 func secretWith(ns, name, key, body string) *coreV1.Secret {
 	return &coreV1.Secret{
-		ObjectMeta: metaV1.ObjectMeta{Name: name, Namespace: ns},
-		Data:       map[string][]byte{key: []byte(body)},
+		Name: name, Namespace: ns,
+		Data: map[string][]byte{key: []byte(body)},
 	}
 }
 
@@ -484,11 +479,9 @@ func TestUnresolvedNamespaceDoesNotBlockCollectionOfOthers(t *testing.T) {
 // false reassurance about this path.
 func TestApplyRefusesUnownedSecret(t *testing.T) {
 	hand := &coreV1.Secret{
-		ObjectMeta: metaV1.ObjectMeta{
-			Name:      "cluster-prod",
-			Namespace: testTargetNS,
-			Labels:    map[string]string{argoSecretTypeLabel: argoSecretTypeValue},
-		},
+		Name:      "cluster-prod",
+		Namespace: testTargetNS,
+		Labels:    map[string]string{argoSecretTypeLabel: argoSecretTypeValue},
 		Data: map[string][]byte{
 			"name":    []byte("prod"),
 			"server":  []byte("https://real-prod:6443"),
@@ -501,8 +494,7 @@ func TestApplyRefusesUnownedSecret(t *testing.T) {
 		cluster: "prod", namespace: "tenant-evil", namespaceUID: "uid-tenant-evil",
 		server: "https://attacker:6443", config: `{"bearerToken":"stolen"}`,
 	})
-	var conflict *conflictError
-	if !errors.As(err, &conflict) {
+	if _, ok := errors.AsType[*conflictError](err); !ok {
 		t.Fatalf("apply returned %v, want a conflictError", err)
 	}
 
@@ -532,8 +524,7 @@ func TestApplyRefusesSecretOwnedByAnotherNamespace(t *testing.T) {
 		cluster: "a", namespace: "k3k-evil", namespaceUID: "uid-k3k-evil",
 		server: "https://challenger:6443", config: "{}",
 	})
-	var conflict *conflictError
-	if !errors.As(err, &conflict) {
+	if _, ok := errors.AsType[*conflictError](err); !ok {
 		t.Fatalf("apply returned %v, want a conflictError", err)
 	}
 
@@ -580,8 +571,7 @@ func TestApplyRefusesAdoptionWhenClusterLabelDiffers(t *testing.T) {
 		cluster: "a", namespace: testSourceNS, namespaceUID: "uid-k3k-a",
 		server: "https://new", config: "{}",
 	})
-	var conflict *conflictError
-	if !errors.As(err, &conflict) {
+	if _, ok := errors.AsType[*conflictError](err); !ok {
 		t.Fatalf("apply returned %v, want a conflictError", err)
 	}
 
@@ -690,8 +680,7 @@ func TestCreateRaceReturnsConflict(t *testing.T) {
 		cluster: "a", namespace: testSourceNS, namespaceUID: "uid-k3k-a",
 		server: testServer, config: "{}",
 	})
-	var conflict *conflictError
-	if !errors.As(err, &conflict) {
+	if _, ok := errors.AsType[*conflictError](err); !ok {
 		t.Fatalf("apply returned %v, want a conflictError", err)
 	}
 }
@@ -708,8 +697,7 @@ func TestDryRunReportsConflictAndWritesNothing(t *testing.T) {
 		cluster: "a", namespace: "k3k-evil", namespaceUID: "uid-k3k-evil",
 		server: "https://attacker", config: "{}",
 	})
-	var conflict *conflictError
-	if !errors.As(err, &conflict) {
+	if _, ok := errors.AsType[*conflictError](err); !ok {
 		t.Fatalf("dry-run reported %v, want a conflictError", err)
 	}
 
@@ -1205,8 +1193,8 @@ func secretWithKeys(ns, name string, kv map[string]string) *coreV1.Secret {
 		data[k] = []byte(v)
 	}
 	return &coreV1.Secret{
-		ObjectMeta: metaV1.ObjectMeta{Name: name, Namespace: ns},
-		Data:       data,
+		Name: name, Namespace: ns,
+		Data: data,
 	}
 }
 
@@ -1337,11 +1325,10 @@ func TestEveryRefusalCarriesItsOwnReason(t *testing.T) {
 			name: "a Secret we do not own at all",
 			want: conflictNotManaged,
 			build: func(*testing.T) (*Registrar, child) {
-				hand := &coreV1.Secret{ObjectMeta: metaV1.ObjectMeta{
+				hand := &coreV1.Secret{
 					Name:      "cluster-prod",
 					Namespace: testTargetNS,
-					Labels:    map[string]string{argoSecretTypeLabel: argoSecretTypeValue},
-				}}
+					Labels:    map[string]string{argoSecretTypeLabel: argoSecretTypeValue}}
 				r, _ := newTestRegistrar(hand)
 				return r, child{cluster: "prod", namespace: "tenant-evil", server: testServer, config: "{}"}
 			},
@@ -1731,7 +1718,7 @@ func TestTheAdmittedAnnotationSetIsStableAcrossPasses(t *testing.T) {
 		ann[fmt.Sprintf("%sk%02d", testPrefix, i)] = strings.Repeat("z", annotationLimits.value-1)
 	}
 	var first map[string]string
-	for pass := 0; pass < 3; pass++ {
+	for pass := range 3 {
 		out, _ := propagate(ann, testPrefix, annotationLimits)
 		if pass == 0 {
 			first = out
@@ -1754,7 +1741,7 @@ func TestNormalisingATrailingSlashIsNotAnAddressMove(t *testing.T) {
 	incumbent.Data["server"] = []byte(k3kServer)
 	// It must exist, or claimServer releases the address as a dead incumbent and
 	// the test would pass without exercising anything.
-	otherNS := &coreV1.Namespace{ObjectMeta: metaV1.ObjectMeta{Name: "other-ns"}}
+	otherNS := &coreV1.Namespace{Name: "other-ns"}
 
 	// What 0.5.x stored: the address exactly as the kubeconfig wrote it.
 	stored := registeredSecret("a", testNS)
@@ -2126,8 +2113,7 @@ func TestServerCollisionCheckFailsClosedOnAPIError(t *testing.T) {
 	}
 	// And it must not be a conflictError: nothing was proven, so the caller has
 	// to retry rather than log a refusal and move on.
-	var conflict *conflictError
-	if errors.As(err, &conflict) {
+	if _, ok := errors.AsType[*conflictError](err); ok {
 		t.Errorf("an API failure was reported as a refusal: %v", err)
 	}
 }
@@ -2240,12 +2226,10 @@ func TestServerIsStoredNormalised(t *testing.T) {
 // same, so the check selects on ArgoCD's own label rather than ours.
 func TestForeignClusterSecretAlsoHoldsItsAddress(t *testing.T) {
 	foreign := &coreV1.Secret{
-		ObjectMeta: metaV1.ObjectMeta{
-			Name:      "hand-written",
-			Namespace: testTargetNS,
-			Labels:    map[string]string{argoSecretTypeLabel: argoSecretTypeValue},
-		},
-		Data: map[string][]byte{"server": []byte(k3kServer)},
+		Name:      "hand-written",
+		Namespace: testTargetNS,
+		Labels:    map[string]string{argoSecretTypeLabel: argoSecretTypeValue},
+		Data:      map[string][]byte{"server": []byte(k3kServer)},
 	}
 	r, c := newTestRegistrar(
 		foreign,

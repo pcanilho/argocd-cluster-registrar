@@ -7,7 +7,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	coreV1 "k8s.io/api/core/v1"
 	apiErrors "k8s.io/apimachinery/pkg/api/errors"
-	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8stesting "k8s.io/client-go/testing"
@@ -47,11 +46,10 @@ func TestEveryConflictReasonIsCountedUnderItsOwnLabel(t *testing.T) {
 			want: conflictNotManaged,
 			ns:   testNS,
 			build: func(*testing.T) *Registrar {
-				hand := &coreV1.Secret{ObjectMeta: metaV1.ObjectMeta{
+				hand := &coreV1.Secret{
 					Name:      "cluster-a",
 					Namespace: testTargetNS,
-					Labels:    map[string]string{argoSecretTypeLabel: argoSecretTypeValue},
-				}}
+					Labels:    map[string]string{argoSecretTypeLabel: argoSecretTypeValue}}
 				r, _ := newTestRegistrar(
 					managedNS(testNS, "a"), kubeconfigSecret(testNS, "k3k-a-kubeconfig"), hand)
 				return r
