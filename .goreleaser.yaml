@@ -51,10 +51,20 @@ release:
   draft: false
 
 # Release notes come from CHANGELOG.md, injected by the workflow via
-# --release-notes. Generating a second set from commit subjects would either be
-# ignored or appended as noise, so it is turned off here.
+# --release-notes, which wins over anything generated here.
 changelog:
-  disable: true
+  # MUST stay enabled, however dead the generated changelog looks. goreleaser
+  # reads `--release-notes` INSIDE this pipe, so `disable: true` does not merely
+  # stop it generating notes - it stops it reading the notes file too, and the
+  # release publishes with an EMPTY body. v0.4.0 through v0.6.1 all shipped that
+  # way, green throughout: the extract step wrote the right section, goreleaser
+  # exited 0, and a release body is the one artifact nothing else looks at.
+  #
+  # What this generates never reaches a release: the file release.yaml passes
+  # with --release-notes always wins. Left on `git` rather than `github` so it
+  # needs no token; the workflow checks out with fetch-depth 0, so it has the
+  # history to walk.
+  sort: asc
 
 kos:
   - id: app

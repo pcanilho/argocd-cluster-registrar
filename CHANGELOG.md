@@ -5,6 +5,29 @@ All notable changes to **argocd-cluster-registrar** are documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Every release since 0.4.0 published with an empty body.** `.goreleaser.yaml`
+  set `changelog: disable: true`, on the reasoning that a generated changelog
+  would compete with the notes the workflow injects. But goreleaser reads
+  `--release-notes` *inside* the changelog pipe, so disabling it stopped
+  goreleaser reading the notes file as well as generating one, and the body came
+  out empty.
+
+  Nothing failed. The extract step wrote the right section, goreleaser exited 0,
+  and every check was green: a release body is the one artifact nothing else
+  looks at. Confirmed by running goreleaser against this repository both ways -
+  `generating changelog` appears in the log only when the pipe is enabled, and
+  the run with it enabled succeeds unchanged.
+
+  The pipe is enabled again, left on `git` rather than `github` so it needs no
+  token; the workflow already checks out with `fetch-depth: 0`, so it has the
+  history to walk. The notes the workflow passes still win, so there was never a
+  second set to suppress. The bodies of 0.4.0, 0.5.0, 0.6.0, 0.6.0-rc1 and 0.6.1
+  can be backfilled from this file.
+
 ## [0.6.1] - 2026-09-01
 
 Maintenance only. No flag, metric, label, annotation or chart value moves, and
