@@ -17,6 +17,6 @@ jobs:
       # Upstream repinned it to the 2.29.0 image (Go 1.27.0) a day after tagging.
       # Dependabot tracks tags, so v2.30.0 will move this forward again.
       - name: Run Gosec Security Scanner
-        uses: securego/gosec@57f161386e11e13e4c8a37255bc1a6502993d079 # post-v2.29.0
+        uses: securego/gosec@58362d8a331e123b887741c27056f459c8b0660f # post-v2.29.0
         with:
           args: ./...
