@@ -5,9 +5,11 @@ All notable changes to **argocd-cluster-registrar** are documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.2] - 2026-11-06
 
 ### Fixed
+
+- **Maintenance patch** bumping `go.mod`.
 
 - **Every release since 0.4.0 published with an empty body.** `.goreleaser.yaml`
   set `changelog: disable: true`, on the reasoning that a generated changelog
